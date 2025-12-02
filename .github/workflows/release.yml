@@ -30,23 +30,28 @@ jobs:
 
       - name: Build for all platforms
         run: |
+          VERSION=${{ steps.version.outputs.VERSION }}
+          COMMIT=$(git rev-parse --short=10 HEAD)
+          BUILD_TIME=$(date -u '+%Y-%m-%d_%H:%M:%S')
+          LDFLAGS="-s -w -X main.Version=${VERSION} -X main.GitCommit=${COMMIT} -X main.BuildTime=${BUILD_TIME}"
+
           # Linux amd64
-          GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o drip-${{ steps.version.outputs.VERSION }}-linux-amd64 ./cmd/drip
+          GOOS=linux GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o drip-${VERSION}-linux-amd64 ./cmd/drip
 
           # Linux arm64
-          GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o drip-${{ steps.version.outputs.VERSION }}-linux-arm64 ./cmd/drip
+          GOOS=linux GOARCH=arm64 go build -ldflags="${LDFLAGS}" -o drip-${VERSION}-linux-arm64 ./cmd/drip
 
           # macOS amd64
-          GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w" -o drip-${{ steps.version.outputs.VERSION }}-darwin-amd64 ./cmd/drip
+          GOOS=darwin GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o drip-${VERSION}-darwin-amd64 ./cmd/drip
 
           # macOS arm64
-          GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o drip-${{ steps.version.outputs.VERSION }}-darwin-arm64 ./cmd/drip
+          GOOS=darwin GOARCH=arm64 go build -ldflags="${LDFLAGS}" -o drip-${VERSION}-darwin-arm64 ./cmd/drip
 
           # Windows amd64
-          GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o drip-${{ steps.version.outputs.VERSION }}-windows-amd64.exe ./cmd/drip
+          GOOS=windows GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o drip-${VERSION}-windows-amd64.exe ./cmd/drip
 
           # Windows arm64
-          GOOS=windows GOARCH=arm64 go build -ldflags="-s -w" -o drip-${{ steps.version.outputs.VERSION }}-windows-arm64.exe ./cmd/drip
+          GOOS=windows GOARCH=arm64 go build -ldflags="${LDFLAGS}" -o drip-${VERSION}-windows-arm64.exe ./cmd/drip
 
       - name: Generate checksums
         run: |
