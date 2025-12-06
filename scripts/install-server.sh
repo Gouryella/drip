@@ -10,6 +10,7 @@ SERVICE_USER="${SERVICE_USER:-drip}"
 CONFIG_DIR="/etc/drip"
 WORK_DIR="/var/lib/drip"
 VERSION="${VERSION:-}"
+COMMAND_MADE_AVAILABLE=false
 
 # Default values
 DEFAULT_PORT=8443
@@ -231,6 +232,73 @@ print_warning() { echo -e "${YELLOW}[!]${NC} $1"; }
 print_error() { echo -e "${RED}[✗]${NC} $1"; }
 print_step() { echo -e "${CYAN}[→]${NC} $1"; }
 
+repeat_char() {
+    local char="$1"
+    local count="$2"
+    local out=""
+    for _ in $(seq 1 "$count"); do
+        out+="$char"
+    done
+    echo "$out"
+}
+
+print_panel() {
+    local title="$1"
+    shift
+    local width=58
+    local bar
+    bar=$(repeat_char "=" "$width")
+    echo ""
+    echo -e "${CYAN}${bar}${NC}"
+    echo -e "${CYAN}${title}${NC}"
+    echo -e "${CYAN}${bar}${NC}"
+    for line in "$@"; do
+        echo -e "  $line"
+    done
+    echo -e "${CYAN}${bar}${NC}"
+    echo ""
+}
+
+print_subheader() {
+    local title="$1"
+    local width=58
+    local bar
+    bar=$(repeat_char "-" "$width")
+    echo ""
+    echo -e "${CYAN}${title}${NC}"
+    echo -e "${CYAN}${bar}${NC}"
+}
+
+ensure_command_access() {
+    hash -r 2>/dev/null || true
+    command -v rehash >/dev/null 2>&1 && rehash || true
+
+    if command -v drip >/dev/null 2>&1; then
+        COMMAND_MADE_AVAILABLE=true
+        return
+    fi
+
+    local target_path="${INSTALL_DIR}/drip"
+    local preferred="/usr/local/bin"
+
+    if [[ ":$PATH:" == *":$preferred:"* ]]; then
+        if [[ -w "$preferred" ]]; then
+            if ln -sf "$target_path" "$preferred/drip" 2>/dev/null; then
+                COMMAND_MADE_AVAILABLE=true
+                print_success "Made drip available at $preferred/drip"
+            fi
+        else
+            if sudo ln -sf "$target_path" "$preferred/drip" 2>/dev/null; then
+                COMMAND_MADE_AVAILABLE=true
+                print_success "Made drip available at $preferred/drip"
+            fi
+        fi
+    fi
+
+    hash -r 2>/dev/null || true
+    command -v rehash >/dev/null 2>&1 && rehash || true
+}
+
 # Print banner
 print_banner() {
     echo -e "${GREEN}"
@@ -272,14 +340,9 @@ get_version_from_binary() {
 # Language selection
 # ============================================================================
 select_language() {
-    echo ""
-    echo -e "${CYAN}╔════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║   $(msg select_lang)          ║${NC}"
-    echo -e "${CYAN}╠════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║${NC}  ${GREEN}1)${NC} English                             ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${GREEN}2)${NC} 中文                                 ${CYAN}║${NC}"
-    echo -e "${CYAN}╚════════════════════════════════════════╝${NC}"
-    echo ""
+    print_panel "$(msg select_lang)" \
+        "${GREEN}1)${NC} English" \
+        "${GREEN}2)${NC} 中文"
 
     read -p "Select [1]: " lang_choice < /dev/tty
     case "$lang_choice" in
@@ -492,11 +555,7 @@ generate_token() {
 }
 
 configure_server() {
-    echo ""
-    echo -e "${CYAN}╔════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║   $(msg config_title)                            ${CYAN}║${NC}"
-    echo -e "${CYAN}╚════════════════════════════════════════╝${NC}"
-    echo ""
+    print_subheader "$(msg config_title)"
 
     # Domain
     while true; do
@@ -533,15 +592,10 @@ configure_server() {
     fi
 
     # TLS certificate selection
-    echo ""
-    echo -e "${CYAN}╔════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║   $(msg cert_option_title)                                  ${CYAN}║${NC}"
-    echo -e "${CYAN}╠════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║${NC}  ${GREEN}1)${NC} $(msg cert_option_certbot)              ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${GREEN}2)${NC} $(msg cert_option_self)     ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${GREEN}3)${NC} $(msg cert_option_provide)                        ${CYAN}║${NC}"
-    echo -e "${CYAN}╚════════════════════════════════════════════════════╝${NC}"
-    echo ""
+    print_panel "$(msg cert_option_title)" \
+        "${GREEN}1)${NC} $(msg cert_option_certbot)" \
+        "${GREEN}2)${NC} $(msg cert_option_self)" \
+        "${GREEN}3)${NC} $(msg cert_option_provide)"
 
     read -p "Select [1]: " cert_choice < /dev/tty
 
@@ -938,11 +992,7 @@ start_service() {
 # Final output
 # ============================================================================
 show_completion() {
-    echo ""
-    echo -e "${GREEN}╔════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${GREEN}║   $(msg install_complete)                                          ${GREEN}║${NC}"
-    echo -e "${GREEN}╚════════════════════════════════════════════════════════════╝${NC}"
-    echo ""
+    print_panel "$(msg install_complete)"
 
     echo -e "${CYAN}$(msg client_info):${NC}"
     echo -e "  ${BOLD}$(msg server_addr):${NC} ${DOMAIN}:${PORT}"
@@ -976,11 +1026,12 @@ main() {
     check_existing_install
 
     echo ""
-    download_binary
-    install_binary
+download_binary
+install_binary
+ensure_command_access
 
-    # If updating, check if systemd service exists
-    if [[ "$IS_UPDATE" == true ]]; then
+# If updating, check if systemd service exists
+if [[ "$IS_UPDATE" == true ]]; then
         # Check if systemd service file exists
         if [[ -f /etc/systemd/system/drip-server.service ]]; then
             echo ""
@@ -997,10 +1048,7 @@ main() {
 
             echo ""
             local new_version=$(get_version_from_binary "$INSTALL_DIR/drip")
-            echo -e "${GREEN}╔════════════════════════════════════════════════════════════╗${NC}"
-            echo -e "${GREEN}║   $(msg update_ok)                                                ${GREEN}║${NC}"
-            echo -e "${GREEN}╚════════════════════════════════════════════════════════════╝${NC}"
-            echo ""
+            print_panel "$(msg update_ok)"
             print_info "$(msg current_version): $new_version"
             echo ""
             exit 0

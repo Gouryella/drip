@@ -8,6 +8,8 @@ GITHUB_REPO="Gouryella/drip"
 INSTALL_DIR="${INSTALL_DIR:-}"
 VERSION="${VERSION:-}"
 BINARY_NAME="drip"
+UNINSTALL_MODE=false
+COMMAND_MADE_AVAILABLE=false
 
 # Colors
 RED='\033[0;31m'
@@ -83,6 +85,15 @@ msg_en() {
         verify_ok) echo "Verification passed" ;;
         verify_failed) echo "Verification failed" ;;
         insecure_note) echo "Only use --insecure for development/testing" ;;
+        uninstall_title) echo "Drip Client - Uninstall" ;;
+        uninstall_prompt) echo "Uninstall Drip client now?" ;;
+        uninstalling) echo "Uninstalling Drip client..." ;;
+        uninstall_done) echo "Uninstall completed" ;;
+        uninstall_not_found) echo "Drip is not installed" ;;
+        remove_config_prompt) echo "Remove Drip config directory as well?" ;;
+        config_removed) echo "Config removed" ;;
+        path_cleanup) echo "Cleaning PATH entries..." ;;
+        path_cleanup_done) echo "PATH entries cleaned" ;;
         *) echo "$1" ;;
     esac
 }
@@ -146,6 +157,15 @@ msg_zh() {
         verify_ok) echo "验证通过" ;;
         verify_failed) echo "验证失败" ;;
         insecure_note) echo "--insecure 仅用于开发/测试环境" ;;
+        uninstall_title) echo "Drip 客户端 - 卸载" ;;
+        uninstall_prompt) echo "现在卸载 Drip 客户端？" ;;
+        uninstalling) echo "正在卸载 Drip 客户端..." ;;
+        uninstall_done) echo "卸载完成" ;;
+        uninstall_not_found) echo "未检测到已安装的 Drip" ;;
+        remove_config_prompt) echo "是否同时删除 Drip 配置目录？" ;;
+        config_removed) echo "配置已删除" ;;
+        path_cleanup) echo "清理 PATH 相关配置..." ;;
+        path_cleanup_done) echo "PATH 配置已清理" ;;
         *) echo "$1" ;;
     esac
 }
@@ -176,6 +196,43 @@ print_success() { echo -e "${GREEN}[✓]${NC} $1"; }
 print_warning() { echo -e "${YELLOW}[!]${NC} $1"; }
 print_error() { echo -e "${RED}[✗]${NC} $1"; }
 print_step() { echo -e "${CYAN}[→]${NC} $1"; }
+
+repeat_char() {
+    local char="$1"
+    local count="$2"
+    local out=""
+    for _ in $(seq 1 "$count"); do
+        out+="$char"
+    done
+    echo "$out"
+}
+
+print_panel() {
+    local title="$1"
+    shift
+    local width=58
+    local bar
+    bar=$(repeat_char "=" "$width")
+    echo ""
+    echo -e "${CYAN}${bar}${NC}"
+    echo -e "${CYAN}${title}${NC}"
+    echo -e "${CYAN}${bar}${NC}"
+    for line in "$@"; do
+        echo -e "  $line"
+    done
+    echo -e "${CYAN}${bar}${NC}"
+    echo ""
+}
+
+print_subheader() {
+    local title="$1"
+    local width=58
+    local bar
+    bar=$(repeat_char "-" "$width")
+    echo ""
+    echo -e "${CYAN}${title}${NC}"
+    echo -e "${CYAN}${bar}${NC}"
+}
 
 # Print banner
 print_banner() {
@@ -218,14 +275,9 @@ get_version_from_binary() {
 # Language selection
 # ============================================================================
 select_language() {
-    echo ""
-    echo -e "${CYAN}╔════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║   $(msg select_lang)          ║${NC}"
-    echo -e "${CYAN}╠════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║${NC}  ${GREEN}1)${NC} English                             ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${GREEN}2)${NC} 中文                                 ${CYAN}║${NC}"
-    echo -e "${CYAN}╚════════════════════════════════════════╝${NC}"
-    echo ""
+    print_panel "$(msg select_lang)" \
+        "${GREEN}1)${NC} English" \
+        "${GREEN}2)${NC} 中文"
 
     prompt_input "Select [1]: " lang_choice
     case "$lang_choice" in
@@ -406,16 +458,11 @@ select_install_dir() {
         return
     fi
 
-    echo ""
-    echo -e "${CYAN}╔════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║   $(msg select_install_dir)                    ${CYAN}║${NC}"
-    echo -e "${CYAN}╠════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║${NC}  ${GREEN}1)${NC} ~/.local/bin $(msg option_user)       ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${GREEN}2)${NC} /usr/local/bin $(msg option_system)   ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${GREEN}3)${NC} ./ $(msg option_current)               ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${GREEN}4)${NC} $(msg option_custom)                   ${CYAN}║${NC}"
-    echo -e "${CYAN}╚════════════════════════════════════════╝${NC}"
-    echo ""
+    print_panel "$(msg select_install_dir)" \
+        "${GREEN}1)${NC} ~/.local/bin $(msg option_user)" \
+        "${GREEN}2)${NC} /usr/local/bin $(msg option_system)" \
+        "${GREEN}3)${NC} ./ $(msg option_current)" \
+        "${GREEN}4)${NC} $(msg option_custom)"
 
     prompt_input "Select [1]: " dir_choice
 
@@ -470,6 +517,9 @@ update_path() {
     if command -v drip &> /dev/null; then
         return
     fi
+    if [[ "$COMMAND_MADE_AVAILABLE" == true ]]; then
+        return
+    fi
 
     # Skip for system directories (usually already in PATH)
     if [[ "$INSTALL_DIR" == "/usr/local/bin" ]] || [[ "$INSTALL_DIR" == "/usr/bin" ]]; then
@@ -508,6 +558,42 @@ update_path() {
     print_warning "$(msg path_note)"
 }
 
+ensure_command_access() {
+    # Try to make the command available immediately without requiring shell restart
+    if [[ "$OS" == "windows" ]]; then
+        return
+    fi
+
+    hash -r 2>/dev/null || true
+    command -v rehash >/dev/null 2>&1 && rehash || true
+
+    if command -v "$BINARY_NAME" >/dev/null 2>&1; then
+        COMMAND_MADE_AVAILABLE=true
+        return
+    fi
+
+    local target_path="$INSTALL_DIR/$BINARY_NAME"
+    local preferred="/usr/local/bin"
+
+    if [[ ":$PATH:" == *":$preferred:"* ]]; then
+        if [[ -w "$preferred" ]]; then
+            if ln -sf "$target_path" "$preferred/$BINARY_NAME" 2>/dev/null; then
+                COMMAND_MADE_AVAILABLE=true
+                print_success "Made ${BINARY_NAME} available at $preferred/$BINARY_NAME"
+            fi
+        else
+            if sudo ln -sf "$target_path" "$preferred/$BINARY_NAME" 2>/dev/null; then
+                COMMAND_MADE_AVAILABLE=true
+                print_success "Made ${BINARY_NAME} available at $preferred/$BINARY_NAME"
+            fi
+        fi
+    fi
+
+    # Refresh hash table
+    hash -r 2>/dev/null || true
+    command -v rehash >/dev/null 2>&1 && rehash || true
+}
+
 verify_installation() {
     print_step "$(msg verify_install)"
 
@@ -536,11 +622,7 @@ configure_client() {
         return
     fi
 
-    echo ""
-    echo -e "${CYAN}╔════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║   $(msg config_title)                          ${CYAN}║${NC}"
-    echo -e "${CYAN}╚════════════════════════════════════════╝${NC}"
-    echo ""
+    print_subheader "$(msg config_title)"
 
     local binary_path="$INSTALL_DIR/$BINARY_NAME"
 
@@ -605,11 +687,7 @@ test_connection() {
 show_completion() {
     local binary_path="$INSTALL_DIR/$BINARY_NAME"
 
-    echo ""
-    echo -e "${GREEN}╔════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${GREEN}║   $(msg install_complete)                                          ${GREEN}║${NC}"
-    echo -e "${GREEN}╚════════════════════════════════════════════════════════════╝${NC}"
-    echo ""
+    print_panel "$(msg install_complete)"
 
     echo -e "${CYAN}$(msg usage_title):${NC}"
     echo ""
@@ -630,14 +708,120 @@ show_completion() {
 }
 
 # ============================================================================
+# Uninstall
+# ============================================================================
+cleanup_path_entries() {
+    local install_dir="$1"
+
+    local candidates=()
+
+    local os_name="$OS"
+    if [[ -z "$os_name" ]]; then
+        case "$(uname -s)" in
+            Darwin*) os_name="darwin" ;;
+            *) os_name="linux" ;;
+        esac
+    fi
+
+    # Determine shell config files
+    if [[ -n "$ZSH_VERSION" ]] || [[ "$SHELL" == *"zsh"* ]]; then
+        candidates+=("$HOME/.zshrc")
+    fi
+    if [[ -n "$BASH_VERSION" ]] || [[ "$SHELL" == *"bash"* ]]; then
+        if [[ "$os_name" == "darwin" ]]; then
+            candidates+=("$HOME/.bash_profile")
+        else
+            candidates+=("$HOME/.bashrc")
+        fi
+    fi
+    if [[ "$SHELL" == *"fish"* ]]; then
+        candidates+=("$HOME/.config/fish/config.fish")
+    fi
+
+    for file in "${candidates[@]}"; do
+        if [[ -f "$file" ]] && grep -q "$install_dir" "$file" 2>/dev/null; then
+            local tmp
+            tmp=$(mktemp)
+            # Remove the comment marker and PATH export line we added
+            grep -v "Drip client" "$file" | grep -v "$install_dir" > "$tmp" || true
+            mv "$tmp" "$file"
+        fi
+    done
+}
+
+remove_config_dirs() {
+    local removed=false
+    local dirs=("$HOME/.drip" "$HOME/.config/drip")
+
+    echo ""
+    prompt_input "$(msg remove_config_prompt) [y/N]: " remove_choice
+    if [[ ! "$remove_choice" =~ ^[Yy]$ ]]; then
+        return
+    fi
+
+    for dir in "${dirs[@]}"; do
+        if [[ -d "$dir" ]]; then
+            rm -rf "$dir"
+            removed=true
+        fi
+    done
+
+    if [[ "$removed" == true ]]; then
+        print_success "$(msg config_removed)"
+    fi
+}
+
+uninstall_client() {
+    if ! command -v drip &> /dev/null; then
+        print_warning "$(msg uninstall_not_found)"
+        return
+    fi
+
+    local current_path
+    current_path=$(command -v drip)
+
+    prompt_input "$(msg uninstall_prompt) [y/N]: " confirm_uninstall
+    if [[ ! "$confirm_uninstall" =~ ^[Yy]$ ]]; then
+        return
+    fi
+
+    print_step "$(msg uninstalling)"
+
+    if [[ -w "$current_path" ]]; then
+        rm -f "$current_path" || true
+    else
+        sudo rm -f "$current_path" || true
+    fi
+
+    print_success "$(msg uninstall_done)"
+
+    local install_dir
+    install_dir=$(dirname "$current_path")
+    print_step "$(msg path_cleanup)"
+    cleanup_path_entries "$install_dir"
+    print_success "$(msg path_cleanup_done)"
+
+    remove_config_dirs
+}
+
+# ============================================================================
 # Main
 # ============================================================================
 main() {
+    if [[ "$1" == "--uninstall" || "$1" == "uninstall" ]]; then
+        UNINSTALL_MODE=true
+    fi
+
     clear
     print_banner
     select_language
 
     echo -e "${BOLD}────────────────────────────────────────────${NC}"
+
+    if [[ "$UNINSTALL_MODE" == true ]]; then
+        uninstall_client
+        exit 0
+    fi
 
     check_os
     check_arch
@@ -648,6 +832,7 @@ main() {
     download_binary
     select_install_dir
     install_binary
+    ensure_command_access
     update_path
     verify_installation
 
@@ -658,10 +843,7 @@ main() {
     else
         echo ""
         local new_version=$(get_version_from_binary "$INSTALL_DIR/$BINARY_NAME")
-        echo -e "${GREEN}╔════════════════════════════════════════════════════════════╗${NC}"
-        echo -e "${GREEN}║   $(msg update_ok)                                                ${GREEN}║${NC}"
-        echo -e "${GREEN}╚════════════════════════════════════════════════════════════╝${NC}"
-        echo ""
+        print_panel "$(msg update_ok)"
         print_info "Version: $new_version"
         echo ""
         return

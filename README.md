@@ -64,6 +64,11 @@ bash <(curl -sL https://raw.githubusercontent.com/Gouryella/drip/main/scripts/in
 bash <(curl -sL https://raw.githubusercontent.com/Gouryella/drip/main/scripts/install-server.sh)
 ```
 
+### Uninstall
+```bash
+bash <(curl -sL https://raw.githubusercontent.com/Gouryella/drip/main/scripts/uninstall.sh)
+```
+
 ## Usage
 
 ### First Time Setup
