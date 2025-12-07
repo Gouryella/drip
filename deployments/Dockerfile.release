@@ -1,37 +1,52 @@
-# Dockerfile for deploying drip-server from GitHub Release
-# Usage:
-#   docker build -f deployments/Dockerfile.release -t drip-server .
-#   docker build -f deployments/Dockerfile.release --build-arg VERSION=v1.0.0 -t drip-server:v1.0.0 .
+# =========================
+# Builder stage (Alpine)
+# =========================
+FROM golang:1.25-alpine AS builder
 
-FROM alpine:latest
+RUN apk add --no-cache ca-certificates tzdata
 
-# VERSION is passed from GitHub Actions (release tag or "latest")
-ARG VERSION=latest
-# TARGETARCH is automatically set by Docker Buildx (amd64, arm64, etc.)
-ARG TARGETARCH=amd64
+# All project files under /app
+WORKDIR /app
+ADD . .
 
-RUN apk add --no-cache ca-certificates tzdata curl && update-ca-certificates
+# Git tag/version passed from build args, e.g. v1.0.0
+ARG VERSION=dev
 
-RUN addgroup -S drip && adduser -S -G drip drip
+# Buildx injects these automatically for multi-arch builds
+ARG TARGETOS
+ARG TARGETARCH
 
+# Adjust this to your real main package directory
+# e.g. /app/cmd/drip-server if different
+WORKDIR /app/cmd/drip
+
+# main.version should match the version variable in your Go code
+RUN env CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
+    go build -v -trimpath \
+      -ldflags "-s -w -X main.version=${VERSION}" \
+      -o /app/bin/drip
+
+# =========================
+# Runtime stage (Alpine)
+# =========================
+FROM alpine:3.22
+
+RUN apk add --no-cache ca-certificates tzdata curl && \
+    update-ca-certificates
+
+# Everything lives under /app in runtime image
 WORKDIR /app
 
-# Download binary from GitHub Releases
-RUN set -ex; \
-    # Resolve "latest" to an actual tag
-    if [ "$VERSION" = "latest" ]; then \
-        VERSION=$(curl -sL https://api.github.com/repos/Gouryella/drip/releases/latest \
-          | grep '"tag_name"' | cut -d'"' -f4); \
-    fi; \
-    echo "Resolved VERSION=${VERSION}"; \
-    echo "Downloading drip ${VERSION} for linux-${TARGETARCH}"; \
-    curl -fsSL "https://github.com/Gouryella/drip/releases/download/${VERSION}/drip-${VERSION}-linux-${TARGETARCH}" -o /app/drip; \
-    chmod +x /app/drip; \
-    /app/drip version --short
+# Optional but nice to have: certs + timezone data
+COPY --from=builder /etc/ssl/certs /etc/ssl/certs
+COPY --from=builder /usr/share/zoneinfo /usr/share/zoneinfo
 
-RUN mkdir -p /app/data/certs && \
+# Copy the built binary into /app
+COPY --from=builder /app/bin/drip /app/drip
+
+# Non-root user
+RUN addgroup -S drip && adduser -S -G drip drip && \
     chown -R drip:drip /app
-
 USER drip
 
 EXPOSE 80 443 8080 20000-20100

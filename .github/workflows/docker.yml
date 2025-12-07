@@ -1,176 +1,66 @@
 name: Docker
 
 on:
-  # Trigger when a release is published (after assets are uploaded)
-  release:
-    types: [published]
-
-  # Optional manual trigger
-  workflow_dispatch:
-    inputs:
-      version:
-        description: 'Release tag to use (e.g., v1.0.0 or latest)'
-        required: false
-        default: 'latest'
+  push:
+    tags: [ "v*.*.*" ]
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
-
-permissions:
-  contents: read
-  packages: write
+  VERSION: ${{ github.ref_name }}
 
 jobs:
-  build-and-push:
-    name: Build and Push Docker Image
+  build:
     runs-on: ubuntu-latest
-
-    # For release event, only build for tags like v1.2.3
-    if: |
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'release' && startsWith(github.event.release.tag_name, 'v'))
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v5
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+      - name: Install cosign
+        if: github.event_name != 'pull_request'
+        uses: sigstore/cosign-installer@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to GitHub Container Registry
+      - name: Log into registry
+        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Resolve VERSION:
-      # - release event: use release tag_name (e.g., v0.3.0)
-      # - workflow_dispatch: use input version (default: latest)
-      - name: Get version
-        id: version
-        run: |
-          if [ "${{ github.event_name }}" = "release" ]; then
-            v="${{ github.event.release.tag_name }}"
-          else
-            v="${{ github.event.inputs.version }}"
-            if [ -z "$v" ]; then
-              v="latest"
-            fi
-          fi
-
-          echo "VERSION=$v" >> "$GITHUB_OUTPUT"
-          echo "Resolved VERSION=$v"
-
-      # Ensure release assets exist before building
-      - name: Check release assets
-        id: check_assets
-        run: |
-          VERSION="${{ steps.version.outputs.VERSION }}"
-          REPO="${{ github.repository }}"
-
-          echo "Checking assets for $REPO, VERSION=$VERSION"
-
-          # For 'latest', we can only reliably ask the latest release API,
-          # the asset names are still versioned (drip-vX.Y.Z-linux-arch).
-          if [ "$VERSION" = "latest" ]; then
-            API_URL="https://api.github.com/repos/${REPO}/releases/latest"
-            echo "Using latest release API: $API_URL"
-            json=$(curl -fsSL "$API_URL")
-
-            # Check that assets for both amd64 and arm64 exist
-            echo "$json" | grep -q 'drip-.*linux-amd64' || missing_amd64=1
-            echo "$json" | grep -q 'drip-.*linux-arm64' || missing_arm64=1
-
-            if [ "${missing_amd64:-0}" -eq 0 ] && [ "${missing_arm64:-0}" -eq 0 ]; then
-              echo "assets_ready=true" >> "$GITHUB_OUTPUT"
-              echo "Assets found for both linux-amd64 and linux-arm64 (latest)."
-            else
-              echo "assets_ready=false" >> "$GITHUB_OUTPUT"
-              echo "Required assets for latest release are missing; build will be skipped."
-            fi
-            exit 0
-          fi
-
-          # For a specific version tag (e.g., v0.3.0) check direct download URLs
-          archs="amd64 arm64"
-          missing=0
-
-          for arch in $archs; do
-            url="https://github.com/${REPO}/releases/download/${VERSION}/drip-${VERSION}-linux-${arch}"
-            status=$(curl -o /dev/null -w "%{http_code}" -sL "$url")
-            echo "[$arch] HTTP $status -> $url"
-            if [ "$status" != "200" ]; then
-              missing=1
-            fi
-          done
-
-          if [ "$missing" -eq 0 ]; then
-            echo "assets_ready=true" >> "$GITHUB_OUTPUT"
-            echo "All required assets exist. Proceeding with build."
-          else
-            echo "assets_ready=false" >> "$GITHUB_OUTPUT"
-            echo "Required assets are missing; build will be skipped."
-          fi
-
-      - name: Skip build (assets not ready)
-        if: steps.check_assets.outputs.assets_ready != 'true'
-        run: |
-          echo "Release assets are not ready. Docker image build is skipped."
-          echo "You must upload all required release files (drip-<version>-linux-amd64/arm64) first."
-
-      - name: Extract metadata (tags & labels)
+      - name: Extract Docker metadata
         id: meta
-        if: steps.check_assets.outputs.assets_ready == 'true'
         uses: docker/metadata-action@v5
         with:
-          images: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            # Main tag, e.g. v0.3.0 or latest
-            type=raw,value=${{ steps.version.outputs.VERSION }}
-            # Also tag 'latest' for convenience when using a specific version
-            type=raw,value=latest,enable=${{ steps.version.outputs.VERSION != 'latest' }}
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
 
-      - name: Build and push
-        if: steps.check_assets.outputs.assets_ready == 'true'
+      - name: Build and push Docker image
+        id: build-and-push
         uses: docker/build-push-action@v5
         with:
           context: .
           file: deployments/Dockerfile.release
-          platforms: linux/amd64,linux/arm64
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            VERSION=${{ steps.version.outputs.VERSION }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            VERSION=${{ env.VERSION }}
+          provenance: false
 
-      - name: Generate deployment summary
-        if: steps.check_assets.outputs.assets_ready == 'true'
-        run: |
-          echo "## 🐳 Docker Image Published" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "**Version (GitHub Release tag or 'latest'):** \`${{ steps.version.outputs.VERSION }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "### Pull from GHCR" >> "$GITHUB_STEP_SUMMARY"
-          echo "\`\`\`bash" >> "$GITHUB_STEP_SUMMARY"
-          echo "docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "### Quick start" >> "$GITHUB_STEP_SUMMARY"
-          echo "\`\`\`bash" >> "$GITHUB_STEP_SUMMARY"
-          echo "docker run -d \\\\" >> "$GITHUB_STEP_SUMMARY"
-          echo "  --name drip-server \\\\" >> "$GITHUB_STEP_SUMMARY"
-          echo "  -p 443:443 \\\\" >> "$GITHUB_STEP_SUMMARY"
-          echo "  -v /path/to/certs:/app/data/certs:ro \\\\" >> "$GITHUB_STEP_SUMMARY"
-          echo "  ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }} \\\\" >> "$GITHUB_STEP_SUMMARY"
-          echo "  server --domain your.domain.com --port 443 \\\\" >> "$GITHUB_STEP_SUMMARY"
-          echo "  --tls-cert /app/data/certs/fullchain.pem \\\\" >> "$GITHUB_STEP_SUMMARY"
-          echo "  --tls-key /app/data/certs/privkey.pem" >> "$GITHUB_STEP_SUMMARY"
-          echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
+      - name: Sign the published Docker image
+        if: github.event_name != 'pull_request'
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.build-and-push.outputs.digest }}
+        run: echo "${TAGS}" | tr ',' '\n' | xargs -I {} cosign sign --yes {}@${DIGEST}
