@@ -15,6 +15,7 @@ import (
 
 	"drip/internal/shared/pool"
 	"drip/internal/shared/protocol"
+
 	"go.uber.org/zap"
 )
 
@@ -97,10 +98,10 @@ func NewFrameHandler(conn net.Conn, frameWriter *protocol.FrameWriter, localHost
 				DisableKeepAlives:     false,             // Enable keep-alive for connection reuse
 				TLSHandshakeTimeout:   5 * time.Second,   // Reduced from 10s for faster failure detection
 				TLSClientConfig:       tlsConfig,
-				ResponseHeaderTimeout: 15 * time.Second,  // Reduced from 30s for faster timeout
+				ResponseHeaderTimeout: 15 * time.Second,       // Reduced from 30s for faster timeout
 				ExpectContinueTimeout: 500 * time.Millisecond, // Reduced from 1s for better responsiveness
-				WriteBufferSize:       32 * 1024,         // 32KB write buffer
-				ReadBufferSize:        32 * 1024,         // 32KB read buffer
+				WriteBufferSize:       32 * 1024,              // 32KB write buffer
+				ReadBufferSize:        32 * 1024,              // 32KB read buffer
 				DialContext: (&net.Dialer{
 					Timeout:   3 * time.Second,  // Reduced from 5s for faster connection attempts
 					KeepAlive: 30 * time.Second, // Keep TCP keepalive
@@ -226,9 +227,6 @@ func (h *FrameHandler) handleLocalResponse(stream *Stream) {
 		}
 
 		n, err := stream.LocalConn.Read(buf)
-		if err != nil {
-			break
-		}
 
 		if n > 0 {
 			if h.isClosedCheck != nil && h.isClosedCheck() {
@@ -263,6 +261,10 @@ func (h *FrameHandler) handleLocalResponse(stream *Stream) {
 			}
 
 			h.stats.AddBytesOut(int64(len(payload)))
+		}
+
+		if err != nil {
+			break
 		}
 	}
 }

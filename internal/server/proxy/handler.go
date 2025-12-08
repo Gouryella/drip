@@ -1,11 +1,13 @@
 package proxy
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	json "github.com/goccy/go-json"
@@ -90,8 +92,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleAdaptiveRequest(w http.ResponseWriter, r *http.Request, transport tunnel.Transport, requestID string, subdomain string) {
 	const streamingThreshold int64 = 1 * 1024 * 1024
 
+	ctx := r.Context()
+
+	var cancelTransport func()
 	if transport != nil {
-		h.responses.RegisterCancelFunc(requestID, func() {
+		cancelOnce := sync.Once{}
+		cancelFunc := func() {
 			header := protocol.DataHeader{
 				StreamID:  requestID,
 				RequestID: requestID,
@@ -111,8 +117,13 @@ func (h *Handler) handleAdaptiveRequest(w http.ResponseWriter, r *http.Request, 
 					zap.Error(err),
 				)
 			}
-		})
+		}
 
+		cancelTransport = func() {
+			cancelOnce.Do(cancelFunc)
+		}
+
+		h.responses.RegisterCancelFunc(requestID, cancelTransport)
 		defer h.responses.CleanupCancelFunc(requestID)
 	}
 
@@ -138,7 +149,7 @@ func (h *Handler) handleAdaptiveRequest(w http.ResponseWriter, r *http.Request, 
 		}
 		if err == io.EOF {
 			r.Body.Close()
-			h.sendBufferedRequest(w, r, transport, requestID, subdomain, buffer)
+			h.sendBufferedRequest(ctx, w, r, transport, requestID, subdomain, cancelTransport, buffer)
 			return
 		}
 		if err != nil {
@@ -155,14 +166,14 @@ func (h *Handler) handleAdaptiveRequest(w http.ResponseWriter, r *http.Request, 
 
 	if !hitThreshold {
 		r.Body.Close()
-		h.sendBufferedRequest(w, r, transport, requestID, subdomain, buffer)
+		h.sendBufferedRequest(ctx, w, r, transport, requestID, subdomain, cancelTransport, buffer)
 		return
 	}
 
-	h.streamLargeRequest(w, r, transport, requestID, subdomain, buffer)
+	h.streamLargeRequest(ctx, w, r, transport, requestID, subdomain, cancelTransport, buffer)
 }
 
-func (h *Handler) sendBufferedRequest(w http.ResponseWriter, r *http.Request, transport tunnel.Transport, requestID string, subdomain string, body []byte) {
+func (h *Handler) sendBufferedRequest(ctx context.Context, w http.ResponseWriter, r *http.Request, transport tunnel.Transport, requestID string, subdomain string, cancelTransport func(), body []byte) {
 	headers := h.headerPool.Get()
 	h.headerPool.CloneWithExtra(headers, r.Header, "Host", r.Host)
 
@@ -220,6 +231,15 @@ func (h *Handler) sendBufferedRequest(w http.ResponseWriter, r *http.Request, tr
 		h.writeHTTPResponse(w, respMsg, subdomain, r)
 	case <-streamingDone:
 		// Streaming response has been fully written by SendStreamingChunk
+	case <-ctx.Done():
+		if cancelTransport != nil {
+			cancelTransport()
+		}
+		h.logger.Debug("HTTP request context cancelled",
+			zap.String("request_id", requestID),
+			zap.String("subdomain", subdomain),
+		)
+		return
 	case <-time.After(5 * time.Minute):
 		h.logger.Error("Request timeout",
 			zap.String("request_id", requestID),
@@ -229,7 +249,7 @@ func (h *Handler) sendBufferedRequest(w http.ResponseWriter, r *http.Request, tr
 	}
 }
 
-func (h *Handler) streamLargeRequest(w http.ResponseWriter, r *http.Request, transport tunnel.Transport, requestID string, subdomain string, bufferedData []byte) {
+func (h *Handler) streamLargeRequest(ctx context.Context, w http.ResponseWriter, r *http.Request, transport tunnel.Transport, requestID string, subdomain string, cancelTransport func(), bufferedData []byte) {
 	headers := h.headerPool.Get()
 	h.headerPool.CloneWithExtra(headers, r.Header, "Host", r.Host)
 
@@ -327,6 +347,19 @@ func (h *Handler) streamLargeRequest(w http.ResponseWriter, r *http.Request, tra
 	defer h.bufferPool.PutMedium(streamBufPtr)
 	buffer := (*streamBufPtr)[:pool.MediumBufferSize]
 	for {
+		select {
+		case <-ctx.Done():
+			if cancelTransport != nil {
+				cancelTransport()
+			}
+			h.logger.Debug("Streaming request cancelled via context",
+				zap.String("request_id", requestID),
+				zap.String("subdomain", subdomain),
+			)
+			return
+		default:
+		}
+
 		n, readErr := r.Body.Read(buffer)
 		if n > 0 {
 			isLast := readErr == io.EOF
@@ -422,6 +455,15 @@ func (h *Handler) streamLargeRequest(w http.ResponseWriter, r *http.Request, tra
 		h.writeHTTPResponse(w, respMsg, subdomain, r)
 	case <-streamingDone:
 		// Streaming response has been fully written by SendStreamingChunk
+	case <-ctx.Done():
+		if cancelTransport != nil {
+			cancelTransport()
+		}
+		h.logger.Debug("Streaming HTTP request context cancelled",
+			zap.String("request_id", requestID),
+			zap.String("subdomain", subdomain),
+		)
+		return
 	case <-time.After(5 * time.Minute):
 		h.logger.Error("Streaming request timeout",
 			zap.String("request_id", requestID),
@@ -444,12 +486,12 @@ func (h *Handler) writeHTTPResponse(w http.ResponseWriter, resp *protocol.HTTPRe
 
 		// Skip hop-by-hop headers completely using canonical key comparison
 		if canonicalKey == "Connection" ||
-		   canonicalKey == "Keep-Alive" ||
-		   canonicalKey == "Transfer-Encoding" ||
-		   canonicalKey == "Upgrade" ||
-		   canonicalKey == "Proxy-Connection" ||
-		   canonicalKey == "Te" ||
-		   canonicalKey == "Trailer" {
+			canonicalKey == "Keep-Alive" ||
+			canonicalKey == "Transfer-Encoding" ||
+			canonicalKey == "Upgrade" ||
+			canonicalKey == "Proxy-Connection" ||
+			canonicalKey == "Te" ||
+			canonicalKey == "Trailer" {
 			continue
 		}
 

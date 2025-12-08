@@ -2,6 +2,7 @@ package tcp
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -41,6 +42,8 @@ type Connection struct {
 	httpHandler   http.Handler
 	responseChans HTTPResponseHandler
 	tunnelType    protocol.TunnelType // Track tunnel type
+	ctx           context.Context
+	cancel        context.CancelFunc
 }
 
 // HTTPResponseHandler interface for response channel operations
@@ -56,6 +59,7 @@ type HTTPResponseHandler interface {
 
 // NewConnection creates a new connection handler
 func NewConnection(conn net.Conn, authToken string, manager *tunnel.Manager, logger *zap.Logger, portAlloc *PortAllocator, domain string, publicPort int, httpHandler http.Handler, responseChans HTTPResponseHandler) *Connection {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Connection{
 		conn:          conn,
 		authToken:     authToken,
@@ -68,6 +72,8 @@ func NewConnection(conn net.Conn, authToken string, manager *tunnel.Manager, log
 		responseChans: responseChans,
 		stopCh:        make(chan struct{}),
 		lastHeartbeat: time.Now(),
+		ctx:           ctx,
+		cancel:        cancel,
 	}
 }
 
@@ -287,6 +293,10 @@ func (c *Connection) handleHTTPRequest(reader *bufio.Reader) error {
 			}
 			c.logger.Error("Failed to parse HTTP request", zap.Error(err))
 			return fmt.Errorf("failed to parse HTTP request: %w", err)
+		}
+
+		if c.ctx != nil {
+			req = req.WithContext(c.ctx)
 		}
 
 		c.logger.Info("Processing HTTP request on TCP port",
@@ -588,6 +598,10 @@ func (c *Connection) Close() {
 
 		close(c.stopCh)
 
+		if c.cancel != nil {
+			c.cancel()
+		}
+
 		if c.frameWriter != nil {
 			c.frameWriter.Flush()
 			c.frameWriter.Close()
@@ -621,7 +635,7 @@ func (c *Connection) GetSubdomain() string {
 // httpResponseWriter implements http.ResponseWriter for writing to a net.Conn
 type httpResponseWriter struct {
 	conn          net.Conn
-	writer        *bufio.Writer  // Buffered writer for efficient I/O
+	writer        *bufio.Writer // Buffered writer for efficient I/O
 	header        http.Header
 	statusCode    int
 	headerWritten bool

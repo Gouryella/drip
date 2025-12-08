@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"drip/internal/shared/protocol"
+
 	"go.uber.org/zap"
 )
 
@@ -162,12 +163,12 @@ func (h *ResponseHandler) SendStreamingHead(requestID string, head *protocol.HTT
 
 		// Skip ALL hop-by-hop headers
 		if canonicalKey == "Connection" ||
-		   canonicalKey == "Keep-Alive" ||
-		   canonicalKey == "Transfer-Encoding" ||
-		   canonicalKey == "Upgrade" ||
-		   canonicalKey == "Proxy-Connection" ||
-		   canonicalKey == "Te" ||
-		   canonicalKey == "Trailer" {
+			canonicalKey == "Keep-Alive" ||
+			canonicalKey == "Transfer-Encoding" ||
+			canonicalKey == "Upgrade" ||
+			canonicalKey == "Proxy-Connection" ||
+			canonicalKey == "Te" ||
+			canonicalKey == "Trailer" {
 			continue
 		}
 
@@ -349,7 +350,7 @@ func (h *ResponseHandler) cleanupLoop() {
 
 func (h *ResponseHandler) cleanupExpiredChannels() {
 	now := time.Now()
-	timeout := 30 * time.Second
+	timeout := 5 * time.Minute
 	streamingTimeout := 5 * time.Minute
 
 	h.mu.Lock()

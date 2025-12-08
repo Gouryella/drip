@@ -14,6 +14,7 @@ var stopCmd = &cobra.Command{
 
 Examples:
   drip stop http 3000    Stop HTTP tunnel on port 3000
+  drip stop https 8443   Stop HTTPS tunnel on port 8443
   drip stop tcp 5432     Stop TCP tunnel on port 5432
   drip stop all          Stop all running tunnels
 
@@ -37,8 +38,8 @@ func runStop(cmd *cobra.Command, args []string) error {
 	}
 
 	tunnelType := args[0]
-	if tunnelType != "http" && tunnelType != "tcp" {
-		return fmt.Errorf("invalid tunnel type: %s (must be 'http' or 'tcp')", tunnelType)
+	if tunnelType != "http" && tunnelType != "https" && tunnelType != "tcp" {
+		return fmt.Errorf("invalid tunnel type: %s (must be 'http', 'https', or 'tcp')", tunnelType)
 	}
 
 	port, err := strconv.Atoi(args[1])

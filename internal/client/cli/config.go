@@ -117,9 +117,15 @@ func runConfigShow(cmd *cobra.Command, args []string) error {
 
 	var displayToken string
 	if cfg.Token != "" {
-		if len(cfg.Token) > 10 {
-			displayToken = cfg.Token[:3] + "***" + cfg.Token[len(cfg.Token)-3:]
+		tokenLen := len(cfg.Token)
+		if tokenLen <= 3 {
+			// For very short tokens, just show asterisks
+			displayToken = "***"
+		} else if tokenLen > 10 {
+			// For long tokens, show first 3 and last 3 characters
+			displayToken = cfg.Token[:3] + "***" + cfg.Token[tokenLen-3:]
 		} else {
+			// For medium tokens (4-10 chars), show first 3 characters
 			displayToken = cfg.Token[:3] + "***"
 		}
 	} else {
