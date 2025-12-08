@@ -573,8 +573,15 @@ func (h *Handler) serveHealth(w http.ResponseWriter, r *http.Request) {
 		"timestamp":      time.Now().Unix(),
 	}
 
+	data, err := json.Marshal(health)
+	if err != nil {
+		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(health)
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
+	w.Write(data)
 }
 
 func (h *Handler) serveStats(w http.ResponseWriter, r *http.Request) {
@@ -607,6 +614,13 @@ func (h *Handler) serveStats(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	data, err := json.Marshal(stats)
+	if err != nil {
+		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(stats)
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
+	w.Write(data)
 }
