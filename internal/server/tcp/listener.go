@@ -1,6 +1,7 @@
 package tcp
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"net"
@@ -14,29 +15,30 @@ import (
 	"drip/internal/shared/recovery"
 
 	"go.uber.org/zap"
+	"golang.org/x/net/http2"
 )
 
-// Listener handles TCP connections with TLS 1.3
 type Listener struct {
-	address     string
-	tlsConfig   *tls.Config
-	authToken   string
-	manager     *tunnel.Manager
-	portAlloc   *PortAllocator
-	logger      *zap.Logger
-	domain      string
-	publicPort  int
-	httpHandler http.Handler
-	listener    net.Listener
-	stopCh      chan struct{}
-	wg          sync.WaitGroup
-	connections map[string]*Connection
-	connMu      sync.RWMutex
-	workerPool  *pool.WorkerPool // Worker pool for connection handling
-	recoverer   *recovery.Recoverer
-	panicMetrics  *recovery.PanicMetrics
-
+	address      string
+	tlsConfig    *tls.Config
+	authToken    string
+	manager      *tunnel.Manager
+	portAlloc    *PortAllocator
+	logger       *zap.Logger
+	domain       string
+	publicPort   int
+	httpHandler  http.Handler
+	listener     net.Listener
+	stopCh       chan struct{}
+	wg           sync.WaitGroup
+	connections  map[string]*Connection
+	connMu       sync.RWMutex
+	workerPool   *pool.WorkerPool
+	recoverer    *recovery.Recoverer
+	panicMetrics *recovery.PanicMetrics
 	groupManager *ConnectionGroupManager
+	httpServer   *http.Server
+	httpListener *connQueueListener
 }
 
 func NewListener(address string, tlsConfig *tls.Config, authToken string, manager *tunnel.Manager, logger *zap.Logger, portAlloc *PortAllocator, domain string, publicPort int, httpHandler http.Handler) *Listener {
@@ -73,7 +75,6 @@ func NewListener(address string, tlsConfig *tls.Config, authToken string, manage
 	}
 }
 
-// Start starts the TCP listener
 func (l *Listener) Start() error {
 	var err error
 
@@ -87,13 +88,39 @@ func (l *Listener) Start() error {
 		zap.String("tls_version", "TLS 1.3"),
 	)
 
+	l.httpListener = newConnQueueListener(l.listener.Addr(), 4096)
+
+	l.httpServer = &http.Server{
+		Handler:           l.httpHandler,
+		ReadHeaderTimeout: 30 * time.Second,
+		ReadTimeout:       0,
+		WriteTimeout:      0,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
+
+	if err := http2.ConfigureServer(l.httpServer, &http2.Server{
+		MaxConcurrentStreams: 1000,
+		IdleTimeout:          120 * time.Second,
+	}); err != nil {
+		l.logger.Warn("Failed to configure HTTP/2", zap.Error(err))
+	}
+
+	l.wg.Add(1)
+	go func() {
+		defer l.wg.Done()
+		l.logger.Info("HTTP server started (with context cancellation support)")
+		if err := l.httpServer.Serve(l.httpListener); err != nil && err != http.ErrServerClosed {
+			l.logger.Error("HTTP server error", zap.Error(err))
+		}
+	}()
+
 	l.wg.Add(1)
 	go l.acceptLoop()
 
 	return nil
 }
 
-// acceptLoop accepts incoming connections
 func (l *Listener) acceptLoop() {
 	defer l.wg.Done()
 	defer l.recoverer.Recover("acceptLoop")
@@ -105,7 +132,6 @@ func (l *Listener) acceptLoop() {
 		default:
 		}
 
-		// Set accept deadline to allow checking stopCh
 		if tcpListener, ok := l.listener.(*net.TCPListener); ok {
 			tcpListener.SetDeadline(time.Now().Add(1 * time.Second))
 		}
@@ -113,7 +139,7 @@ func (l *Listener) acceptLoop() {
 		conn, err := l.listener.Accept()
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				continue // Timeout is expected due to deadline
+				continue
 			}
 			select {
 			case <-l.stopCh:
@@ -143,10 +169,8 @@ func (l *Listener) acceptLoop() {
 	}
 }
 
-// handleConnection handles a single client connection
 func (l *Listener) handleConnection(netConn net.Conn) {
 	defer l.wg.Done()
-	defer netConn.Close()
 	defer l.recoverer.RecoverWithCallback("handleConnection", func(p interface{}) {
 		connID := netConn.RemoteAddr().String()
 		l.connMu.Lock()
@@ -160,7 +184,6 @@ func (l *Listener) handleConnection(netConn net.Conn) {
 		return
 	}
 
-	// Set read deadline before handshake to prevent slow handshake attacks
 	if err := tlsConn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
 		l.logger.Warn("Failed to set read deadline",
 			zap.String("remote_addr", netConn.RemoteAddr().String()),
@@ -177,7 +200,6 @@ func (l *Listener) handleConnection(netConn net.Conn) {
 		return
 	}
 
-	// Clear the read deadline after successful handshake
 	if err := tlsConn.SetReadDeadline(time.Time{}); err != nil {
 		l.logger.Warn("Failed to clear read deadline",
 			zap.String("remote_addr", netConn.RemoteAddr().String()),
@@ -208,7 +230,7 @@ func (l *Listener) handleConnection(netConn net.Conn) {
 		return
 	}
 
-	conn := NewConnection(netConn, l.authToken, l.manager, l.logger, l.portAlloc, l.domain, l.publicPort, l.httpHandler, l.groupManager)
+	conn := NewConnection(netConn, l.authToken, l.manager, l.logger, l.portAlloc, l.domain, l.publicPort, l.httpHandler, l.groupManager, l.httpListener)
 
 	connID := netConn.RemoteAddr().String()
 	l.connMu.Lock()
@@ -219,12 +241,15 @@ func (l *Listener) handleConnection(netConn net.Conn) {
 		l.connMu.Lock()
 		delete(l.connections, connID)
 		l.connMu.Unlock()
+
+		if !conn.IsHandedOff() {
+			netConn.Close()
+		}
 	}()
 
 	if err := conn.Handle(); err != nil {
 		errStr := err.Error()
 
-		// Client disconnection errors - normal network behavior, ignore
 		if strings.Contains(errStr, "EOF") ||
 			strings.Contains(errStr, "connection reset by peer") ||
 			strings.Contains(errStr, "broken pipe") ||
@@ -232,7 +257,6 @@ func (l *Listener) handleConnection(netConn net.Conn) {
 			return
 		}
 
-		// Protocol errors (invalid clients, scanners) are expected - log as WARN
 		if strings.Contains(errStr, "payload too large") ||
 			strings.Contains(errStr, "failed to read registration frame") ||
 			strings.Contains(errStr, "expected register frame") ||
@@ -243,7 +267,6 @@ func (l *Listener) handleConnection(netConn net.Conn) {
 				zap.Error(err),
 			)
 		} else {
-			// Legitimate errors (auth failures, registration failures, etc.)
 			l.logger.Error("Connection handling failed",
 				zap.String("remote_addr", connID),
 				zap.Error(err),
@@ -252,11 +275,23 @@ func (l *Listener) handleConnection(netConn net.Conn) {
 	}
 }
 
-// Stop stops the listener and closes all connections
 func (l *Listener) Stop() error {
 	l.logger.Info("Stopping TCP listener")
 
 	close(l.stopCh)
+
+	if l.httpServer != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := l.httpServer.Shutdown(shutdownCtx); err != nil {
+			l.logger.Warn("HTTP server shutdown error", zap.Error(err))
+		}
+		l.logger.Info("HTTP server shutdown complete")
+	}
+
+	if l.httpListener != nil {
+		l.httpListener.Close()
+	}
 
 	if l.listener != nil {
 		if err := l.listener.Close(); err != nil {
@@ -284,7 +319,6 @@ func (l *Listener) Stop() error {
 	return nil
 }
 
-// GetActiveConnections returns the number of active connections
 func (l *Listener) GetActiveConnections() int {
 	l.connMu.RLock()
 	defer l.connMu.RUnlock()

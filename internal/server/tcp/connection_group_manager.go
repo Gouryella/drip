@@ -3,8 +3,6 @@ package tcp
 import (
 	"crypto/rand"
 	"encoding/hex"
-	"fmt"
-	"net"
 	"sync"
 	"time"
 
@@ -82,26 +80,6 @@ func (m *ConnectionGroupManager) RemoveGroup(tunnelID string) {
 	if ok && group != nil {
 		group.Close()
 	}
-}
-
-// AddDataConnection adds a data connection to a group
-func (m *ConnectionGroupManager) AddDataConnection(req *protocol.DataConnectRequest, conn net.Conn) (*DataConnection, error) {
-	m.mu.RLock()
-	group, ok := m.groups[req.TunnelID]
-	m.mu.RUnlock()
-
-	if !ok {
-		return nil, fmt.Errorf("tunnel not found: %s", req.TunnelID)
-	}
-
-	// Validate token
-	if group.Token != "" && req.Token != group.Token {
-		return nil, fmt.Errorf("invalid token")
-	}
-
-	dataConn := group.AddDataConnection(req.ConnectionID, conn)
-
-	return dataConn, nil
 }
 
 // cleanupLoop periodically cleans up stale groups

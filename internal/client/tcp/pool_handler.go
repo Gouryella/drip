@@ -18,7 +18,6 @@ import (
 	"go.uber.org/zap"
 )
 
-// handleStream routes incoming stream to appropriate handler.
 func (c *PoolClient) handleStream(h *sessionHandle, stream net.Conn) {
 	defer c.wg.Done()
 	defer func() {
@@ -35,7 +34,6 @@ func (c *PoolClient) handleStream(h *sessionHandle, stream net.Conn) {
 	}
 }
 
-// handleTCPStream handles raw TCP tunneling.
 func (c *PoolClient) handleTCPStream(stream net.Conn) {
 	localConn, err := net.DialTimeout("tcp", net.JoinHostPort(c.localHost, fmt.Sprintf("%d", c.localPort)), 10*time.Second)
 	if err != nil {
@@ -62,7 +60,6 @@ func (c *PoolClient) handleTCPStream(stream net.Conn) {
 	)
 }
 
-// handleHTTPStream handles HTTP/HTTPS proxy requests.
 func (c *PoolClient) handleHTTPStream(stream net.Conn) {
 	_ = stream.SetReadDeadline(time.Now().Add(30 * time.Second))
 
@@ -103,6 +100,8 @@ func (c *PoolClient) handleHTTPStream(stream net.Conn) {
 	origHost := req.Host
 	httputil.CopyHeaders(outReq.Header, req.Header)
 	httputil.CleanHopByHopHeaders(outReq.Header)
+
+	outReq.Header.Del("Accept-Encoding")
 
 	targetHost := c.localHost
 	if c.localPort != 80 && c.localPort != 443 {
@@ -153,7 +152,6 @@ func (c *PoolClient) handleHTTPStream(stream net.Conn) {
 	close(done)
 }
 
-// handleWebSocketUpgrade handles WebSocket upgrade requests.
 func (c *PoolClient) handleWebSocketUpgrade(cc net.Conn, req *http.Request) {
 	scheme := "ws"
 	if c.tunnelType == protocol.TunnelTypeHTTPS {
@@ -207,7 +205,6 @@ func (c *PoolClient) handleWebSocketUpgrade(cc net.Conn, req *http.Request) {
 	}
 }
 
-// newLocalHTTPClient creates an HTTP client for local service requests.
 func newLocalHTTPClient(tunnelType protocol.TunnelType) *http.Client {
 	var tlsConfig *tls.Config
 	if tunnelType == protocol.TunnelTypeHTTPS {

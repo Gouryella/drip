@@ -39,7 +39,7 @@ func (c *Connection) handleTCPTunnel(reader *bufio.Reader) error {
 	c.session = session
 
 	openStream := session.Open
-	if c.tunnelID != "" && c.groupManager != nil {
+	if c.groupManager != nil {
 		if group, ok := c.groupManager.GetGroup(c.tunnelID); ok && group != nil {
 			group.AddSession("primary", session)
 			openStream = group.OpenStream
@@ -78,7 +78,7 @@ func (c *Connection) handleHTTPProxyTunnel(reader *bufio.Reader) error {
 	c.session = session
 
 	openStream := session.Open
-	if c.tunnelID != "" && c.groupManager != nil {
+	if c.groupManager != nil {
 		if group, ok := c.groupManager.GetGroup(c.tunnelID); ok && group != nil {
 			group.AddSession("primary", session)
 			openStream = group.OpenStream

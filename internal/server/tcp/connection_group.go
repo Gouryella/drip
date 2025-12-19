@@ -15,23 +15,11 @@ import (
 	"go.uber.org/zap"
 )
 
-
-type DataConnection struct {
-	ID         string
-	Conn       net.Conn
-	LastActive time.Time
-	closed     bool
-	closedMu   sync.RWMutex
-	stopCh     chan struct{}
-	mu         sync.RWMutex
-}
-
 type ConnectionGroup struct {
 	TunnelID     string
 	Subdomain    string
 	Token        string
 	PrimaryConn  *Connection
-	DataConns    map[string]*DataConnection
 	Sessions     map[string]*yamux.Session
 	TunnelType   protocol.TunnelType
 	RegisteredAt time.Time
@@ -50,7 +38,6 @@ func NewConnectionGroup(tunnelID, subdomain, token string, primaryConn *Connecti
 		Subdomain:    subdomain,
 		Token:        token,
 		PrimaryConn:  primaryConn,
-		DataConns:    make(map[string]*DataConnection),
 		Sessions:     make(map[string]*yamux.Session),
 		TunnelType:   tunnelType,
 		RegisteredAt: time.Now(),
@@ -146,46 +133,6 @@ func (g *ConnectionGroup) heartbeatLoop(interval, timeout time.Duration) {
 	}
 }
 
-func (g *ConnectionGroup) AddDataConnection(connID string, conn net.Conn) *DataConnection {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-
-	dataConn := &DataConnection{
-		ID:         connID,
-		Conn:       conn,
-		LastActive: time.Now(),
-		stopCh:     make(chan struct{}),
-	}
-	g.DataConns[connID] = dataConn
-	g.LastActivity = time.Now()
-	return dataConn
-}
-
-func (g *ConnectionGroup) RemoveDataConnection(connID string) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-
-	if dataConn, ok := g.DataConns[connID]; ok {
-		dataConn.closedMu.Lock()
-		if !dataConn.closed {
-			dataConn.closed = true
-			close(dataConn.stopCh)
-			if dataConn.Conn != nil {
-				_ = dataConn.Conn.SetDeadline(time.Now())
-				dataConn.Conn.Close()
-			}
-		}
-		dataConn.closedMu.Unlock()
-		delete(g.DataConns, connID)
-	}
-}
-
-func (g *ConnectionGroup) DataConnectionCount() int {
-	g.mu.RLock()
-	defer g.mu.RUnlock()
-	return len(g.DataConns)
-}
-
 func (g *ConnectionGroup) Close() {
 	g.mu.Lock()
 
@@ -197,12 +144,6 @@ func (g *ConnectionGroup) Close() {
 		close(g.stopCh)
 	}
 
-	dataConns := make([]*DataConnection, 0, len(g.DataConns))
-	for _, dataConn := range g.DataConns {
-		dataConns = append(dataConns, dataConn)
-	}
-	g.DataConns = make(map[string]*DataConnection)
-
 	sessions := make([]*yamux.Session, 0, len(g.Sessions))
 	for _, session := range g.Sessions {
 		if session != nil {
@@ -212,19 +153,6 @@ func (g *ConnectionGroup) Close() {
 	g.Sessions = make(map[string]*yamux.Session)
 
 	g.mu.Unlock()
-
-	for _, dataConn := range dataConns {
-		dataConn.closedMu.Lock()
-		if !dataConn.closed {
-			dataConn.closed = true
-			close(dataConn.stopCh)
-			if dataConn.Conn != nil {
-				_ = dataConn.Conn.SetDeadline(time.Now())
-				_ = dataConn.Conn.Close()
-			}
-		}
-		dataConn.closedMu.Unlock()
-	}
 
 	for _, session := range sessions {
 		_ = session.Close()
@@ -302,7 +230,13 @@ func (g *ConnectionGroup) OpenStream() (net.Conn, error) {
 		default:
 		}
 
-		sessions := g.sessionsSnapshot()
+		// Prefer data sessions for data-plane traffic; keep the primary session
+		// as control-plane (client ping/latency), and only fall back to primary
+		// when no data session exists.
+		sessions := g.sessionsSnapshot(false)
+		if len(sessions) == 0 {
+			sessions = g.sessionsSnapshot(true)
+		}
 		if len(sessions) == 0 {
 			return nil, net.ErrClosed
 		}
@@ -380,7 +314,10 @@ func (g *ConnectionGroup) OpenStream() (net.Conn, error) {
 }
 
 func (g *ConnectionGroup) selectSession() *yamux.Session {
-	sessions := g.sessionsSnapshot()
+	sessions := g.sessionsSnapshot(false)
+	if len(sessions) == 0 {
+		sessions = g.sessionsSnapshot(true)
+	}
 	if len(sessions) == 0 {
 		return nil
 	}
@@ -403,7 +340,7 @@ func (g *ConnectionGroup) selectSession() *yamux.Session {
 	return best
 }
 
-func (g *ConnectionGroup) sessionsSnapshot() []*yamux.Session {
+func (g *ConnectionGroup) sessionsSnapshot(includePrimary bool) []*yamux.Session {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
@@ -415,6 +352,9 @@ func (g *ConnectionGroup) sessionsSnapshot() []*yamux.Session {
 	for id, session := range g.Sessions {
 		if session == nil || session.IsClosed() {
 			delete(g.Sessions, id)
+			continue
+		}
+		if id == "primary" && !includePrimary {
 			continue
 		}
 		sessions = append(sessions, session)
