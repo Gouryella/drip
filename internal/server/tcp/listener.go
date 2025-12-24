@@ -92,11 +92,11 @@ func (l *Listener) Start() error {
 
 	l.httpServer = &http.Server{
 		Handler:           l.httpHandler,
-		ReadHeaderTimeout: 30 * time.Second,
-		ReadTimeout:       0,
-		WriteTimeout:      0,
-		IdleTimeout:       120 * time.Second,
-		MaxHeaderBytes:    1 << 20,
+		ReadHeaderTimeout: 10 * time.Second,  // Time to read request headers
+		ReadTimeout:       30 * time.Second,  // Total time to read request (prevents slow-loris)
+		WriteTimeout:      60 * time.Second,  // Time to write response (allows large responses)
+		IdleTimeout:       120 * time.Second, // Keep-alive timeout
+		MaxHeaderBytes:    1 << 18,           // 256KB max header size (reduced from 1MB)
 	}
 
 	if err := http2.ConfigureServer(l.httpServer, &http2.Server{

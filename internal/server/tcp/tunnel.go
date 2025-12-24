@@ -3,12 +3,11 @@ package tcp
 import (
 	"bufio"
 	"fmt"
-	"io"
 	"net"
 
 	"github.com/hashicorp/yamux"
 
-	"drip/internal/shared/constants"
+	"drip/internal/shared/mux"
 )
 
 type bufferedConn struct {
@@ -27,10 +26,8 @@ func (c *Connection) handleTCPTunnel(reader *bufio.Reader) error {
 		reader: reader,
 	}
 
-	cfg := yamux.DefaultConfig()
-	cfg.EnableKeepAlive = false
-	cfg.LogOutput = io.Discard
-	cfg.AcceptBacklog = constants.YamuxAcceptBacklog
+	// Use optimized mux config for server
+	cfg := mux.NewServerConfig()
 
 	session, err := yamux.Client(bc, cfg)
 	if err != nil {
@@ -66,10 +63,8 @@ func (c *Connection) handleHTTPProxyTunnel(reader *bufio.Reader) error {
 		reader: reader,
 	}
 
-	cfg := yamux.DefaultConfig()
-	cfg.EnableKeepAlive = false
-	cfg.LogOutput = io.Discard
-	cfg.AcceptBacklog = constants.YamuxAcceptBacklog
+	// Use optimized mux config for server
+	cfg := mux.NewServerConfig()
 
 	session, err := yamux.Client(bc, cfg)
 	if err != nil {

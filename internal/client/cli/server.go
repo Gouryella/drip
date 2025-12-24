@@ -13,6 +13,7 @@ import (
 	"drip/internal/server/tcp"
 	"drip/internal/server/tunnel"
 	"drip/internal/shared/constants"
+	"drip/internal/shared/tuning"
 	"drip/internal/shared/utils"
 	"drip/pkg/config"
 	"github.com/spf13/cobra"
@@ -60,6 +61,9 @@ func init() {
 }
 
 func runServer(_ *cobra.Command, _ []string) error {
+	// Apply server-mode GC tuning (high throughput, more memory)
+	tuning.ApplyMode(tuning.ModeServer)
+
 	if serverTLSCert == "" {
 		return fmt.Errorf("TLS certificate path is required (use --tls-cert flag or DRIP_TLS_CERT environment variable)")
 	}

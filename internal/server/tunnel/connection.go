@@ -20,9 +20,10 @@ type Connection struct {
 	LastActive time.Time
 	mu         sync.RWMutex
 	logger     *zap.Logger
-	closed     bool
+	closed     atomic.Bool // Use atomic for lock-free hot path checks
 	tunnelType protocol.TunnelType
 	openStream func() (net.Conn, error)
+	remoteIP   string // Client IP for rate limiting tracking
 
 	bytesIn           atomic.Int64
 	bytesOut          atomic.Int64
@@ -38,18 +39,15 @@ func NewConnection(subdomain string, conn *websocket.Conn, logger *zap.Logger) *
 		CloseCh:    make(chan struct{}),
 		LastActive: time.Now(),
 		logger:     logger,
-		closed:     false,
 	}
 }
 
 // Send sends data through the WebSocket connection
 func (c *Connection) Send(data []byte) error {
-	c.mu.RLock()
-	if c.closed {
-		c.mu.RUnlock()
+	// Lock-free check using atomic - avoids RLock contention on hot path
+	if c.closed.Load() {
 		return ErrConnectionClosed
 	}
-	c.mu.RUnlock()
 
 	select {
 	case c.SendCh <- data:
@@ -75,14 +73,14 @@ func (c *Connection) IsAlive(timeout time.Duration) bool {
 
 // Close closes the connection and all associated channels
 func (c *Connection) Close() {
+	// Use atomic swap to ensure only one goroutine closes
+	if c.closed.Swap(true) {
+		return // Already closed
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.closed {
-		return
-	}
-
-	c.closed = true
 	close(c.CloseCh)
 	close(c.SendCh)
 
@@ -100,9 +98,7 @@ func (c *Connection) Close() {
 
 // IsClosed returns whether the connection is closed
 func (c *Connection) IsClosed() bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.closed
+	return c.closed.Load() // Lock-free check
 }
 
 // SetTunnelType sets the tunnel type.
@@ -119,8 +115,7 @@ func (c *Connection) GetTunnelType() protocol.TunnelType {
 	return c.tunnelType
 }
 
-// SetOpenStream registers a yamux stream opener for this tunnel.
-// It is used by the HTTP proxy to forward each request over a mux stream.
+// SetOpenStream registers a stream opener for this tunnel.
 func (c *Connection) SetOpenStream(open func() (net.Conn, error)) {
 	c.mu.Lock()
 	c.openStream = open
@@ -129,12 +124,16 @@ func (c *Connection) SetOpenStream(open func() (net.Conn, error)) {
 
 // OpenStream opens a new mux stream to the tunnel client.
 func (c *Connection) OpenStream() (net.Conn, error) {
+	// Lock-free closed check
+	if c.closed.Load() {
+		return nil, ErrConnectionClosed
+	}
+
 	c.mu.RLock()
 	open := c.openStream
-	closed := c.closed
 	c.mu.RUnlock()
 
-	if closed || open == nil {
+	if open == nil {
 		return nil, ErrConnectionClosed
 	}
 	return open()
@@ -178,17 +177,11 @@ func (c *Connection) GetActiveConnections() int64 {
 
 // StartWritePump starts the write pump for sending messages
 func (c *Connection) StartWritePump() {
-	// Skip write pump for TCP-only connections (no WebSocket)
 	if c.Conn == nil {
-		c.logger.Debug("Skipping WritePump for TCP connection",
-			zap.String("subdomain", c.Subdomain),
-		)
-		// Still need to drain SendCh to prevent blocking
 		go func() {
 			for {
 				select {
 				case <-c.SendCh:
-					// Discard messages for TCP mode
 				case <-c.CloseCh:
 					return
 				}

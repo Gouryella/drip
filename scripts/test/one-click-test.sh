@@ -66,7 +66,7 @@ cleanup() {
     fi
 
     # Extra cleanup: ensure ports are released
-    pkill -f "python.*${HTTP_TEST_PORT}" 2>/dev/null || true
+    pkill -f "test-server.*${HTTP_TEST_PORT}" 2>/dev/null || true
     pkill -f "drip server.*${DRIP_SERVER_PORT}" 2>/dev/null || true
     pkill -f "drip http ${HTTP_TEST_PORT}" 2>/dev/null || true
 
@@ -86,8 +86,8 @@ check_dependencies() {
         missing="${missing}\n  - wrk (brew install wrk)"
     fi
 
-    if ! command -v python3 &> /dev/null; then
-        missing="${missing}\n  - python3"
+    if ! command -v go &> /dev/null; then
+        missing="${missing}\n  - go (https://go.dev/dl/)"
     fi
 
     if ! command -v openssl &> /dev/null; then
@@ -157,42 +157,28 @@ wait_for_port() {
     return 0
 }
 
-# Start HTTP test server
+# Start HTTP test server (high-performance Go server)
 start_http_server() {
     log_step "Starting HTTP test server (port $HTTP_TEST_PORT)..."
 
-    # Create simple test server
-    cat > "${LOG_DIR}/test-server.py" << 'EOF'
-import http.server
-import socketserver
-import json
-from datetime import datetime
-import sys
+    # Build Go test server
+    local test_server_dir="scripts/test/test-server"
+    local test_server_bin="${LOG_DIR}/test-server"
 
-PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 3000
+    if [ ! -d "$test_server_dir" ]; then
+        log_error "Test server source not found: $test_server_dir"
+        exit 1
+    fi
 
-class TestHandler(http.server.SimpleHTTPRequestHandler):
-    def do_GET(self):
-        response = {
-            "status": "ok",
-            "timestamp": datetime.now().isoformat(),
-            "message": "Test server response"
-        }
+    log_info "Building Go test server..."
+    if ! go build -o "$test_server_bin" "./$test_server_dir" > "${LOG_DIR}/build.log" 2>&1; then
+        log_error "Failed to build test server"
+        cat "${LOG_DIR}/build.log"
+        exit 1
+    fi
 
-        self.send_response(200)
-        self.send_header('Content-type', 'application/json')
-        self.end_headers()
-        self.wfile.write(json.dumps(response).encode())
-
-    def log_message(self, format, *args):
-        pass  # Silent logging
-
-with socketserver.TCPServer(("", PORT), TestHandler) as httpd:
-    print(f"Server started on port {PORT}", flush=True)
-    httpd.serve_forever()
-EOF
-
-    python3 "${LOG_DIR}/test-server.py" "$HTTP_TEST_PORT" \
+    # Start the Go test server
+    "$test_server_bin" -port "$HTTP_TEST_PORT" \
         > "${LOG_DIR}/http-server.log" 2>&1 &
     local pid=$!
     echo "$pid" >> "$PIDS_FILE"
@@ -201,6 +187,7 @@ EOF
         log_info "✓ HTTP test server started (PID: $pid)"
     else
         log_error "HTTP test server failed to start"
+        cat "${LOG_DIR}/http-server.log"
         exit 1
     fi
 }
@@ -475,12 +462,12 @@ main() {
         exit 1
     fi
 
-    # Warm up
+    # Warm up (sequential to ensure connection pool is ready)
     log_info "Warming up tunnel (5s)..."
-    for _ in {1..5}; do
-        curl -sk "$TUNNEL_URL" > /dev/null 2>&1 || true
-        sleep 1
+    for _ in {1..20}; do
+        curl -sk --max-time 2 "$TUNNEL_URL" > /dev/null 2>&1 || true
     done
+    sleep 2
 
     # Run tests
     run_performance_tests "$TUNNEL_URL"

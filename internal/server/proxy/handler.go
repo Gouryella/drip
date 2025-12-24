@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	json "github.com/goccy/go-json"
@@ -16,12 +17,20 @@ import (
 	"drip/internal/server/tunnel"
 	"drip/internal/shared/httputil"
 	"drip/internal/shared/netutil"
+	"drip/internal/shared/pool"
 	"drip/internal/shared/protocol"
 
 	"go.uber.org/zap"
 )
 
-const openStreamTimeout = 10 * time.Second
+// bufio.Reader pool to reduce allocations on hot path
+var bufioReaderPool = sync.Pool{
+	New: func() interface{} {
+		return bufio.NewReaderSize(nil, 32*1024)
+	},
+}
+
+const openStreamTimeout = 3 * time.Second
 
 type Handler struct {
 	manager   *tunnel.Manager
@@ -104,13 +113,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := http.ReadResponse(bufio.NewReaderSize(countingStream, 32*1024), r)
+	reader := bufioReaderPool.Get().(*bufio.Reader)
+	reader.Reset(countingStream)
+	resp, err := http.ReadResponse(reader, r)
 	if err != nil {
+		bufioReaderPool.Put(reader)
 		w.Header().Set("Connection", "close")
 		http.Error(w, "Read response failed", http.StatusBadGateway)
 		return
 	}
-	defer resp.Body.Close()
+	defer func() {
+		resp.Body.Close()
+		bufioReaderPool.Put(reader)
+	}()
 
 	h.copyResponseHeaders(w.Header(), resp.Header, r.Host)
 
@@ -147,7 +162,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	_, _ = io.Copy(w, resp.Body)
+	// Use pooled buffer for zero-copy optimization
+	buf := pool.GetBuffer(pool.SizeLarge)
+	_, _ = io.CopyBuffer(w, resp.Body, (*buf)[:])
+	pool.PutBuffer(buf)
+
 	close(done)
 	stream.Close()
 }
@@ -158,10 +177,18 @@ func (h *Handler) openStreamWithTimeout(tconn *tunnel.Connection) (net.Conn, err
 		err    error
 	}
 	ch := make(chan result, 1)
+	done := make(chan struct{})
+	defer close(done)
 
 	go func() {
 		s, err := tconn.OpenStream()
-		ch <- result{s, err}
+		select {
+		case ch <- result{s, err}:
+		case <-done:
+			if s != nil {
+				s.Close()
+			}
+		}
 	}()
 
 	select {
@@ -349,32 +376,30 @@ func (h *Handler) serveHealth(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) serveStats(w http.ResponseWriter, r *http.Request) {
 	if h.authToken != "" {
-		token := r.URL.Query().Get("token")
-		if token == "" {
-			authHeader := r.Header.Get("Authorization")
-			if strings.HasPrefix(authHeader, "Bearer ") {
-				token = strings.TrimPrefix(authHeader, "Bearer ")
-			}
+		// Only accept token via Authorization header (Bearer token)
+		// URL query parameters are insecure (logged, cached, visible in browser history)
+		var token string
+		authHeader := r.Header.Get("Authorization")
+		if strings.HasPrefix(authHeader, "Bearer ") {
+			token = strings.TrimPrefix(authHeader, "Bearer ")
 		}
 
 		if token != h.authToken {
-			http.Error(w, "Unauthorized: invalid or missing token", http.StatusUnauthorized)
+			w.Header().Set("WWW-Authenticate", `Bearer realm="stats"`)
+			http.Error(w, "Unauthorized: provide token via 'Authorization: Bearer <token>' header", http.StatusUnauthorized)
 			return
 		}
 	}
 
 	connections := h.manager.List()
 
-	stats := map[string]interface{}{
-		"total_tunnels": len(connections),
-		"tunnels":       []map[string]interface{}{},
-	}
-
+	// Pre-allocate slice to avoid O(n²) reallocations
+	tunnelStats := make([]map[string]interface{}, 0, len(connections))
 	for _, conn := range connections {
 		if conn == nil {
 			continue
 		}
-		stats["tunnels"] = append(stats["tunnels"].([]map[string]interface{}), map[string]interface{}{
+		tunnelStats = append(tunnelStats, map[string]interface{}{
 			"subdomain":          conn.Subdomain,
 			"tunnel_type":        string(conn.GetTunnelType()),
 			"last_active":        conn.LastActive.Unix(),
@@ -383,6 +408,11 @@ func (h *Handler) serveStats(w http.ResponseWriter, r *http.Request) {
 			"active_connections": conn.GetActiveConnections(),
 			"total_bytes":        conn.GetBytesIn() + conn.GetBytesOut(),
 		})
+	}
+
+	stats := map[string]interface{}{
+		"total_tunnels": len(tunnelStats),
+		"tunnels":       tunnelStats,
 	}
 
 	data, err := json.Marshal(stats)

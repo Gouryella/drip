@@ -18,10 +18,18 @@ import (
 
 	"drip/internal/server/tunnel"
 	"drip/internal/shared/constants"
+	"drip/internal/shared/mux"
 	"drip/internal/shared/protocol"
 
 	"go.uber.org/zap"
 )
+
+// bufioWriterPool reuses bufio.Writer instances to reduce GC pressure
+var bufioWriterPool = sync.Pool{
+	New: func() interface{} {
+		return bufio.NewWriterSize(nil, 4096)
+	},
+}
 
 type Connection struct {
 	conn          net.Conn
@@ -344,9 +352,13 @@ func (c *Connection) handleHTTPRequestLegacy(reader *bufio.Reader) error {
 			zap.String("host", req.Host),
 		)
 
+		// Get writer from pool to reduce GC pressure
+		pooledWriter := bufioWriterPool.Get().(*bufio.Writer)
+		pooledWriter.Reset(c.conn)
+
 		respWriter := &httpResponseWriter{
 			conn:   c.conn,
-			writer: bufio.NewWriterSize(c.conn, 4096),
+			writer: pooledWriter,
 			header: make(http.Header),
 		}
 
@@ -356,10 +368,12 @@ func (c *Connection) handleHTTPRequestLegacy(reader *bufio.Reader) error {
 			c.logger.Debug("Failed to flush HTTP response", zap.Error(err))
 		}
 
-		if tcpConn, ok := c.conn.(*net.TCPConn); ok {
-			tcpConn.SetNoDelay(true)
-			tcpConn.SetNoDelay(false)
-		}
+		// Return writer to pool
+		pooledWriter.Reset(nil) // Clear reference to connection
+		bufioWriterPool.Put(pooledWriter)
+
+		// Keep TCP_NODELAY enabled for low latency HTTP responses
+		// (removed the toggle that was disabling it)
 
 		c.logger.Debug("HTTP request processing completed",
 			zap.String("method", req.Method),
@@ -673,10 +687,8 @@ func (c *Connection) handleDataConnect(frame *protocol.Frame, reader *bufio.Read
 		reader: reader,
 	}
 
-	cfg := yamux.DefaultConfig()
-	cfg.EnableKeepAlive = false
-	cfg.LogOutput = io.Discard
-	cfg.AcceptBacklog = constants.YamuxAcceptBacklog
+	// Use optimized mux config for server
+	cfg := mux.NewServerConfig()
 
 	session, err := yamux.Client(bc, cfg)
 	if err != nil {

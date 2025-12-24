@@ -11,7 +11,9 @@ import (
 
 const (
 	FrameHeaderSize = 5
-	MaxFrameSize    = 10 * 1024 * 1024
+	// MaxFrameSize limits payload size to prevent memory exhaustion attacks.
+	// 1MB is sufficient for most HTTP requests/responses while limiting DoS impact.
+	MaxFrameSize = 1 * 1024 * 1024 // 1MB (reduced from 10MB)
 )
 
 // FrameType defines the type of frame
@@ -88,8 +90,9 @@ func WriteFrame(w io.Writer, frame *Frame) error {
 }
 
 func ReadFrame(r io.Reader) (*Frame, error) {
-	header := make([]byte, FrameHeaderSize)
-	if _, err := io.ReadFull(r, header); err != nil {
+	// Use stack-allocated array to avoid heap allocation
+	var header [FrameHeaderSize]byte
+	if _, err := io.ReadFull(r, header[:]); err != nil {
 		return nil, fmt.Errorf("failed to read frame header: %w", err)
 	}
 

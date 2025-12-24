@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"runtime"
@@ -17,6 +16,7 @@ import (
 	"go.uber.org/zap"
 
 	"drip/internal/shared/constants"
+	"drip/internal/shared/mux"
 	"drip/internal/shared/protocol"
 	"drip/internal/shared/stats"
 	"drip/pkg/config"
@@ -202,10 +202,7 @@ func (c *PoolClient) Connect() error {
 		c.tunnelID = resp.TunnelID
 	}
 
-	yamuxCfg := yamux.DefaultConfig()
-	yamuxCfg.EnableKeepAlive = false
-	yamuxCfg.LogOutput = io.Discard
-	yamuxCfg.AcceptBacklog = constants.YamuxAcceptBacklog
+	yamuxCfg := mux.NewClientConfig()
 
 	session, err := yamux.Server(primaryConn, yamuxCfg)
 	if err != nil {
@@ -241,7 +238,7 @@ func (c *PoolClient) Connect() error {
 		c.desiredTotal = c.initialSessions
 		c.mu.Unlock()
 
-		c.ensureSessions()
+		c.warmupSessions()
 
 		c.wg.Add(1)
 		go c.scalerLoop()

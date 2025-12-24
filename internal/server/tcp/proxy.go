@@ -182,17 +182,25 @@ func (p *Proxy) handleConn(conn net.Conn) {
 		return
 	}
 
-	// Open stream with timeout to prevent goroutine leak
-	const openStreamTimeout = 10 * time.Second
+	const openStreamTimeout = 3 * time.Second
 	type streamResult struct {
 		stream net.Conn
 		err    error
 	}
 	resultCh := make(chan streamResult, 1)
 
+	ctx, cancel := context.WithTimeout(p.ctx, openStreamTimeout)
+	defer cancel()
+
 	go func() {
 		s, err := p.openStream()
-		resultCh <- streamResult{s, err}
+		select {
+		case resultCh <- streamResult{s, err}:
+		case <-ctx.Done():
+			if s != nil {
+				s.Close()
+			}
+		}
 	}()
 
 	var stream net.Conn
@@ -205,7 +213,7 @@ func (p *Proxy) handleConn(conn net.Conn) {
 			return
 		}
 		stream = result.stream
-	case <-time.After(openStreamTimeout):
+	case <-ctx.Done():
 		p.logger.Debug("Open stream timeout")
 		return
 	case <-p.stopCh:

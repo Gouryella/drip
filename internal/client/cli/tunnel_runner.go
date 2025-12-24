@@ -9,8 +9,10 @@ import (
 	"time"
 
 	"drip/internal/client/tcp"
+	"drip/internal/shared/tuning"
 	"drip/internal/shared/ui"
 	"drip/internal/shared/utils"
+
 	"go.uber.org/zap"
 )
 
@@ -20,6 +22,8 @@ const (
 )
 
 func runTunnelWithUI(connConfig *tcp.ConnectorConfig, daemonInfo *DaemonInfo) error {
+	tuning.ApplyMode(tuning.ModeClient)
+
 	if err := utils.InitLogger(verbose); err != nil {
 		return fmt.Errorf("failed to initialize logger: %w", err)
 	}

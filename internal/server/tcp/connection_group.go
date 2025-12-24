@@ -1,10 +1,10 @@
 package tcp
 
 import (
+	"container/heap"
 	"fmt"
 	"net"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/yamux"
@@ -14,6 +14,54 @@ import (
 
 	"go.uber.org/zap"
 )
+
+// sessionEntry represents a session with its current stream count for heap operations
+type sessionEntry struct {
+	id       string
+	session  *yamux.Session
+	streams  int
+	heapIdx  int // index in the heap, managed by heap.Interface
+}
+
+// sessionHeap implements heap.Interface for O(log n) session selection
+type sessionHeap []*sessionEntry
+
+func (h sessionHeap) Len() int { return len(h) }
+
+func (h sessionHeap) Less(i, j int) bool {
+	// Min-heap: session with fewer streams has higher priority
+	return h[i].streams < h[j].streams
+}
+
+func (h sessionHeap) Swap(i, j int) {
+	h[i], h[j] = h[j], h[i]
+	h[i].heapIdx = i
+	h[j].heapIdx = j
+}
+
+func (h *sessionHeap) Push(x interface{}) {
+	entry := x.(*sessionEntry)
+	entry.heapIdx = len(*h)
+	*h = append(*h, entry)
+}
+
+func (h *sessionHeap) Pop() interface{} {
+	old := *h
+	n := len(old)
+	entry := old[n-1]
+	old[n-1] = nil // avoid memory leak
+	entry.heapIdx = -1
+	*h = old[0 : n-1]
+	return entry
+}
+
+// sessionHeapPool reuses heap slices to reduce allocations
+var sessionHeapPool = sync.Pool{
+	New: func() interface{} {
+		h := make(sessionHeap, 0, 16)
+		return &h
+	},
+}
 
 type ConnectionGroup struct {
 	TunnelID     string
@@ -60,6 +108,12 @@ func (g *ConnectionGroup) heartbeatLoop(interval, timeout time.Duration) {
 	const maxConsecutiveFailures = 3
 	failureCount := make(map[string]int)
 
+	type sessionSnapshot struct {
+		id      string
+		session *yamux.Session
+	}
+	sessions := make([]sessionSnapshot, 0, 16)
+
 	for {
 		select {
 		case <-g.stopCh:
@@ -67,26 +121,25 @@ func (g *ConnectionGroup) heartbeatLoop(interval, timeout time.Duration) {
 		case <-ticker.C:
 		}
 
+		sessions = sessions[:0]
 		g.mu.RLock()
-		sessions := make(map[string]*yamux.Session, len(g.Sessions))
 		for id, s := range g.Sessions {
-			sessions[id] = s
+			sessions = append(sessions, sessionSnapshot{id: id, session: s})
 		}
 		g.mu.RUnlock()
 
-		for id, session := range sessions {
-			if session == nil || session.IsClosed() {
-				g.RemoveSession(id)
-				delete(failureCount, id)
+		for _, snap := range sessions {
+			if snap.session == nil || snap.session.IsClosed() {
+				g.RemoveSession(snap.id)
+				delete(failureCount, snap.id)
 				continue
 			}
 
-			// Ping with timeout
 			done := make(chan error, 1)
 			go func(s *yamux.Session) {
 				_, err := s.Ping()
 				done <- err
-			}(session)
+			}(snap.session)
 
 			var err error
 			select {
@@ -98,31 +151,29 @@ func (g *ConnectionGroup) heartbeatLoop(interval, timeout time.Duration) {
 			}
 
 			if err != nil {
-				failureCount[id]++
+				failureCount[snap.id]++
 				g.logger.Debug("Session ping failed",
-					zap.String("session_id", id),
-					zap.Int("consecutive_failures", failureCount[id]),
+					zap.String("session_id", snap.id),
+					zap.Int("consecutive_failures", failureCount[snap.id]),
 					zap.Error(err),
 				)
 
-				if failureCount[id] >= maxConsecutiveFailures {
+				if failureCount[snap.id] >= maxConsecutiveFailures {
 					g.logger.Warn("Session ping failed too many times, removing",
-						zap.String("session_id", id),
-						zap.Int("failures", failureCount[id]),
+						zap.String("session_id", snap.id),
+						zap.Int("failures", failureCount[snap.id]),
 					)
-					g.RemoveSession(id)
-					delete(failureCount, id)
+					g.RemoveSession(snap.id)
+					delete(failureCount, snap.id)
 				}
 			} else {
-				// Reset on success
-				failureCount[id] = 0
+				failureCount[snap.id] = 0
 				g.mu.Lock()
 				g.LastActivity = time.Now()
 				g.mu.Unlock()
 			}
 		}
 
-		// Check if all sessions are gone
 		g.mu.RLock()
 		sessionCount := len(g.Sessions)
 		g.mu.RUnlock()
@@ -214,11 +265,12 @@ func (g *ConnectionGroup) SessionCount() int {
 	return len(g.Sessions)
 }
 
+// OpenStream opens a new stream using a min-heap for O(log n) session selection.
 func (g *ConnectionGroup) OpenStream() (net.Conn, error) {
 	const (
 		maxStreamsPerSession = 256
 		maxRetries           = 3
-		backoffBase          = 25 * time.Millisecond
+		backoffBase          = 5 * time.Millisecond
 	)
 
 	var lastErr error
@@ -230,61 +282,33 @@ func (g *ConnectionGroup) OpenStream() (net.Conn, error) {
 		default:
 		}
 
-		// Prefer data sessions for data-plane traffic; keep the primary session
-		// as control-plane (client ping/latency), and only fall back to primary
-		// when no data session exists.
-		sessions := g.sessionsSnapshot(false)
-		if len(sessions) == 0 {
-			sessions = g.sessionsSnapshot(true)
+		h := g.buildSessionHeap(false)
+		if h.Len() == 0 {
+			h = g.buildSessionHeap(true)
 		}
-		if len(sessions) == 0 {
+		if h.Len() == 0 {
 			return nil, net.ErrClosed
 		}
 
-		tried := make([]bool, len(sessions))
 		anyUnderCap := false
-		start := int(atomic.AddUint32(&g.sessionIdx, 1) - 1)
+		for h.Len() > 0 {
+			entry := heap.Pop(h).(*sessionEntry)
+			session := entry.session
 
-		for range sessions {
-			bestIdx := -1
-			minStreams := int(^uint(0) >> 1)
-
-			for i := 0; i < len(sessions); i++ {
-				idx := (start + i) % len(sessions)
-				if tried[idx] {
-					continue
-				}
-
-				session := sessions[idx]
-				if session == nil || session.IsClosed() {
-					tried[idx] = true
-					continue
-				}
-
-				n := session.NumStreams()
-				if n >= maxStreamsPerSession {
-					continue
-				}
-				anyUnderCap = true
-
-				if n < minStreams {
-					minStreams = n
-					bestIdx = idx
-				}
-			}
-
-			if bestIdx == -1 {
-				break
-			}
-
-			tried[bestIdx] = true
-			session := sessions[bestIdx]
 			if session == nil || session.IsClosed() {
 				continue
 			}
 
+			currentStreams := session.NumStreams()
+			if currentStreams >= maxStreamsPerSession {
+				continue
+			}
+			anyUnderCap = true
+
 			stream, err := session.Open()
 			if err == nil {
+				*h = (*h)[:0]
+				sessionHeapPool.Put(h)
 				return stream, nil
 			}
 			lastErr = err
@@ -293,6 +317,9 @@ func (g *ConnectionGroup) OpenStream() (net.Conn, error) {
 				g.deleteClosedSessions()
 			}
 		}
+
+		*h = (*h)[:0]
+		sessionHeapPool.Put(h)
 
 		if !anyUnderCap {
 			lastErr = fmt.Errorf("all sessions are at stream capacity (%d)", maxStreamsPerSession)
@@ -313,36 +340,64 @@ func (g *ConnectionGroup) OpenStream() (net.Conn, error) {
 	return nil, lastErr
 }
 
-func (g *ConnectionGroup) selectSession() *yamux.Session {
-	sessions := g.sessionsSnapshot(false)
-	if len(sessions) == 0 {
-		sessions = g.sessionsSnapshot(true)
-	}
-	if len(sessions) == 0 {
-		return nil
+// buildSessionHeap creates a min-heap of sessions ordered by stream count.
+func (g *ConnectionGroup) buildSessionHeap(includePrimary bool) *sessionHeap {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+
+	if len(g.Sessions) == 0 {
+		h := sessionHeapPool.Get().(*sessionHeap)
+		return h
 	}
 
-	start := int(atomic.AddUint32(&g.sessionIdx, 1) - 1)
-	minStreams := int(^uint(0) >> 1)
-	var best *yamux.Session
+	h := sessionHeapPool.Get().(*sessionHeap)
+	*h = (*h)[:0]
 
-	for i := 0; i < len(sessions); i++ {
-		session := sessions[(start+i)%len(sessions)]
+	for id, session := range g.Sessions {
 		if session == nil || session.IsClosed() {
 			continue
 		}
-		if n := session.NumStreams(); n < minStreams {
-			minStreams = n
-			best = session
+		if id == "primary" && !includePrimary {
+			continue
 		}
+
+		*h = append(*h, &sessionEntry{
+			id:      id,
+			session: session,
+			streams: session.NumStreams(),
+		})
 	}
 
-	return best
+	heap.Init(h)
+	return h
+}
+
+func (g *ConnectionGroup) selectSession() *yamux.Session {
+	h := g.buildSessionHeap(false)
+	if h.Len() == 0 {
+		sessionHeapPool.Put(h)
+		h = g.buildSessionHeap(true)
+	}
+	if h.Len() == 0 {
+		sessionHeapPool.Put(h)
+		return nil
+	}
+
+	entry := heap.Pop(h).(*sessionEntry)
+	session := entry.session
+
+	*h = (*h)[:0]
+	sessionHeapPool.Put(h)
+
+	if session == nil || session.IsClosed() {
+		return nil
+	}
+	return session
 }
 
 func (g *ConnectionGroup) sessionsSnapshot(includePrimary bool) []*yamux.Session {
-	g.mu.Lock()
-	defer g.mu.Unlock()
+	g.mu.RLock()
+	defer g.mu.RUnlock()
 
 	if len(g.Sessions) == 0 {
 		return nil
@@ -351,17 +406,12 @@ func (g *ConnectionGroup) sessionsSnapshot(includePrimary bool) []*yamux.Session
 	sessions := make([]*yamux.Session, 0, len(g.Sessions))
 	for id, session := range g.Sessions {
 		if session == nil || session.IsClosed() {
-			delete(g.Sessions, id)
 			continue
 		}
 		if id == "primary" && !includePrimary {
 			continue
 		}
 		sessions = append(sessions, session)
-	}
-
-	if len(sessions) > 0 {
-		g.LastActivity = time.Now()
 	}
 
 	return sessions

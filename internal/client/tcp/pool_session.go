@@ -2,18 +2,19 @@ package tcp
 
 import (
 	"fmt"
-	"io"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	json "github.com/goccy/go-json"
 	"github.com/hashicorp/yamux"
-	"go.uber.org/zap"
 
-	"drip/internal/shared/constants"
+	"drip/internal/shared/mux"
 	"drip/internal/shared/protocol"
 )
+
+var dataConnCounter atomic.Uint64
 
 // sessionHandle wraps a yamux session with metadata.
 type sessionHandle struct {
@@ -37,17 +38,49 @@ func (h *sessionHandle) lastActiveTime() time.Time {
 	return time.Unix(0, n)
 }
 
+// warmupSessions pre-creates initial sessions in parallel to eliminate cold-start latency.
+func (c *PoolClient) warmupSessions() {
+	if c.IsClosed() || c.tunnelID == "" {
+		return
+	}
+
+	c.mu.RLock()
+	desired := c.desiredTotal
+	c.mu.RUnlock()
+
+	current := c.sessionCount()
+	toCreate := desired - current
+	if toCreate <= 0 {
+		return
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < toCreate; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = c.addDataSession()
+		}()
+	}
+	wg.Wait()
+
+	// Brief wait for server to register all sessions
+	time.Sleep(100 * time.Millisecond)
+}
+
 // scalerLoop monitors load and adjusts session count.
 func (c *PoolClient) scalerLoop() {
 	defer c.wg.Done()
 
 	const (
-		checkInterval      = 5 * time.Second
-		scaleUpCooldown    = 5 * time.Second
+		checkInterval      = 1 * time.Second
+		scaleUpCooldown    = 1 * time.Second
 		scaleDownCooldown  = 60 * time.Second
-		capacityPerSession = int64(64)
-		scaleUpLoad        = 0.7
-		scaleDownLoad      = 0.3
+		capacityPerSession = int64(256)
+		scaleUpLoad        = 0.6
+		scaleDownLoad      = 0.2
+		burstThreshold     = 0.9
+		maxBurstAdd        = 4
 	)
 
 	ticker := time.NewTicker(checkInterval)
@@ -76,11 +109,23 @@ func (c *PoolClient) scalerLoop() {
 
 		active := c.stats.GetActiveConnections()
 		load := float64(active) / float64(int64(current)*capacityPerSession)
-
 		sinceLastScale := time.Since(lastScale)
-		if sinceLastScale >= scaleUpCooldown && load > scaleUpLoad && desired < c.maxSessions {
+
+		if load > burstThreshold && desired < c.maxSessions {
+			sessionsToAdd := min(maxBurstAdd, c.maxSessions-desired)
+			if sessionsToAdd > 0 {
+				c.mu.Lock()
+				c.desiredTotal = min(c.desiredTotal+sessionsToAdd, c.maxSessions)
+				c.lastScale = time.Now()
+				c.mu.Unlock()
+			}
+		} else if sinceLastScale >= scaleUpCooldown && load > scaleUpLoad && desired < c.maxSessions {
+			sessionsToAdd := 1
+			if load > 0.8 {
+				sessionsToAdd = 2
+			}
 			c.mu.Lock()
-			c.desiredTotal = min(c.desiredTotal+1, c.maxSessions)
+			c.desiredTotal = min(c.desiredTotal+sessionsToAdd, c.maxSessions)
 			c.lastScale = time.Now()
 			c.mu.Unlock()
 		} else if sinceLastScale >= scaleDownCooldown && load < scaleDownLoad && desired > c.minSessions {
@@ -108,11 +153,20 @@ func (c *PoolClient) ensureSessions() {
 
 	current := c.sessionCount()
 	if current < desired {
-		for i := 0; i < desired-current; i++ {
-			if err := c.addDataSession(); err != nil {
-				c.logger.Debug("Add data session failed", zap.Error(err))
-				break
+		toAdd := desired - current
+
+		if toAdd > 1 {
+			var wg sync.WaitGroup
+			for i := 0; i < toAdd; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					_ = c.addDataSession()
+				}()
 			}
+			wg.Wait()
+		} else {
+			_ = c.addDataSession()
 		}
 		return
 	}
@@ -139,7 +193,7 @@ func (c *PoolClient) addDataSession() error {
 		return err
 	}
 
-	connID := fmt.Sprintf("data-%d", time.Now().UnixNano())
+	connID := fmt.Sprintf("data-%d", dataConnCounter.Add(1))
 
 	req := protocol.DataConnectRequest{
 		TunnelID:     c.tunnelID,
@@ -191,10 +245,7 @@ func (c *PoolClient) addDataSession() error {
 		return fmt.Errorf("data connection rejected: %s", resp.Message)
 	}
 
-	yamuxCfg := yamux.DefaultConfig()
-	yamuxCfg.EnableKeepAlive = false
-	yamuxCfg.LogOutput = io.Discard
-	yamuxCfg.AcceptBacklog = constants.YamuxAcceptBacklog
+	yamuxCfg := mux.NewClientConfig()
 
 	session, err := yamux.Server(conn, yamuxCfg)
 	if err != nil {
@@ -218,6 +269,9 @@ func (c *PoolClient) addDataSession() error {
 
 	c.wg.Add(1)
 	go c.sessionWatcher(h, false)
+
+	c.wg.Add(1)
+	go c.pingLoop(h)
 
 	return nil
 }
@@ -309,4 +363,40 @@ func (c *PoolClient) sessionCount() int {
 		count++
 	}
 	return count
+}
+
+// SessionStats holds per-session statistics.
+type SessionStats struct {
+	ID           string
+	IsPrimary    bool
+	ActiveCount  int64
+	LastActiveAt time.Time
+}
+
+// GetSessionStats returns statistics for all sessions.
+func (c *PoolClient) GetSessionStats() []SessionStats {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	stats := make([]SessionStats, 0, len(c.dataSessions)+1)
+
+	if c.primary != nil {
+		stats = append(stats, SessionStats{
+			ID:           c.primary.id,
+			IsPrimary:    true,
+			ActiveCount:  c.primary.active.Load(),
+			LastActiveAt: c.primary.lastActiveTime(),
+		})
+	}
+
+	for _, h := range c.dataSessions {
+		stats = append(stats, SessionStats{
+			ID:           h.id,
+			IsPrimary:    false,
+			ActiveCount:  h.active.Load(),
+			LastActiveAt: h.lastActiveTime(),
+		})
+	}
+
+	return stats
 }
