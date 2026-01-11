@@ -192,6 +192,7 @@ sudo journalctl -u drip-server -f
 **Security**
 - TLS 1.3 encryption for all connections
 - Token-based authentication
+- IP whitelist/blacklist access control
 - No legacy protocol support
 
 **Flexibility**
@@ -248,6 +249,21 @@ drip http 8080 -a 172.17.0.3
 drip tcp 5432 -a db-container
 ```
 
+**IP Access Control**
+```bash
+# Only allow access from specific networks (CIDR)
+drip http 3000 --allow-ip 192.168.0.0/16,10.0.0.0/8
+
+# Only allow specific IP addresses
+drip http 3000 --allow-ip 192.168.1.100,192.168.1.101
+
+# Block specific IP addresses
+drip http 3000 --deny-ip 1.2.3.4,5.6.7.8
+
+# Combine whitelist and blacklist
+drip tcp 5432 --allow-ip 192.168.1.0/24 --deny-ip 192.168.1.100
+```
+
 ## Command Reference
 
 ```bash
@@ -258,6 +274,8 @@ drip http <port> [flags]
   -d, --daemon       Run in background
   -s, --server       Server address
   -t, --token        Auth token
+  --allow-ip         Allow only these IPs or CIDR ranges
+  --deny-ip          Deny these IPs or CIDR ranges
 
 # HTTPS tunnel (same flags as http)
 drip https <port> [flags]

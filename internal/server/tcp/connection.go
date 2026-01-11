@@ -181,6 +181,15 @@ func (c *Connection) Handle() error {
 	c.tunnelConn.SetTunnelType(req.TunnelType)
 	c.tunnelType = req.TunnelType
 
+	if req.IPAccess != nil && (len(req.IPAccess.AllowIPs) > 0 || len(req.IPAccess.DenyIPs) > 0) {
+		c.tunnelConn.SetIPAccessControl(req.IPAccess.AllowIPs, req.IPAccess.DenyIPs)
+		c.logger.Info("IP access control configured",
+			zap.String("subdomain", subdomain),
+			zap.Strings("allow_ips", req.IPAccess.AllowIPs),
+			zap.Strings("deny_ips", req.IPAccess.DenyIPs),
+		)
+	}
+
 	c.logger.Info("Tunnel registered",
 		zap.String("subdomain", subdomain),
 		zap.String("tunnel_type", string(req.TunnelType)),

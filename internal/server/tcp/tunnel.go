@@ -44,6 +44,10 @@ func (c *Connection) handleTCPTunnel(reader *bufio.Reader) error {
 	}
 
 	c.proxy = NewProxy(c.ctx, c.port, c.subdomain, openStream, c.tunnelConn, c.logger)
+	if c.tunnelConn != nil && c.tunnelConn.HasIPAccessControl() {
+		c.proxy.SetIPAccessCheck(c.tunnelConn.IsIPAllowed)
+	}
+
 	if err := c.proxy.Start(); err != nil {
 		return fmt.Errorf("failed to start tcp proxy: %w", err)
 	}

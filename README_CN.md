@@ -163,6 +163,7 @@ server {
 
     location / {
         proxy_pass https://127.0.0.1:8443;
+        proxy_ssl_protocols TLSv1.3;
         proxy_ssl_verify off;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
@@ -191,6 +192,7 @@ sudo journalctl -u drip-server -f
 **安全性**
 - 所有连接使用 TLS 1.3 加密
 - 基于 Token 的身份验证
+- IP 白名单/黑名单访问控制
 - 不支持任何遗留协议
 
 **灵活性**
@@ -247,6 +249,21 @@ drip http 8080 -a 172.17.0.3
 drip tcp 5432 -a db-container
 ```
 
+**IP 访问控制**
+```bash
+# 只允许特定网段访问（CIDR）
+drip http 3000 --allow-ip 192.168.0.0/16,10.0.0.0/8
+
+# 只允许特定 IP 访问
+drip http 3000 --allow-ip 192.168.1.100,192.168.1.101
+
+# 拒绝特定 IP
+drip http 3000 --deny-ip 1.2.3.4,5.6.7.8
+
+# 组合白名单和黑名单
+drip tcp 5432 --allow-ip 192.168.1.0/24 --deny-ip 192.168.1.100
+```
+
 ## 命令参考
 
 ```bash
@@ -257,6 +274,8 @@ drip http <端口> [参数]
   -d, --daemon       后台运行
   -s, --server       服务器地址
   -t, --token        认证 token
+  --allow-ip         只允许这些 IP 或 CIDR 访问
+  --deny-ip          拒绝这些 IP 或 CIDR 访问
 
 # HTTPS 隧道（参数同 http）
 drip https <端口> [参数]

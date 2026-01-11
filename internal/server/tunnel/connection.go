@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"drip/internal/server/metrics"
+	"drip/internal/shared/netutil"
 	"drip/internal/shared/protocol"
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
@@ -29,6 +30,8 @@ type Connection struct {
 	bytesIn           atomic.Int64
 	bytesOut          atomic.Int64
 	activeConnections atomic.Int64
+
+	ipAccessChecker *netutil.IPAccessChecker
 }
 
 // NewConnection creates a new tunnel connection
@@ -180,6 +183,32 @@ func (c *Connection) DecActiveConnections() {
 
 func (c *Connection) GetActiveConnections() int64 {
 	return c.activeConnections.Load()
+}
+
+// SetIPAccessControl sets the IP access control rules for this tunnel.
+func (c *Connection) SetIPAccessControl(allowCIDRs, denyIPs []string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ipAccessChecker = netutil.NewIPAccessChecker(allowCIDRs, denyIPs)
+}
+
+// IsIPAllowed checks if the given IP address is allowed to access this tunnel.
+func (c *Connection) IsIPAllowed(ip string) bool {
+	c.mu.RLock()
+	checker := c.ipAccessChecker
+	c.mu.RUnlock()
+
+	if checker == nil {
+		return true // No access control configured
+	}
+	return checker.IsAllowed(ip)
+}
+
+// HasIPAccessControl returns true if IP access control is configured.
+func (c *Connection) HasIPAccessControl() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.ipAccessChecker != nil && c.ipAccessChecker.HasRules()
 }
 
 // StartWritePump starts the write pump for sending messages

@@ -63,6 +63,9 @@ type PoolClient struct {
 	lastScale    time.Time
 
 	logger *zap.Logger
+
+	allowIPs []string
+	denyIPs  []string
 }
 
 // NewPoolClient creates a new pool client.
@@ -126,6 +129,8 @@ func NewPoolClient(cfg *ConnectorConfig, logger *zap.Logger) *PoolClient {
 		doneCh:          make(chan struct{}),
 		dataSessions:    make(map[string]*sessionHandle),
 		logger:          logger,
+		allowIPs:        cfg.AllowIPs,
+		denyIPs:         cfg.DenyIPs,
 	}
 
 	if tunnelType == protocol.TunnelTypeHTTP || tunnelType == protocol.TunnelTypeHTTPS {
@@ -154,6 +159,13 @@ func (c *PoolClient) Connect() error {
 			MaxDataConns: maxData,
 			Version:      1,
 		},
+	}
+
+	if len(c.allowIPs) > 0 || len(c.denyIPs) > 0 {
+		req.IPAccess = &protocol.IPAccessControl{
+			AllowIPs: c.allowIPs,
+			DenyIPs:  c.denyIPs,
+		}
 	}
 
 	payload, err := json.Marshal(req)

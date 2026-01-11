@@ -81,6 +81,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if tconn.HasIPAccessControl() {
+		clientIP := h.extractClientIP(r)
+		if !tconn.IsIPAllowed(clientIP) {
+			http.Error(w, "Access denied: your IP is not allowed", http.StatusForbidden)
+			return
+		}
+	}
+
 	tType := tconn.GetTunnelType()
 	if tType != "" && tType != protocol.TunnelTypeHTTP && tType != protocol.TunnelTypeHTTPS {
 		http.Error(w, "Tunnel does not accept HTTP traffic", http.StatusBadGateway)
@@ -326,6 +334,32 @@ func (h *Handler) extractSubdomain(host string) string {
 	}
 
 	return ""
+}
+
+// extractClientIP extracts the client IP from the request.
+// It checks X-Forwarded-For and X-Real-IP headers first (for reverse proxy setups),
+// then falls back to the remote address.
+func (h *Handler) extractClientIP(r *http.Request) string {
+	// Check X-Forwarded-For header (may contain multiple IPs)
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		// Take the first IP (original client)
+		if idx := strings.Index(xff, ","); idx != -1 {
+			return strings.TrimSpace(xff[:idx])
+		}
+		return strings.TrimSpace(xff)
+	}
+
+	// Check X-Real-IP header
+	if xri := r.Header.Get("X-Real-IP"); xri != "" {
+		return strings.TrimSpace(xri)
+	}
+
+	// Fall back to remote address
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
 
 func (h *Handler) serveHomePage(w http.ResponseWriter, r *http.Request) {

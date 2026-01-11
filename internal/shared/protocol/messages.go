@@ -8,6 +8,12 @@ type PoolCapabilities struct {
 	Version      int `json:"version"`        // Protocol version for pool features
 }
 
+// IPAccessControl defines IP-based access control rules for a tunnel
+type IPAccessControl struct {
+	AllowIPs []string `json:"allow_ips,omitempty"` // Allowed IPs or CIDR ranges (whitelist)
+	DenyIPs  []string `json:"deny_ips,omitempty"`  // Denied IPs or CIDR ranges (blacklist)
+}
+
 // RegisterRequest is sent by client to register a tunnel
 type RegisterRequest struct {
 	Token           string     `json:"token"`            // Authentication token
@@ -19,6 +25,9 @@ type RegisterRequest struct {
 	ConnectionType   string            `json:"connection_type,omitempty"`   // "primary" or empty for legacy
 	TunnelID         string            `json:"tunnel_id,omitempty"`         // For data connections to join
 	PoolCapabilities *PoolCapabilities `json:"pool_capabilities,omitempty"` // Client pool capabilities
+
+	// Access control (optional)
+	IPAccess *IPAccessControl `json:"ip_access,omitempty"` // IP-based access control rules
 }
 
 // RegisterResponse is sent by server after successful registration
