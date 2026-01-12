@@ -8,14 +8,14 @@ import (
 // IPAccessChecker checks if an IP address is allowed based on whitelist/blacklist rules.
 type IPAccessChecker struct {
 	allowNets []*net.IPNet // Allowed CIDR ranges (whitelist)
-	denyIPs   []net.IP     // Denied IP addresses (blacklist)
+	denyNets  []*net.IPNet // Denied CIDR ranges (blacklist)
 	hasAllow  bool         // Whether whitelist is configured
 	hasDeny   bool         // Whether blacklist is configured
 }
 
 // NewIPAccessChecker creates a new IP access checker from CIDR and IP lists.
 // allowCIDRs: list of CIDR ranges to allow (e.g., "192.168.1.0/24", "10.0.0.0/8")
-// denyIPs: list of IP addresses to deny (e.g., "1.2.3.4", "5.6.7.8")
+// denyIPs: list of CIDR ranges or IP addresses to deny (e.g., "192.168.0.0/16", "1.2.3.4")
 func NewIPAccessChecker(allowCIDRs, denyIPs []string) *IPAccessChecker {
 	checker := &IPAccessChecker{}
 
@@ -46,19 +46,32 @@ func NewIPAccessChecker(allowCIDRs, denyIPs []string) *IPAccessChecker {
 	}
 	checker.hasAllow = len(checker.allowNets) > 0
 
-	// Parse denied IPs
+	// Parse denied IPs/CIDRs
 	for _, ipStr := range denyIPs {
 		ipStr = strings.TrimSpace(ipStr)
 		if ipStr == "" {
 			continue
 		}
 
-		ip := net.ParseIP(ipStr)
-		if ip != nil {
-			checker.denyIPs = append(checker.denyIPs, ip)
+		// If no "/" in the string, treat it as a single IP (/32 for IPv4, /128 for IPv6)
+		if !strings.Contains(ipStr, "/") {
+			ip := net.ParseIP(ipStr)
+			if ip != nil {
+				if ip.To4() != nil {
+					ipStr = ipStr + "/32"
+				} else {
+					ipStr = ipStr + "/128"
+				}
+			}
 		}
+
+		_, ipNet, err := net.ParseCIDR(ipStr)
+		if err != nil {
+			continue
+		}
+		checker.denyNets = append(checker.denyNets, ipNet)
 	}
-	checker.hasDeny = len(checker.denyIPs) > 0
+	checker.hasDeny = len(checker.denyNets) > 0
 
 	return checker
 }
@@ -80,8 +93,8 @@ func (c *IPAccessChecker) IsAllowed(ipStr string) bool {
 
 	// Check deny list first (blacklist takes priority)
 	if c.hasDeny {
-		for _, denyIP := range c.denyIPs {
-			if ip.Equal(denyIP) {
+		for _, denyNet := range c.denyNets {
+			if denyNet.Contains(ip) {
 				return false
 			}
 		}
