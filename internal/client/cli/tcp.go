@@ -20,6 +20,9 @@ Example:
   drip tcp 3306                     Tunnel MySQL
   drip tcp 22                       Tunnel SSH
   drip tcp 6379 --subdomain myredis Tunnel Redis with custom subdomain
+  drip tcp 5432 --allow-ip 192.168.0.0/16  Only allow IPs from 192.168.x.x
+  drip tcp 22 --allow-ip 10.0.0.1          Allow single IP
+  drip tcp 22 --deny-ip 1.2.3.4            Block specific IP
 
 Supported Services:
   - Databases: PostgreSQL (5432), MySQL (3306), Redis (6379), MongoDB (27017)
@@ -39,6 +42,8 @@ func init() {
 	tcpCmd.Flags().StringVarP(&subdomain, "subdomain", "n", "", "Custom subdomain (optional)")
 	tcpCmd.Flags().BoolVarP(&daemonMode, "daemon", "d", false, "Run in background (daemon mode)")
 	tcpCmd.Flags().StringVarP(&localAddress, "address", "a", "127.0.0.1", "Local address to forward to (default: 127.0.0.1)")
+	tcpCmd.Flags().StringSliceVar(&allowIPs, "allow-ip", nil, "Allow only these IPs or CIDR ranges (e.g., 192.168.1.1,10.0.0.0/8)")
+	tcpCmd.Flags().StringSliceVar(&denyIPs, "deny-ip", nil, "Deny these IPs or CIDR ranges (e.g., 1.2.3.4,192.168.1.0/24)")
 	tcpCmd.Flags().BoolVar(&daemonMarker, "daemon-child", false, "Internal flag for daemon child process")
 	tcpCmd.Flags().MarkHidden("daemon-child")
 	rootCmd.AddCommand(tcpCmd)
@@ -67,6 +72,8 @@ func runTCP(_ *cobra.Command, args []string) error {
 		LocalPort:  port,
 		Subdomain:  subdomain,
 		Insecure:   insecure,
+		AllowIPs:   allowIPs,
+		DenyIPs:    denyIPs,
 	}
 
 	var daemon *DaemonInfo

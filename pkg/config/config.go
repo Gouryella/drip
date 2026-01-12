@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"os"
+	"strings"
 )
 
 // ServerConfig holds the server configuration
@@ -28,6 +29,50 @@ type ServerConfig struct {
 
 	// Logging
 	Debug bool
+}
+
+// Validate checks if the server configuration is valid
+func (c *ServerConfig) Validate() error {
+	// Validate port
+	if c.Port < 1 || c.Port > 65535 {
+		return fmt.Errorf("invalid port %d: must be between 1 and 65535", c.Port)
+	}
+
+	// Validate public port if set
+	if c.PublicPort != 0 && (c.PublicPort < 1 || c.PublicPort > 65535) {
+		return fmt.Errorf("invalid public port %d: must be between 1 and 65535", c.PublicPort)
+	}
+
+	// Validate domain
+	if c.Domain == "" {
+		return fmt.Errorf("domain is required")
+	}
+	if strings.Contains(c.Domain, ":") {
+		return fmt.Errorf("domain should not contain port, got: %s", c.Domain)
+	}
+
+	// Validate TCP port range
+	if c.TCPPortMin < 1 || c.TCPPortMin > 65535 {
+		return fmt.Errorf("invalid TCPPortMin %d: must be between 1 and 65535", c.TCPPortMin)
+	}
+	if c.TCPPortMax < 1 || c.TCPPortMax > 65535 {
+		return fmt.Errorf("invalid TCPPortMax %d: must be between 1 and 65535", c.TCPPortMax)
+	}
+	if c.TCPPortMin >= c.TCPPortMax {
+		return fmt.Errorf("TCPPortMin (%d) must be less than TCPPortMax (%d)", c.TCPPortMin, c.TCPPortMax)
+	}
+
+	// Validate TLS settings
+	if c.TLSEnabled {
+		if c.TLSCertFile == "" {
+			return fmt.Errorf("TLS certificate file is required when TLS is enabled")
+		}
+		if c.TLSKeyFile == "" {
+			return fmt.Errorf("TLS key file is required when TLS is enabled")
+		}
+	}
+
+	return nil
 }
 
 // LoadTLSConfig loads TLS configuration

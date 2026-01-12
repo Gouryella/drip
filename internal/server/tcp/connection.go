@@ -181,6 +181,15 @@ func (c *Connection) Handle() error {
 	c.tunnelConn.SetTunnelType(req.TunnelType)
 	c.tunnelType = req.TunnelType
 
+	if req.IPAccess != nil && (len(req.IPAccess.AllowIPs) > 0 || len(req.IPAccess.DenyIPs) > 0) {
+		c.tunnelConn.SetIPAccessControl(req.IPAccess.AllowIPs, req.IPAccess.DenyIPs)
+		c.logger.Info("IP access control configured",
+			zap.String("subdomain", subdomain),
+			zap.Strings("allow_ips", req.IPAccess.AllowIPs),
+			zap.Strings("deny_ips", req.IPAccess.DenyIPs),
+		)
+	}
+
 	c.logger.Info("Tunnel registered",
 		zap.String("subdomain", subdomain),
 		zap.String("tunnel_type", string(req.TunnelType)),
@@ -226,7 +235,10 @@ func (c *Connection) Handle() error {
 		RecommendedConns: recommendedConns,
 	}
 
-	respData, _ := json.Marshal(resp)
+	respData, err := json.Marshal(resp)
+	if err != nil {
+		return fmt.Errorf("failed to marshal registration response: %w", err)
+	}
 	ackFrame := protocol.NewFrame(protocol.FrameTypeRegisterAck, respData)
 
 	err = protocol.WriteFrame(c.conn, ackFrame)
@@ -400,13 +412,6 @@ func (c *Connection) handleHTTPRequestLegacy(reader *bufio.Reader) error {
 	}
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 func parseTCPSubdomainPort(subdomain string) (int, bool) {
 	if !strings.HasPrefix(subdomain, "tcp-") {
 		return 0, false
@@ -516,11 +521,15 @@ func (c *Connection) sendError(code, message string) {
 		Code:    code,
 		Message: message,
 	}
-	data, _ := json.Marshal(errMsg)
+	data, err := json.Marshal(errMsg)
+	if err != nil {
+		c.logger.Error("Failed to marshal error message", zap.Error(err))
+		return
+	}
 	errFrame := protocol.NewFrame(protocol.FrameTypeError, data)
 
 	if c.frameWriter == nil {
-		protocol.WriteFrame(c.conn, errFrame)
+		_ = protocol.WriteFrame(c.conn, errFrame)
 	} else {
 		c.frameWriter.WriteFrame(errFrame)
 	}
@@ -667,7 +676,10 @@ func (c *Connection) handleDataConnect(frame *protocol.Frame, reader *bufio.Read
 		Message:      "Data connection accepted",
 	}
 
-	respData, _ := json.Marshal(resp)
+	respData, err := json.Marshal(resp)
+	if err != nil {
+		return fmt.Errorf("failed to marshal data connect response: %w", err)
+	}
 	ackFrame := protocol.NewFrame(protocol.FrameTypeDataConnectAck, respData)
 
 	if err := protocol.WriteFrame(c.conn, ackFrame); err != nil {
@@ -723,7 +735,11 @@ func (c *Connection) sendDataConnectError(code, message string) {
 		Accepted: false,
 		Message:  fmt.Sprintf("%s: %s", code, message),
 	}
-	respData, _ := json.Marshal(resp)
+	respData, err := json.Marshal(resp)
+	if err != nil {
+		c.logger.Error("Failed to marshal data connect error", zap.Error(err))
+		return
+	}
 	frame := protocol.NewFrame(protocol.FrameTypeDataConnectAck, respData)
-	protocol.WriteFrame(c.conn, frame)
+	_ = protocol.WriteFrame(c.conn, frame)
 }

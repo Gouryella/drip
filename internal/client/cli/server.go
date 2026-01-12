@@ -21,17 +21,17 @@ import (
 )
 
 var (
-	serverPort        int
-	serverPublicPort  int
-	serverDomain      string
-	serverAuthToken   string
+	serverPort         int
+	serverPublicPort   int
+	serverDomain       string
+	serverAuthToken    string
 	serverMetricsToken string
-	serverDebug       bool
-	serverTCPPortMin  int
-	serverTCPPortMax  int
-	serverTLSCert     string
-	serverTLSKey      string
-	serverPprofPort   int
+	serverDebug        bool
+	serverTCPPortMin   int
+	serverTCPPortMax   int
+	serverTLSCert      string
+	serverTLSKey       string
+	serverPprofPort    int
 )
 
 var serverCmd = &cobra.Command{
@@ -111,6 +111,10 @@ func runServer(_ *cobra.Command, _ []string) error {
 		TLSKeyFile:  serverTLSKey,
 		AuthToken:   serverAuthToken,
 		Debug:       serverDebug,
+	}
+
+	if err := serverConfig.Validate(); err != nil {
+		logger.Fatal("Invalid server configuration", zap.Error(err))
 	}
 
 	tlsConfig, err := serverConfig.LoadTLSConfig()

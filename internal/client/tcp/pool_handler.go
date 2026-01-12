@@ -127,12 +127,12 @@ func (c *PoolClient) handleHTTPStream(stream net.Conn) {
 		return
 	}
 
-	done := make(chan struct{})
+	copyDone := make(chan struct{})
 	go func() {
 		select {
 		case <-ctx.Done():
 			stream.Close()
-		case <-done:
+		case <-copyDone:
 		}
 	}()
 
@@ -150,7 +150,7 @@ func (c *PoolClient) handleHTTPStream(stream net.Conn) {
 			break
 		}
 	}
-	close(done)
+	close(copyDone)
 }
 
 func (c *PoolClient) handleWebSocketUpgrade(cc net.Conn, req *http.Request) {

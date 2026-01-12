@@ -64,16 +64,6 @@ func PipeWithCallbacksAndBufferSize(ctx context.Context, a, b io.ReadWriteCloser
 
 	errCh := make(chan error, 2)
 
-	if ctx != nil {
-		go func() {
-			select {
-			case <-ctx.Done():
-				closeAll()
-			case <-stopCh:
-			}
-		}()
-	}
-
 	go func() {
 		defer wg.Done()
 		err := pipeBuffer(b, a, bufSize, onAToB, stopCh)
@@ -91,6 +81,16 @@ func PipeWithCallbacksAndBufferSize(ctx context.Context, a, b io.ReadWriteCloser
 		}
 		closeAll()
 	}()
+
+	if ctx != nil {
+		go func() {
+			select {
+			case <-ctx.Done():
+				closeAll()
+			case <-stopCh:
+			}
+		}()
+	}
 
 	wg.Wait()
 

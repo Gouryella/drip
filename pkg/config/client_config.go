@@ -2,8 +2,10 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -13,6 +15,31 @@ type ClientConfig struct {
 	Server string `yaml:"server"` // Server address (e.g., tunnel.example.com:443)
 	Token  string `yaml:"token"`  // Authentication token
 	TLS    bool   `yaml:"tls"`    // Use TLS (always true for production)
+}
+
+// Validate checks if the client configuration is valid
+func (c *ClientConfig) Validate() error {
+	if c.Server == "" {
+		return fmt.Errorf("server address is required")
+	}
+
+	host, port, err := net.SplitHostPort(c.Server)
+	if err != nil {
+		if strings.Contains(err.Error(), "missing port") {
+			return fmt.Errorf("server address must include port (e.g., example.com:443), got: %s", c.Server)
+		}
+		return fmt.Errorf("invalid server address format: %s (expected host:port)", c.Server)
+	}
+
+	if host == "" {
+		return fmt.Errorf("server host is required")
+	}
+
+	if port == "" {
+		return fmt.Errorf("server port is required")
+	}
+
+	return nil
 }
 
 // DefaultClientConfig returns the default configuration path
@@ -43,8 +70,8 @@ func LoadClientConfig(path string) (*ClientConfig, error) {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
 
-	if config.Server == "" {
-		return nil, fmt.Errorf("server address is required in config")
+	if err := config.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid config: %w", err)
 	}
 
 	return &config, nil

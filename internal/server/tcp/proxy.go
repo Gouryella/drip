@@ -32,6 +32,8 @@ type Proxy struct {
 
 	ctx    context.Context
 	cancel context.CancelFunc
+
+	checkIPAccess func(ip string) bool
 }
 
 type trafficStats interface {
@@ -64,6 +66,11 @@ func NewProxy(ctx context.Context, port int, subdomain string, openStream func()
 		ctx:        cctx,
 		cancel:     cancel,
 	}
+}
+
+// SetIPAccessCheck sets the IP access control check function.
+func (p *Proxy) SetIPAccessCheck(check func(ip string) bool) {
+	p.checkIPAccess = check
 }
 
 func (p *Proxy) Start() error {
@@ -155,6 +162,17 @@ func (p *Proxy) acceptLoop() {
 func (p *Proxy) handleConn(conn net.Conn) {
 	defer p.wg.Done()
 	defer conn.Close()
+
+	if p.checkIPAccess != nil {
+		clientIP := netutil.ExtractIP(conn.RemoteAddr().String())
+		if !p.checkIPAccess(clientIP) {
+			p.logger.Debug("IP access denied",
+				zap.String("ip", clientIP),
+				zap.Int("port", p.port),
+			)
+			return
+		}
+	}
 
 	if p.sem != nil {
 		select {

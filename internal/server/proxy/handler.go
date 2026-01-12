@@ -41,6 +41,24 @@ type Handler struct {
 	metricsToken string
 }
 
+var privateNetworks []*net.IPNet
+
+func init() {
+	privateCIDRs := []string{
+		"127.0.0.0/8",    // IPv4 loopback
+		"10.0.0.0/8",     // RFC 1918 Class A
+		"172.16.0.0/12",  // RFC 1918 Class B
+		"192.168.0.0/16", // RFC 1918 Class C
+		"::1/128",        // IPv6 loopback
+		"fc00::/7",       // IPv6 unique local
+		"fe80::/10",      // IPv6 link-local
+	}
+	for _, cidr := range privateCIDRs {
+		_, ipNet, _ := net.ParseCIDR(cidr)
+		privateNetworks = append(privateNetworks, ipNet)
+	}
+}
+
 func NewHandler(manager *tunnel.Manager, logger *zap.Logger, domain string, authToken string, metricsToken string) *Handler {
 	return &Handler{
 		manager:      manager,
@@ -79,6 +97,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if tconn.IsClosed() {
 		http.Error(w, "Tunnel connection closed", http.StatusBadGateway)
 		return
+	}
+
+	if tconn.HasIPAccessControl() {
+		clientIP := h.extractClientIP(r)
+		if !tconn.IsIPAllowed(clientIP) {
+			http.Error(w, "Access denied: your IP is not allowed", http.StatusForbidden)
+			return
+		}
 	}
 
 	tType := tconn.GetTunnelType()
@@ -159,23 +185,23 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(statusCode)
 
+	// Use pooled buffer for zero-copy optimization
+	buf := pool.GetBuffer(pool.SizeLarge)
+	defer pool.PutBuffer(buf)
+
+	// Copy with context cancellation support
 	ctx := r.Context()
-	done := make(chan struct{})
+	copyDone := make(chan struct{})
 	go func() {
 		select {
 		case <-ctx.Done():
 			stream.Close()
-		case <-done:
+		case <-copyDone:
 		}
 	}()
 
-	// Use pooled buffer for zero-copy optimization
-	buf := pool.GetBuffer(pool.SizeLarge)
 	_, _ = io.CopyBuffer(w, resp.Body, (*buf)[:])
-	pool.PutBuffer(buf)
-
-	close(done)
-	stream.Close()
+	close(copyDone)
 }
 
 func (h *Handler) openStreamWithTimeout(tconn *tunnel.Connection) (net.Conn, error) {
@@ -184,24 +210,23 @@ func (h *Handler) openStreamWithTimeout(tconn *tunnel.Connection) (net.Conn, err
 		err    error
 	}
 	ch := make(chan result, 1)
-	done := make(chan struct{})
-	defer close(done)
 
 	go func() {
 		s, err := tconn.OpenStream()
-		select {
-		case ch <- result{s, err}:
-		case <-done:
-			if s != nil {
-				s.Close()
-			}
-		}
+		ch <- result{s, err}
 	}()
 
 	select {
 	case r := <-ch:
 		return r.stream, r.err
 	case <-time.After(openStreamTimeout):
+		// Goroutine will eventually complete and send to buffered channel
+		// which will be garbage collected. If stream was opened, it needs cleanup.
+		go func() {
+			if r := <-ch; r.stream != nil {
+				r.stream.Close()
+			}
+		}()
 		return nil, fmt.Errorf("open stream timeout")
 	}
 }
@@ -326,6 +351,59 @@ func (h *Handler) extractSubdomain(host string) string {
 	}
 
 	return ""
+}
+
+// extractClientIP extracts the client IP from the request.
+// It only trusts X-Forwarded-For and X-Real-IP headers when the request
+// comes from a private/loopback network (typical reverse proxy setup).
+func (h *Handler) extractClientIP(r *http.Request) string {
+	// First, get the direct remote address
+	remoteIP := h.extractRemoteIP(r.RemoteAddr)
+
+	// Only trust proxy headers if the request comes from a private network
+	if isPrivateIP(remoteIP) {
+		// Check X-Forwarded-For header (may contain multiple IPs)
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			// Take the first IP (original client)
+			if idx := strings.Index(xff, ","); idx != -1 {
+				return strings.TrimSpace(xff[:idx])
+			}
+			return strings.TrimSpace(xff)
+		}
+
+		// Check X-Real-IP header
+		if xri := r.Header.Get("X-Real-IP"); xri != "" {
+			return strings.TrimSpace(xri)
+		}
+	}
+
+	// Fall back to remote address
+	return remoteIP
+}
+
+// extractRemoteIP extracts the IP address from a remote address string (host:port format).
+func (h *Handler) extractRemoteIP(remoteAddr string) string {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		return remoteAddr
+	}
+	return host
+}
+
+// isPrivateIP checks if the given IP is a private/loopback address.
+func isPrivateIP(ip string) bool {
+	parsedIP := net.ParseIP(ip)
+	if parsedIP == nil {
+		return false
+	}
+
+	for _, network := range privateNetworks {
+		if network.Contains(parsedIP) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (h *Handler) serveHomePage(w http.ResponseWriter, r *http.Request) {

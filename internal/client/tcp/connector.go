@@ -24,6 +24,9 @@ type ConnectorConfig struct {
 	PoolSize int
 	PoolMin  int
 	PoolMax  int
+
+	AllowIPs []string
+	DenyIPs  []string
 }
 
 type TunnelClient interface {
