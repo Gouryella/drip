@@ -509,26 +509,54 @@ download_binary() {
         print_step "$(msg downloading)..."
     fi
 
-    local binary_name="drip-${VERSION}-linux-${ARCH}"
-    local download_url="https://github.com/${GITHUB_REPO}/releases/download/${VERSION}/${binary_name}"
+    # Strip 'v' prefix for archive filename (v0.7.0 -> 0.7.0)
+    local version_number="${VERSION#v}"
+    local archive_name="drip_${version_number}_linux_${ARCH}.tar.gz"
+    local download_url="https://github.com/${GITHUB_REPO}/releases/download/${VERSION}/${archive_name}"
 
-    local tmp_file="/tmp/drip"
+    local tmp_archive="/tmp/drip-archive.tar.gz"
+    local tmp_dir="/tmp/drip-extract"
+
+    # Clean up any previous extraction
+    rm -rf "$tmp_dir"
+    mkdir -p "$tmp_dir"
 
     if command -v curl &> /dev/null; then
         # Use -# for progress bar instead of -s (silent)
-        if ! curl -f#L "$download_url" -o "$tmp_file"; then
+        if ! curl -f#L "$download_url" -o "$tmp_archive"; then
             print_error "$(msg download_failed): $download_url"
             exit 1
         fi
     else
         # Use --show-progress to display download progress
-        if ! wget --show-progress "$download_url" -O "$tmp_file" 2>&1 | grep -v "^$"; then
+        if ! wget --show-progress "$download_url" -O "$tmp_archive" 2>&1 | grep -v "^$"; then
             print_error "$(msg download_failed): $download_url"
             exit 1
         fi
     fi
 
-    chmod +x "$tmp_file"
+    # Extract the archive
+    if ! tar -xzf "$tmp_archive" -C "$tmp_dir"; then
+        print_error "Failed to extract archive"
+        exit 1
+    fi
+
+    # Find the binary (it should be named 'drip')
+    local extracted_binary
+    extracted_binary=$(find "$tmp_dir" -name "drip" -type f 2>/dev/null | head -1)
+
+    if [[ -z "$extracted_binary" ]]; then
+        print_error "Binary not found in archive"
+        exit 1
+    fi
+
+    # Move to standard location
+    mv "$extracted_binary" /tmp/drip
+    chmod +x /tmp/drip
+
+    # Clean up
+    rm -rf "$tmp_archive" "$tmp_dir"
+
     print_success "$(msg download_ok)"
 }
 
