@@ -19,19 +19,17 @@ func (c *bufferedConn) Read(p []byte) (int, error) {
 	return c.reader.Read(p)
 }
 
-func (c *Connection) handleTCPTunnel(reader *bufio.Reader) error {
-	// Public server acts as yamux Client, client connector acts as yamux Server.
+// initMuxSession creates a yamux session over the buffered connection and
+// returns the openStream function (possibly group-aware).
+func (c *Connection) initMuxSession(reader *bufio.Reader) (func() (net.Conn, error), *yamux.Session, error) {
 	bc := &bufferedConn{
 		Conn:   c.conn,
 		reader: reader,
 	}
 
-	// Use optimized mux config for server
-	cfg := mux.NewServerConfig()
-
-	session, err := yamux.Client(bc, cfg)
+	session, err := yamux.Client(bc, mux.NewServerConfig())
 	if err != nil {
-		return fmt.Errorf("failed to init yamux session: %w", err)
+		return nil, nil, fmt.Errorf("failed to init yamux session: %w", err)
 	}
 	c.session = session
 
@@ -43,9 +41,21 @@ func (c *Connection) handleTCPTunnel(reader *bufio.Reader) error {
 		}
 	}
 
+	return openStream, session, nil
+}
+
+func (c *Connection) handleTCPTunnel(reader *bufio.Reader) error {
+	openStream, session, err := c.initMuxSession(reader)
+	if err != nil {
+		return err
+	}
+
 	c.proxy = NewProxy(c.ctx, c.port, c.subdomain, openStream, c.tunnelConn, c.logger)
 	if c.tunnelConn != nil && c.tunnelConn.HasIPAccessControl() {
 		c.proxy.SetIPAccessCheck(c.tunnelConn.IsIPAllowed)
+	}
+	if c.tunnelConn != nil {
+		c.proxy.SetLimiter(c.tunnelConn.GetLimiter())
 	}
 
 	if err := c.proxy.Start(); err != nil {
@@ -61,27 +71,9 @@ func (c *Connection) handleTCPTunnel(reader *bufio.Reader) error {
 }
 
 func (c *Connection) handleHTTPProxyTunnel(reader *bufio.Reader) error {
-	// Public server acts as yamux Client, client connector acts as yamux Server.
-	bc := &bufferedConn{
-		Conn:   c.conn,
-		reader: reader,
-	}
-
-	// Use optimized mux config for server
-	cfg := mux.NewServerConfig()
-
-	session, err := yamux.Client(bc, cfg)
+	openStream, session, err := c.initMuxSession(reader)
 	if err != nil {
-		return fmt.Errorf("failed to init yamux session: %w", err)
-	}
-	c.session = session
-
-	openStream := session.Open
-	if c.groupManager != nil {
-		if group, ok := c.groupManager.GetGroup(c.tunnelID); ok && group != nil {
-			group.AddSession("primary", session)
-			openStream = group.OpenStream
-		}
+		return err
 	}
 
 	if c.tunnelConn != nil {

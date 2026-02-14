@@ -43,9 +43,10 @@ type Listener struct {
 	httpServer   *http.Server
 	httpListener *connQueueListener
 
-	// Server capabilities
 	allowedTransports  []string
 	allowedTunnelTypes []string
+	bandwidth          int64
+	burstMultiplier    float64
 }
 
 func NewListener(address string, tlsConfig *tls.Config, authToken string, manager *tunnel.Manager, logger *zap.Logger, portAlloc *PortAllocator, domain string, tunnelDomain string, publicPort int, httpHandler http.Handler) *Listener {
@@ -63,7 +64,6 @@ func NewListener(address string, tlsConfig *tls.Config, authToken string, manage
 	panicMetrics := recovery.NewPanicMetrics(logger, nil)
 	recoverer := recovery.NewRecoverer(logger, panicMetrics)
 
-	// Initialize worker pool metrics
 	metrics.WorkerPoolSize.Set(float64(workers))
 
 	l := &Listener{
@@ -85,7 +85,6 @@ func NewListener(address string, tlsConfig *tls.Config, authToken string, manage
 		groupManager: NewConnectionGroupManager(logger),
 	}
 
-	// Set up WebSocket connection handler if httpHandler supports it
 	if h, ok := httpHandler.(*proxy.Handler); ok {
 		h.SetWSConnectionHandler(l)
 		h.SetPublicPort(publicPort)
@@ -97,7 +96,6 @@ func NewListener(address string, tlsConfig *tls.Config, authToken string, manage
 func (l *Listener) Start() error {
 	var err error
 
-	// Support both TLS and plain TCP modes
 	if l.tlsConfig != nil {
 		l.listener, err = tls.Listen("tcp", l.address, l.tlsConfig)
 		if err != nil {
@@ -269,57 +267,13 @@ func (l *Listener) handleConnection(netConn net.Conn) {
 		)
 	}
 
-	conn := NewConnection(netConn, l.authToken, l.manager, l.logger, l.portAlloc, l.domain, l.tunnelDomain, l.publicPort, l.httpHandler, l.groupManager, l.httpListener)
-	conn.SetAllowedTunnelTypes(l.allowedTunnelTypes)
-	conn.SetAllowedTransports(l.allowedTransports)
+	conn := l.newConfiguredConnection(netConn)
 
 	connID := netConn.RemoteAddr().String()
-	l.connMu.Lock()
-	l.connections[connID] = conn
-	l.connMu.Unlock()
+	l.trackConnection(connID, conn)
+	defer l.untrackConnection(connID, conn, netConn)
 
-	// Update connection metrics
-	metrics.TotalConnections.Inc()
-	metrics.ActiveConnections.Inc()
-
-	defer func() {
-		l.connMu.Lock()
-		delete(l.connections, connID)
-		l.connMu.Unlock()
-
-		metrics.ActiveConnections.Dec()
-
-		if !conn.IsHandedOff() {
-			netConn.Close()
-		}
-	}()
-
-	if err := conn.Handle(); err != nil {
-		errStr := err.Error()
-
-		if strings.Contains(errStr, "EOF") ||
-			strings.Contains(errStr, "connection reset by peer") ||
-			strings.Contains(errStr, "broken pipe") ||
-			strings.Contains(errStr, "connection refused") {
-			return
-		}
-
-		if strings.Contains(errStr, "payload too large") ||
-			strings.Contains(errStr, "failed to read registration frame") ||
-			strings.Contains(errStr, "expected register frame") ||
-			strings.Contains(errStr, "failed to parse registration request") ||
-			strings.Contains(errStr, "failed to parse HTTP request") {
-			l.logger.Warn("Protocol validation failed",
-				zap.String("remote_addr", connID),
-				zap.Error(err),
-			)
-		} else {
-			l.logger.Error("Connection handling failed",
-				zap.String("remote_addr", connID),
-				zap.Error(err),
-			)
-		}
-	}
+	l.logConnectionError(conn.Handle(), connID, "Connection")
 }
 
 func (l *Listener) Stop() error {
@@ -372,7 +326,6 @@ func (l *Listener) GetActiveConnections() int {
 	return len(l.connections)
 }
 
-// HandleWSConnection implements proxy.WSConnectionHandler for WebSocket tunnel connections
 func (l *Listener) HandleWSConnection(conn net.Conn, remoteAddr string) {
 	l.wg.Add(1)
 	defer l.wg.Done()
@@ -386,77 +339,103 @@ func (l *Listener) HandleWSConnection(conn net.Conn, remoteAddr string) {
 		zap.String("remote_addr", connID),
 	)
 
-	// Create connection handler (no TLS verification needed - already done by HTTP server)
-	tcpConn := NewConnection(conn, l.authToken, l.manager, l.logger, l.portAlloc, l.domain, l.tunnelDomain, l.publicPort, l.httpHandler, l.groupManager, l.httpListener)
-	tcpConn.SetAllowedTunnelTypes(l.allowedTunnelTypes)
+	tcpConn := l.newConfiguredConnection(conn)
 
-	l.connMu.Lock()
-	l.connections[connID] = tcpConn
-	l.connMu.Unlock()
+	l.trackConnection(connID, tcpConn)
+	defer l.untrackConnection(connID, tcpConn, conn)
 
-	metrics.TotalConnections.Inc()
-	metrics.ActiveConnections.Inc()
-
-	defer func() {
-		l.connMu.Lock()
-		delete(l.connections, connID)
-		l.connMu.Unlock()
-
-		metrics.ActiveConnections.Dec()
-
-		if !tcpConn.IsHandedOff() {
-			conn.Close()
-		}
-	}()
-
-	if err := tcpConn.Handle(); err != nil {
-		errStr := err.Error()
-
-		if strings.Contains(errStr, "EOF") ||
-			strings.Contains(errStr, "connection reset by peer") ||
-			strings.Contains(errStr, "broken pipe") ||
-			strings.Contains(errStr, "connection refused") ||
-			strings.Contains(errStr, "websocket: close") {
-			return
-		}
-
-		if strings.Contains(errStr, "payload too large") ||
-			strings.Contains(errStr, "failed to read registration frame") ||
-			strings.Contains(errStr, "expected register frame") ||
-			strings.Contains(errStr, "failed to parse registration request") ||
-			strings.Contains(errStr, "tunnel type not allowed") {
-			l.logger.Warn("WebSocket tunnel protocol validation failed",
-				zap.String("remote_addr", connID),
-				zap.Error(err),
-			)
-		} else {
-			l.logger.Error("WebSocket tunnel connection handling failed",
-				zap.String("remote_addr", connID),
-				zap.Error(err),
-			)
-		}
-	}
+	l.logConnectionError(tcpConn.Handle(), connID, "WebSocket tunnel")
 }
 
-// SetAllowedTransports sets the allowed transport protocols
 func (l *Listener) SetAllowedTransports(transports []string) {
 	l.allowedTransports = transports
 }
 
-// SetAllowedTunnelTypes sets the allowed tunnel types
 func (l *Listener) SetAllowedTunnelTypes(types []string) {
 	l.allowedTunnelTypes = types
 }
 
-// IsTransportAllowed checks if a transport is allowed
 func (l *Listener) IsTransportAllowed(transport string) bool {
-	if len(l.allowedTransports) == 0 {
-		return true
+	return containsFold(l.allowedTransports, transport)
+}
+
+func (l *Listener) SetBurstMultiplier(multiplier float64) {
+	if multiplier <= 0 {
+		multiplier = 2.0
 	}
-	for _, t := range l.allowedTransports {
-		if strings.EqualFold(t, transport) {
-			return true
+	l.burstMultiplier = multiplier
+}
+
+func (l *Listener) SetBandwidth(bandwidth int64) {
+	l.bandwidth = bandwidth
+}
+
+func (l *Listener) newConfiguredConnection(conn net.Conn) *Connection {
+	c := NewConnection(conn, l.authToken, l.manager, l.logger, l.portAlloc, l.domain, l.tunnelDomain, l.publicPort, l.httpHandler, l.groupManager, l.httpListener)
+	c.SetAllowedTunnelTypes(l.allowedTunnelTypes)
+	c.SetAllowedTransports(l.allowedTransports)
+	c.SetBandwidthConfig(l.bandwidth, l.burstMultiplier)
+	return c
+}
+
+func (l *Listener) trackConnection(connID string, conn *Connection) {
+	l.connMu.Lock()
+	l.connections[connID] = conn
+	l.connMu.Unlock()
+
+	metrics.TotalConnections.Inc()
+	metrics.ActiveConnections.Inc()
+}
+
+func (l *Listener) untrackConnection(connID string, conn *Connection, netConn net.Conn) {
+	l.connMu.Lock()
+	delete(l.connections, connID)
+	l.connMu.Unlock()
+
+	metrics.ActiveConnections.Dec()
+
+	if !conn.IsHandedOff() {
+		netConn.Close()
+	}
+}
+
+// logConnectionError classifies and logs a connection handling error.
+// Transient network errors are silently ignored, protocol errors are warned,
+// and everything else is logged as an error.
+func (l *Listener) logConnectionError(err error, connID, label string) {
+	if err == nil {
+		return
+	}
+
+	errStr := err.Error()
+
+	// Transient / expected disconnects — ignore silently
+	for _, substr := range []string{
+		"EOF", "connection reset by peer", "broken pipe",
+		"connection refused", "websocket: close",
+	} {
+		if strings.Contains(errStr, substr) {
+			return
 		}
 	}
-	return false
+
+	// Protocol-level validation failures — warn
+	for _, substr := range []string{
+		"payload too large", "failed to read registration frame",
+		"expected register frame", "failed to parse registration request",
+		"failed to parse HTTP request", "tunnel type not allowed",
+	} {
+		if strings.Contains(errStr, substr) {
+			l.logger.Warn(label+" protocol validation failed",
+				zap.String("remote_addr", connID),
+				zap.Error(err),
+			)
+			return
+		}
+	}
+
+	l.logger.Error(label+" handling failed",
+		zap.String("remote_addr", connID),
+		zap.Error(err),
+	)
 }

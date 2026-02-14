@@ -10,7 +10,6 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// TunnelConfig holds configuration for a predefined tunnel
 type TunnelConfig struct {
 	Name      string   `yaml:"name"`                // Tunnel name (required, unique identifier)
 	Type      string   `yaml:"type"`                // Tunnel type: http, https, tcp (required)
@@ -21,9 +20,9 @@ type TunnelConfig struct {
 	AllowIPs  []string `yaml:"allow_ips,omitempty"` // Allowed IPs/CIDRs
 	DenyIPs   []string `yaml:"deny_ips,omitempty"`  // Denied IPs/CIDRs
 	Auth      string   `yaml:"auth,omitempty"`      // Proxy authentication password (http/https only)
+	Bandwidth string   `yaml:"bandwidth,omitempty"` // Bandwidth limit (e.g., 1M, 500K, 1G)
 }
 
-// Validate checks if the tunnel configuration is valid
 func (t *TunnelConfig) Validate() error {
 	if t.Name == "" {
 		return fmt.Errorf("tunnel name is required")
@@ -47,7 +46,6 @@ func (t *TunnelConfig) Validate() error {
 	return nil
 }
 
-// ClientConfig represents the client configuration
 type ClientConfig struct {
 	Server  string          `yaml:"server"`            // Server address (e.g., tunnel.example.com:443)
 	Token   string          `yaml:"token"`             // Authentication token
@@ -55,7 +53,6 @@ type ClientConfig struct {
 	Tunnels []*TunnelConfig `yaml:"tunnels,omitempty"` // Predefined tunnels
 }
 
-// Validate checks if the client configuration is valid
 func (c *ClientConfig) Validate() error {
 	if c.Server == "" {
 		return fmt.Errorf("server address is required")
@@ -92,7 +89,6 @@ func (c *ClientConfig) Validate() error {
 	return nil
 }
 
-// GetTunnel returns a tunnel by name
 func (c *ClientConfig) GetTunnel(name string) *TunnelConfig {
 	for _, t := range c.Tunnels {
 		if t.Name == name {
@@ -102,7 +98,6 @@ func (c *ClientConfig) GetTunnel(name string) *TunnelConfig {
 	return nil
 }
 
-// GetTunnelNames returns all tunnel names
 func (c *ClientConfig) GetTunnelNames() []string {
 	names := make([]string, len(c.Tunnels))
 	for i, t := range c.Tunnels {
@@ -111,7 +106,6 @@ func (c *ClientConfig) GetTunnelNames() []string {
 	return names
 }
 
-// DefaultClientConfig returns the default configuration path
 func DefaultClientConfigPath() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -120,7 +114,6 @@ func DefaultClientConfigPath() string {
 	return filepath.Join(home, ".drip", "config.yaml")
 }
 
-// LoadClientConfig loads configuration from file
 func LoadClientConfig(path string) (*ClientConfig, error) {
 	if path == "" {
 		path = DefaultClientConfigPath()
@@ -146,7 +139,6 @@ func LoadClientConfig(path string) (*ClientConfig, error) {
 	return &config, nil
 }
 
-// SaveClientConfig saves configuration to file
 func SaveClientConfig(config *ClientConfig, path string) error {
 	if path == "" {
 		path = DefaultClientConfigPath()
@@ -162,7 +154,6 @@ func SaveClientConfig(config *ClientConfig, path string) error {
 		return fmt.Errorf("failed to marshal config: %w", err)
 	}
 
-	// Write to file with secure permissions
 	if err := os.WriteFile(path, data, 0600); err != nil {
 		return fmt.Errorf("failed to write config file: %w", err)
 	}
@@ -170,7 +161,6 @@ func SaveClientConfig(config *ClientConfig, path string) error {
 	return nil
 }
 
-// ConfigExists checks if config file exists
 func ConfigExists(path string) bool {
 	if path == "" {
 		path = DefaultClientConfigPath()

@@ -20,6 +20,7 @@ var (
 	denyIPs      []string
 	authPass     string
 	transport    string
+	bandwidth    string
 )
 
 var httpCmd = &cobra.Command{
@@ -35,6 +36,7 @@ Example:
   drip http 3000 --deny-ip 1.2.3.4          Block specific IP
   drip http 3000 --auth secret              Enable proxy authentication with password
   drip http 3000 --transport wss            Use WebSocket over TLS (CDN-friendly)
+  drip http 3000 --bandwidth 1M             Limit bandwidth to 1 MB/s
 
 Configuration:
   First time: Run 'drip config init' to save server and token
@@ -43,7 +45,13 @@ Configuration:
 Transport options:
   auto  - Automatically select based on server address (default)
   tcp   - Direct TLS 1.3 connection
-  wss   - WebSocket over TLS (works through CDN like Cloudflare)`,
+  wss   - WebSocket over TLS (works through CDN like Cloudflare)
+
+Bandwidth format:
+  1K, 1KB  - 1 kilobyte per second (1024 bytes/s)
+  1M, 1MB  - 1 megabyte per second (1048576 bytes/s)
+  1G, 1GB  - 1 gigabyte per second
+  1024     - 1024 bytes per second (raw number)`,
 	Args: cobra.ExactArgs(1),
 	RunE: runHTTP,
 }
@@ -56,6 +64,7 @@ func init() {
 	httpCmd.Flags().StringSliceVar(&denyIPs, "deny-ip", nil, "Deny these IPs or CIDR ranges (e.g., 1.2.3.4,192.168.1.0/24)")
 	httpCmd.Flags().StringVar(&authPass, "auth", "", "Password for proxy authentication")
 	httpCmd.Flags().StringVar(&transport, "transport", "auto", "Transport protocol: auto, tcp, wss (WebSocket over TLS)")
+	httpCmd.Flags().StringVar(&bandwidth, "bandwidth", "", "Bandwidth limit (e.g., 1M, 500K, 1G)")
 	httpCmd.Flags().BoolVar(&daemonMarker, "daemon-child", false, "Internal flag for daemon child process")
 	httpCmd.Flags().MarkHidden("daemon-child")
 	rootCmd.AddCommand(httpCmd)
@@ -76,6 +85,11 @@ func runHTTP(_ *cobra.Command, args []string) error {
 		return err
 	}
 
+	bw, err := parseBandwidth(bandwidth)
+	if err != nil {
+		return err
+	}
+
 	connConfig := &tcp.ConnectorConfig{
 		ServerAddr: serverAddr,
 		Token:      token,
@@ -88,6 +102,7 @@ func runHTTP(_ *cobra.Command, args []string) error {
 		DenyIPs:    denyIPs,
 		AuthPass:   authPass,
 		Transport:  parseTransport(transport),
+		Bandwidth:  bw,
 	}
 
 	var daemon *DaemonInfo
@@ -107,4 +122,37 @@ func parseTransport(s string) tcp.TransportType {
 	default:
 		return tcp.TransportAuto
 	}
+}
+
+func parseBandwidth(s string) (int64, error) {
+	if s == "" {
+		return 0, nil
+	}
+
+	s = strings.TrimSpace(strings.ToUpper(s))
+	if s == "" {
+		return 0, nil
+	}
+
+	var multiplier int64 = 1
+	switch {
+	case strings.HasSuffix(s, "GB") || strings.HasSuffix(s, "G"):
+		multiplier = 1024 * 1024 * 1024
+		s = strings.TrimSuffix(strings.TrimSuffix(s, "GB"), "G")
+	case strings.HasSuffix(s, "MB") || strings.HasSuffix(s, "M"):
+		multiplier = 1024 * 1024
+		s = strings.TrimSuffix(strings.TrimSuffix(s, "MB"), "M")
+	case strings.HasSuffix(s, "KB") || strings.HasSuffix(s, "K"):
+		multiplier = 1024
+		s = strings.TrimSuffix(strings.TrimSuffix(s, "KB"), "K")
+	case strings.HasSuffix(s, "B"):
+		s = strings.TrimSuffix(s, "B")
+	}
+
+	val, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || val < 0 {
+		return 0, fmt.Errorf("invalid bandwidth value: %q (use format like 1M, 500K, 1G)", s)
+	}
+
+	return val * multiplier, nil
 }

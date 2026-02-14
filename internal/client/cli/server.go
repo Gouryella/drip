@@ -22,21 +22,21 @@ import (
 )
 
 var (
-	serverPort           int
-	serverPublicPort     int
-	serverDomain         string
-	serverTunnelDomain   string
-	serverAuthToken      string
-	serverMetricsToken   string
-	serverDebug          bool
-	serverTCPPortMin     int
-	serverTCPPortMax     int
-	serverTLSCert        string
-	serverTLSKey         string
-	serverPprofPort      int
-	serverTransports     string
-	serverTunnelTypes    string
-	serverConfigFile     string
+	serverPort         int
+	serverPublicPort   int
+	serverDomain       string
+	serverTunnelDomain string
+	serverAuthToken    string
+	serverMetricsToken string
+	serverDebug        bool
+	serverTCPPortMin   int
+	serverTCPPortMax   int
+	serverTLSCert      string
+	serverTLSKey       string
+	serverPprofPort    int
+	serverTransports   string
+	serverTunnelTypes  string
+	serverConfigFile   string
 )
 
 var serverCmd = &cobra.Command{
@@ -293,6 +293,24 @@ func runServer(cmd *cobra.Command, _ []string) error {
 	listener.SetAllowedTransports(cfg.AllowedTransports)
 	listener.SetAllowedTunnelTypes(cfg.AllowedTunnelTypes)
 
+	bandwidth, err := parseBandwidth(cfg.Bandwidth)
+	if err != nil {
+		logger.Fatal("Invalid bandwidth configuration", zap.Error(err))
+	}
+	burstMultiplier := cfg.BurstMultiplier
+	if burstMultiplier <= 0 {
+		burstMultiplier = 2.0
+	}
+	listener.SetBandwidth(bandwidth)
+	listener.SetBurstMultiplier(burstMultiplier)
+	if bandwidth > 0 {
+		logger.Info("Bandwidth limit configured",
+			zap.String("bandwidth", cfg.Bandwidth),
+			zap.Int64("bandwidth_bytes_sec", bandwidth),
+			zap.Float64("burst_multiplier", burstMultiplier),
+		)
+	}
+
 	if err := listener.Start(); err != nil {
 		logger.Fatal("Failed to start TCP listener", zap.Error(err))
 	}
@@ -326,7 +344,6 @@ func runServer(cmd *cobra.Command, _ []string) error {
 	return nil
 }
 
-// getEnvInt returns the environment variable value as int, or defaultVal if not set
 func getEnvInt(key string, defaultVal int) int {
 	if val := os.Getenv(key); val != "" {
 		if i, err := strconv.Atoi(val); err == nil {
@@ -336,7 +353,6 @@ func getEnvInt(key string, defaultVal int) int {
 	return defaultVal
 }
 
-// getEnvString returns the environment variable value, or defaultVal if not set
 func getEnvString(key string, defaultVal string) string {
 	if val := os.Getenv(key); val != "" {
 		return val
@@ -344,7 +360,6 @@ func getEnvString(key string, defaultVal string) string {
 	return defaultVal
 }
 
-// parseCommaSeparated splits a comma-separated string into a slice
 func parseCommaSeparated(s string) []string {
 	if s == "" {
 		return nil

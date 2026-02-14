@@ -10,6 +10,7 @@ import (
 
 	"drip/internal/shared/netutil"
 	"drip/internal/shared/pool"
+	"drip/internal/shared/qos"
 
 	"go.uber.org/zap"
 )
@@ -34,6 +35,7 @@ type Proxy struct {
 	cancel context.CancelFunc
 
 	checkIPAccess func(ip string) bool
+	limiter       *qos.Limiter
 }
 
 type trafficStats interface {
@@ -49,12 +51,6 @@ func NewProxy(ctx context.Context, port int, subdomain string, openStream func()
 	}
 	cctx, cancel := context.WithCancel(ctx)
 
-	const maxConcurrentConnections = 10000
-	var sem chan struct{}
-	if maxConcurrentConnections > 0 {
-		sem = make(chan struct{}, maxConcurrentConnections)
-	}
-
 	return &Proxy{
 		port:       port,
 		subdomain:  subdomain,
@@ -62,15 +58,18 @@ func NewProxy(ctx context.Context, port int, subdomain string, openStream func()
 		stopCh:     make(chan struct{}),
 		openStream: openStream,
 		stats:      stats,
-		sem:        sem,
+		sem:        make(chan struct{}, 10000),
 		ctx:        cctx,
 		cancel:     cancel,
 	}
 }
 
-// SetIPAccessCheck sets the IP access control check function.
 func (p *Proxy) SetIPAccessCheck(check func(ip string) bool) {
 	p.checkIPAccess = check
+}
+
+func (p *Proxy) SetLimiter(limiter *qos.Limiter) {
+	p.limiter = limiter
 }
 
 func (p *Proxy) Start() error {
@@ -174,13 +173,11 @@ func (p *Proxy) handleConn(conn net.Conn) {
 		}
 	}
 
-	if p.sem != nil {
-		select {
-		case p.sem <- struct{}{}:
-			defer func() { <-p.sem }()
-		default:
-			return
-		}
+	select {
+	case p.sem <- struct{}{}:
+		defer func() { <-p.sem }()
+	default:
+		return
 	}
 
 	if p.stats != nil {
@@ -243,7 +240,7 @@ func (p *Proxy) handleConn(conn net.Conn) {
 	_ = netutil.PipeWithCallbacksAndBufferSize(
 		p.ctx,
 		conn,
-		stream,
+		qos.NewLimitedConn(p.ctx, stream, p.limiter),
 		pool.SizeLarge,
 		func(n int64) {
 			if p.stats != nil {

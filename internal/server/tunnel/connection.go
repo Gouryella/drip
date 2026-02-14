@@ -9,6 +9,7 @@ import (
 	"drip/internal/server/metrics"
 	"drip/internal/shared/netutil"
 	"drip/internal/shared/protocol"
+	"drip/internal/shared/qos"
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
 )
@@ -32,6 +33,9 @@ type Connection struct {
 
 	ipAccessChecker *netutil.IPAccessChecker
 	proxyAuth       *protocol.ProxyAuth
+
+	bandwidth int64
+	limiter   *qos.Limiter
 }
 
 func NewConnection(subdomain string, conn *websocket.Conn, logger *zap.Logger) *Connection {
@@ -212,6 +216,34 @@ func (c *Connection) ValidateProxyAuth(password string) bool {
 		return true
 	}
 	return auth.Password == password
+}
+
+func (c *Connection) SetBandwidth(bandwidth int64) {
+	c.SetBandwidthWithBurst(bandwidth, 2.0)
+}
+
+func (c *Connection) SetBandwidthWithBurst(bandwidth int64, burstMultiplier float64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.bandwidth = bandwidth
+	if bandwidth > 0 {
+		burst := int(float64(bandwidth) * burstMultiplier)
+		c.limiter = qos.NewLimiter(qos.Config{Bandwidth: bandwidth, Burst: burst})
+	} else {
+		c.limiter = nil
+	}
+}
+
+func (c *Connection) GetBandwidth() int64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.bandwidth
+}
+
+func (c *Connection) GetLimiter() *qos.Limiter {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.limiter
 }
 
 func (c *Connection) StartWritePump() {

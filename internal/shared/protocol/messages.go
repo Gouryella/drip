@@ -27,6 +27,7 @@ type RegisterRequest struct {
 	PoolCapabilities *PoolCapabilities `json:"pool_capabilities,omitempty"`
 	IPAccess         *IPAccessControl  `json:"ip_access,omitempty"`
 	ProxyAuth        *ProxyAuth        `json:"proxy_auth,omitempty"`
+	Bandwidth        int64             `json:"bandwidth,omitempty"` // Bandwidth limit (bytes/sec), 0 = unlimited
 }
 
 type RegisterResponse struct {
@@ -37,6 +38,7 @@ type RegisterResponse struct {
 	TunnelID         string `json:"tunnel_id,omitempty"`
 	SupportsDataConn bool   `json:"supports_data_conn,omitempty"`
 	RecommendedConns int    `json:"recommended_conns,omitempty"`
+	Bandwidth        int64  `json:"bandwidth,omitempty"` // Applied bandwidth limit (bytes/sec)
 }
 
 type DataConnectRequest struct {

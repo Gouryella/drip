@@ -59,12 +59,12 @@ type Connection struct {
 	httpListener  *connQueueListener
 	handedOff     bool
 
-	// Server capabilities
 	allowedTunnelTypes []string
 	allowedTransports  []string
+	bandwidth          int64
+	burstMultiplier    float64
 }
 
-// NewConnection creates a new connection handler
 func NewConnection(conn net.Conn, authToken string, manager *tunnel.Manager, logger *zap.Logger, portAlloc *PortAllocator, domain string, tunnelDomain string, publicPort int, httpHandler http.Handler, groupManager *ConnectionGroupManager, httpListener *connQueueListener) *Connection {
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &Connection{
@@ -99,22 +99,11 @@ func (c *Connection) Handle() error {
 		return fmt.Errorf("failed to peek connection: %w", err)
 	}
 
-	peekStr := string(peek)
-	httpMethods := []string{"GET ", "POST", "PUT ", "DELE", "HEAD", "OPTI", "PATC", "CONN", "TRAC"}
-	isHTTP := false
-	for _, method := range httpMethods {
-		if strings.HasPrefix(peekStr, method) {
-			isHTTP = true
-			break
-		}
-	}
-
-	if isHTTP {
+	if isHTTPMethod(string(peek)) {
 		c.logger.Info("Detected HTTP request on TCP port, handling as HTTP")
 		return c.handleHTTPRequest(reader)
 	}
 
-	// Check if TCP transport is allowed (only for Drip protocol connections, not HTTP)
 	if !c.isTransportAllowed("tcp") {
 		c.logger.Warn("TCP transport not allowed, rejecting Drip protocol connection")
 		return fmt.Errorf("TCP transport not allowed")
@@ -142,7 +131,6 @@ func (c *Connection) Handle() error {
 
 	c.tunnelType = req.TunnelType
 
-	// Check if tunnel type is allowed
 	if !c.isTunnelTypeAllowed(string(req.TunnelType)) {
 		c.sendError("tunnel_type_not_allowed", fmt.Sprintf("Tunnel type '%s' is not allowed on this server", req.TunnelType))
 		return fmt.Errorf("tunnel type not allowed: %s", req.TunnelType)
@@ -197,7 +185,6 @@ func (c *Connection) Handle() error {
 
 	c.tunnelConn.Conn = nil
 	c.tunnelConn.SetTunnelType(req.TunnelType)
-	c.tunnelType = req.TunnelType
 
 	if req.IPAccess != nil && (len(req.IPAccess.AllowIPs) > 0 || len(req.IPAccess.DenyIPs) > 0) {
 		c.tunnelConn.SetIPAccessControl(req.IPAccess.AllowIPs, req.IPAccess.DenyIPs)
@@ -212,6 +199,31 @@ func (c *Connection) Handle() error {
 		c.tunnelConn.SetProxyAuth(req.ProxyAuth)
 		c.logger.Info("Proxy authentication configured",
 			zap.String("subdomain", subdomain),
+		)
+	}
+
+	effectiveBandwidth := c.bandwidth
+	if req.Bandwidth > 0 {
+		if effectiveBandwidth == 0 || req.Bandwidth < effectiveBandwidth {
+			effectiveBandwidth = req.Bandwidth
+		}
+	}
+	if effectiveBandwidth > 0 {
+		burstMultiplier := c.burstMultiplier
+		if burstMultiplier <= 0 {
+			burstMultiplier = 2.0
+		}
+		c.tunnelConn.SetBandwidthWithBurst(effectiveBandwidth, burstMultiplier)
+
+		source := "server"
+		if req.Bandwidth > 0 && (c.bandwidth == 0 || req.Bandwidth < c.bandwidth) {
+			source = "client"
+		}
+		c.logger.Info("Bandwidth limit configured",
+			zap.String("subdomain", subdomain),
+			zap.Int64("bandwidth_bytes_sec", effectiveBandwidth),
+			zap.Float64("burst_multiplier", burstMultiplier),
+			zap.String("source", source),
 		)
 	}
 
@@ -258,6 +270,7 @@ func (c *Connection) Handle() error {
 		TunnelID:         tunnelID,
 		SupportsDataConn: supportsDataConn,
 		RecommendedConns: recommendedConns,
+		Bandwidth:        c.tunnelConn.GetBandwidth(),
 	}
 
 	respData, err := json.Marshal(resp)
@@ -389,7 +402,6 @@ func (c *Connection) handleHTTPRequestLegacy(reader *bufio.Reader) error {
 			zap.String("host", req.Host),
 		)
 
-		// Get writer from pool to reduce GC pressure
 		pooledWriter := bufioWriterPool.Get().(*bufio.Writer)
 		pooledWriter.Reset(c.conn)
 
@@ -405,30 +417,17 @@ func (c *Connection) handleHTTPRequestLegacy(reader *bufio.Reader) error {
 			c.logger.Debug("Failed to flush HTTP response", zap.Error(err))
 		}
 
-		// Return writer to pool
-		pooledWriter.Reset(nil) // Clear reference to connection
+		pooledWriter.Reset(nil)
 		bufioWriterPool.Put(pooledWriter)
-
-		// Keep TCP_NODELAY enabled for low latency HTTP responses
-		// (removed the toggle that was disabling it)
 
 		c.logger.Debug("HTTP request processing completed",
 			zap.String("method", req.Method),
 			zap.String("url", req.URL.String()),
 		)
 
-		shouldClose := false
-		if req.Close {
-			shouldClose = true
-		} else if req.ProtoMajor == 1 && req.ProtoMinor == 0 {
-			if req.Header.Get("Connection") != "keep-alive" {
-				shouldClose = true
-			}
-		}
-
-		if respWriter.headerWritten && respWriter.header.Get("Connection") == "close" {
-			shouldClose = true
-		}
+		shouldClose := req.Close ||
+			(req.ProtoMajor == 1 && req.ProtoMinor == 0 && req.Header.Get("Connection") != "keep-alive") ||
+			(respWriter.headerWritten && respWriter.header.Get("Connection") == "close")
 
 		if shouldClose {
 			c.logger.Debug("Closing connection as requested by client or server")
@@ -636,7 +635,7 @@ func (w *httpResponseWriter) WriteHeader(statusCode int) {
 	}
 
 	w.writer.WriteString("HTTP/1.1 ")
-	w.writer.WriteString(fmt.Sprintf("%d", statusCode))
+	w.writer.WriteString(strconv.Itoa(statusCode))
 	w.writer.WriteByte(' ')
 	w.writer.WriteString(statusText)
 	w.writer.WriteString("\r\n")
@@ -755,6 +754,14 @@ func isTimeoutError(err error) bool {
 	return strings.Contains(err.Error(), "i/o timeout")
 }
 
+func isHTTPMethod(peek string) bool {
+	switch peek {
+	case "GET ", "POST", "PUT ", "DELE", "HEAD", "OPTI", "PATC", "CONN", "TRAC":
+		return true
+	}
+	return false
+}
+
 func (c *Connection) sendDataConnectError(code, message string) {
 	resp := protocol.DataConnectResponse{
 		Accepted: false,
@@ -769,38 +776,40 @@ func (c *Connection) sendDataConnectError(code, message string) {
 	_ = protocol.WriteFrame(c.conn, frame)
 }
 
-// SetAllowedTunnelTypes sets the allowed tunnel types for this connection
 func (c *Connection) SetAllowedTunnelTypes(types []string) {
 	c.allowedTunnelTypes = types
 }
 
-// SetAllowedTransports sets the allowed transports for this connection
 func (c *Connection) SetAllowedTransports(transports []string) {
 	c.allowedTransports = transports
 }
 
-// isTransportAllowed checks if a transport is allowed
 func (c *Connection) isTransportAllowed(transport string) bool {
-	if len(c.allowedTransports) == 0 {
+	return containsFold(c.allowedTransports, transport)
+}
+
+func (c *Connection) isTunnelTypeAllowed(tunnelType string) bool {
+	return containsFold(c.allowedTunnelTypes, tunnelType)
+}
+
+// containsFold returns true if the slice is empty (allow all) or contains the
+// value case-insensitively.
+func containsFold(allowed []string, value string) bool {
+	if len(allowed) == 0 {
 		return true
 	}
-	for _, t := range c.allowedTransports {
-		if strings.EqualFold(t, transport) {
+	for _, a := range allowed {
+		if strings.EqualFold(a, value) {
 			return true
 		}
 	}
 	return false
 }
 
-// isTunnelTypeAllowed checks if a tunnel type is allowed
-func (c *Connection) isTunnelTypeAllowed(tunnelType string) bool {
-	if len(c.allowedTunnelTypes) == 0 {
-		return true // Allow all by default
+func (c *Connection) SetBandwidthConfig(bandwidth int64, burstMultiplier float64) {
+	c.bandwidth = bandwidth
+	if burstMultiplier <= 0 {
+		burstMultiplier = 2.0
 	}
-	for _, t := range c.allowedTunnelTypes {
-		if strings.EqualFold(t, tunnelType) {
-			return true
-		}
-	}
-	return false
+	c.burstMultiplier = burstMultiplier
 }

@@ -151,6 +151,9 @@ func runConfigShow(_ *cobra.Command, _ []string) error {
 			if t.Transport != "" {
 				fmt.Printf("  transport=%s", t.Transport)
 			}
+			if t.Bandwidth != "" {
+				fmt.Printf("  bandwidth=%s", t.Bandwidth)
+			}
 			if len(t.AllowIPs) > 0 {
 				fmt.Printf("  allow=%s", strings.Join(t.AllowIPs, ","))
 			}

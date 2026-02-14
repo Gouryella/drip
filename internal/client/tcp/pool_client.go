@@ -13,8 +13,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/gorilla/websocket"
 	json "github.com/goccy/go-json"
+	"github.com/gorilla/websocket"
 	"github.com/hashicorp/yamux"
 	"go.uber.org/zap"
 
@@ -26,7 +26,6 @@ import (
 	"drip/pkg/config"
 )
 
-// PoolClient manages a pool of yamux sessions for tunnel connections.
 type PoolClient struct {
 	serverAddr string
 	tlsConfig  *tls.Config
@@ -76,11 +75,12 @@ type PoolClient struct {
 	// Transport protocol selection
 	transport TransportType
 	insecure  bool
+
+	// Bandwidth limit requested from server (bytes/sec), 0 = unlimited
+	bandwidth int64
 }
 
-// NewPoolClient creates a new pool client.
 func NewPoolClient(cfg *ConnectorConfig, logger *zap.Logger) *PoolClient {
-	// Parse server address to get host for TLS config
 	serverAddr := cfg.ServerAddr
 	host := serverAddr
 
@@ -96,7 +96,6 @@ func NewPoolClient(cfg *ConnectorConfig, logger *zap.Logger) *PoolClient {
 		}
 	}
 
-	// Extract hostname without port for TLS
 	hostOnly, _, _ := net.SplitHostPort(host)
 	if hostOnly == "" {
 		hostOnly = host
@@ -140,7 +139,6 @@ func NewPoolClient(cfg *ConnectorConfig, logger *zap.Logger) *PoolClient {
 	}
 	initialSessions = min(max(initialSessions, minSessions), maxSessions)
 
-	// Determine transport type
 	transport := cfg.Transport
 	if transport == "" {
 		transport = TransportAuto
@@ -171,6 +169,7 @@ func NewPoolClient(cfg *ConnectorConfig, logger *zap.Logger) *PoolClient {
 		authPass:        cfg.AuthPass,
 		transport:       transport,
 		insecure:        cfg.Insecure,
+		bandwidth:       cfg.Bandwidth,
 	}
 
 	if tunnelType == protocol.TunnelTypeHTTP || tunnelType == protocol.TunnelTypeHTTPS {
@@ -181,7 +180,6 @@ func NewPoolClient(cfg *ConnectorConfig, logger *zap.Logger) *PoolClient {
 	return c
 }
 
-// Connect establishes the primary connection and starts background workers.
 func (c *PoolClient) Connect() error {
 	primaryConn, err := c.dial()
 	if err != nil {
@@ -213,6 +211,10 @@ func (c *PoolClient) Connect() error {
 			Enabled:  true,
 			Password: c.authPass,
 		}
+	}
+
+	if c.bandwidth > 0 {
+		req.Bandwidth = c.bandwidth
 	}
 
 	payload, err := json.Marshal(req)
@@ -259,6 +261,10 @@ func (c *PoolClient) Connect() error {
 	c.subdomain = resp.Subdomain
 	if resp.SupportsDataConn && resp.TunnelID != "" {
 		c.tunnelID = resp.TunnelID
+	}
+
+	if resp.Bandwidth > 0 {
+		c.bandwidth = resp.Bandwidth
 	}
 
 	yamuxCfg := mux.NewClientConfig()
@@ -335,13 +341,11 @@ func (c *PoolClient) dialTLS() (net.Conn, error) {
 	return conn, nil
 }
 
-// serverCapabilities holds the discovered server capabilities
 type serverCapabilities struct {
 	Transports []string `json:"transports"`
 	Preferred  string   `json:"preferred"`
 }
 
-// dial selects the appropriate transport and establishes a connection
 func (c *PoolClient) dial() (net.Conn, error) {
 	switch c.transport {
 	case TransportWebSocket:
@@ -377,7 +381,6 @@ func (c *PoolClient) dial() (net.Conn, error) {
 	}
 }
 
-// discoverServerCapabilities queries the server for its capabilities
 func (c *PoolClient) discoverServerCapabilities() *serverCapabilities {
 	host, port, err := net.SplitHostPort(c.serverAddr)
 	if err != nil {
@@ -420,9 +423,7 @@ func (c *PoolClient) discoverServerCapabilities() *serverCapabilities {
 	return &caps
 }
 
-// dialWebSocket establishes a WebSocket connection to the server over TLS
 func (c *PoolClient) dialWebSocket() (net.Conn, error) {
-	// Build WebSocket URL
 	host, port, err := net.SplitHostPort(c.serverAddr)
 	if err != nil {
 		// No port specified, use default
@@ -574,7 +575,6 @@ func (c *PoolClient) pingLoop(h *sessionHandle) {
 	}
 }
 
-// Close shuts down the client and all sessions.
 func (c *PoolClient) Close() error {
 	var closeErr error
 
@@ -623,12 +623,12 @@ func (c *PoolClient) Close() error {
 	return closeErr
 }
 
-func (c *PoolClient) Wait()                              { <-c.doneCh }
-func (c *PoolClient) GetURL() string                     { return c.assignedURL }
-func (c *PoolClient) GetSubdomain() string               { return c.subdomain }
-func (c *PoolClient) GetLatency() time.Duration          { return time.Duration(c.latencyNanos.Load()) }
-func (c *PoolClient) GetStats() *stats.TrafficStats      { return c.stats }
-func (c *PoolClient) IsClosed() bool                     { return c.closed.Load() }
+func (c *PoolClient) Wait()                         { <-c.doneCh }
+func (c *PoolClient) GetURL() string                { return c.assignedURL }
+func (c *PoolClient) GetSubdomain() string          { return c.subdomain }
+func (c *PoolClient) GetLatency() time.Duration     { return time.Duration(c.latencyNanos.Load()) }
+func (c *PoolClient) GetStats() *stats.TrafficStats { return c.stats }
+func (c *PoolClient) IsClosed() bool                { return c.closed.Load() }
 
 func (c *PoolClient) SetLatencyCallback(cb LatencyCallback) {
 	if cb == nil {

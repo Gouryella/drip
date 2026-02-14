@@ -125,7 +125,10 @@ func formatTunnelInfo(t *config.TunnelConfig) string {
 }
 
 func startSingleTunnel(cfg *config.ClientConfig, t *config.TunnelConfig) error {
-	connConfig := buildConnectorConfig(cfg, t)
+	connConfig, err := buildConnectorConfig(cfg, t)
+	if err != nil {
+		return err
+	}
 
 	fmt.Printf("Starting tunnel '%s' (%s %s:%d)\n", t.Name, t.Type, getAddress(t), t.Port)
 
@@ -162,7 +165,11 @@ func startMultipleTunnels(cfg *config.ClientConfig, tunnels []*config.TunnelConf
 		go func(tunnel *config.TunnelConfig) {
 			defer wg.Done()
 
-			connConfig := buildConnectorConfig(cfg, tunnel)
+			connConfig, err := buildConnectorConfig(cfg, tunnel)
+			if err != nil {
+				errChan <- fmt.Errorf("tunnel '%s': %w", tunnel.Name, err)
+				return
+			}
 			fmt.Printf("  Starting %s (%s %s:%d)...\n", tunnel.Name, tunnel.Type, getAddress(tunnel), tunnel.Port)
 
 			client := tcp.NewTunnelClient(connConfig, logger)
@@ -210,7 +217,7 @@ func startMultipleTunnels(cfg *config.ClientConfig, tunnels []*config.TunnelConf
 	return nil
 }
 
-func buildConnectorConfig(cfg *config.ClientConfig, t *config.TunnelConfig) *tcp.ConnectorConfig {
+func buildConnectorConfig(cfg *config.ClientConfig, t *config.TunnelConfig) (*tcp.ConnectorConfig, error) {
 	tunnelType := protocol.TunnelTypeHTTP
 	switch t.Type {
 	case "https":
@@ -219,12 +226,11 @@ func buildConnectorConfig(cfg *config.ClientConfig, t *config.TunnelConfig) *tcp
 		tunnelType = protocol.TunnelTypeTCP
 	}
 
-	transport := tcp.TransportAuto
-	switch strings.ToLower(t.Transport) {
-	case "tcp", "tls":
-		transport = tcp.TransportTCP
-	case "wss":
-		transport = tcp.TransportWebSocket
+	transport := parseTransport(t.Transport)
+
+	bw, err := parseBandwidth(t.Bandwidth)
+	if err != nil {
+		return nil, err
 	}
 
 	return &tcp.ConnectorConfig{
@@ -239,7 +245,8 @@ func buildConnectorConfig(cfg *config.ClientConfig, t *config.TunnelConfig) *tcp
 		DenyIPs:    t.DenyIPs,
 		AuthPass:   t.Auth,
 		Transport:  transport,
-	}
+		Bandwidth:  bw,
+	}, nil
 }
 
 func getAddress(t *config.TunnelConfig) string {

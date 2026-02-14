@@ -10,7 +10,6 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// ServerConfig holds the server configuration
 type ServerConfig struct {
 	Port         int    `yaml:"port"`
 	PublicPort   int    `yaml:"public_port"`   // Port to display in URLs (for reverse proxy scenarios)
@@ -37,13 +36,12 @@ type ServerConfig struct {
 	PprofPort int `yaml:"pprof_port"`
 
 	// Allowed transports: "tcp", "wss", or "tcp,wss" (default: "tcp,wss")
-	AllowedTransports []string `yaml:"transports"`
-
-	// Allowed tunnel types: "http", "https", "tcp" (default: all)
+	AllowedTransports  []string `yaml:"transports"`
 	AllowedTunnelTypes []string `yaml:"tunnel_types"`
+	Bandwidth          string   `yaml:"bandwidth,omitempty"`
+	BurstMultiplier    float64  `yaml:"burst_multiplier,omitempty"`
 }
 
-// Validate checks if the server configuration is valid
 func (c *ServerConfig) Validate() error {
 	// Validate port
 	if c.Port < 1 || c.Port > 65535 {
@@ -92,7 +90,6 @@ func (c *ServerConfig) Validate() error {
 	return nil
 }
 
-// LoadTLSConfig loads TLS configuration
 func (c *ServerConfig) LoadTLSConfig() (*tls.Config, error) {
 	if !c.TLSEnabled {
 		return nil, nil
@@ -131,7 +128,6 @@ func (c *ServerConfig) LoadTLSConfig() (*tls.Config, error) {
 	return tlsConfig, nil
 }
 
-// GetClientTLSConfig returns TLS config for client connections
 func GetClientTLSConfig(serverName string) *tls.Config {
 	return &tls.Config{
 		ServerName:               serverName,
@@ -147,8 +143,6 @@ func GetClientTLSConfig(serverName string) *tls.Config {
 	}
 }
 
-// GetClientTLSConfigInsecure returns TLS config for client with InsecureSkipVerify
-// WARNING: Only use for testing!
 func GetClientTLSConfigInsecure() *tls.Config {
 	return &tls.Config{
 		InsecureSkipVerify:       true,
@@ -164,7 +158,6 @@ func GetClientTLSConfigInsecure() *tls.Config {
 	}
 }
 
-// DefaultServerConfigPath returns the default server configuration path
 func DefaultServerConfigPath() string {
 	// Check /etc/drip/config.yaml first (system-wide)
 	systemPath := "/etc/drip/config.yaml"
@@ -180,7 +173,6 @@ func DefaultServerConfigPath() string {
 	return filepath.Join(home, ".drip", "server.yaml")
 }
 
-// LoadServerConfig loads server configuration from file
 func LoadServerConfig(path string) (*ServerConfig, error) {
 	if path == "" {
 		path = DefaultServerConfigPath()
@@ -202,7 +194,6 @@ func LoadServerConfig(path string) (*ServerConfig, error) {
 	return &config, nil
 }
 
-// SaveServerConfig saves server configuration to file
 func SaveServerConfig(config *ServerConfig, path string) error {
 	if path == "" {
 		path = DefaultServerConfigPath()
@@ -225,7 +216,6 @@ func SaveServerConfig(config *ServerConfig, path string) error {
 	return nil
 }
 
-// ServerConfigExists checks if server config file exists
 func ServerConfigExists(path string) bool {
 	if path == "" {
 		path = DefaultServerConfigPath()

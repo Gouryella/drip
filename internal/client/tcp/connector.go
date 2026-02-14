@@ -45,6 +45,9 @@ type ConnectorConfig struct {
 
 	// Transport protocol selection
 	Transport TransportType
+
+	// Bandwidth limiting (bytes/sec), 0 = unlimited
+	Bandwidth int64
 }
 
 type TunnelClient interface {
