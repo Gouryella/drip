@@ -64,6 +64,23 @@ drip http 3000 -n myapp
 - [服务端部署](https://driptunnel.app/docs/direct-mode)
 - [命令参考](https://driptunnel.app/docs/commands)
 
+## 最近更新
+
+**2025-02-14**
+- **带宽限速 (QoS)** - 基于令牌桶算法的隧道级带宽控制，服务端取 `min(客户端, 服务端)` 作为生效带宽
+- **传输协议控制** - 支持服务域名与隧道域名独立配置
+
+```bash
+# 客户端：限速 1MB/s
+drip http 3000 --bandwidth 1M
+```
+
+```yaml
+# 服务端：全局限速 (config.yaml)
+bandwidth: 10M
+burst_multiplier: 2.5
+```
+
 ## 协议
 
 BSD 3-Clause License - 详见 [LICENSE](LICENSE)
