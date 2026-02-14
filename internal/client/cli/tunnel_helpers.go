@@ -30,6 +30,9 @@ func buildDaemonArgs(tunnelType string, args []string, subdomain string, localAd
 	if verbose {
 		daemonArgs = append(daemonArgs, "--verbose")
 	}
+	if bandwidth != "" {
+		daemonArgs = append(daemonArgs, "--bandwidth", bandwidth)
+	}
 
 	return daemonArgs
 }

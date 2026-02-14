@@ -39,6 +39,8 @@ func TestParseBandwidth(t *testing.T) {
 		{"K", 0, true},
 		{"1T", 0, true},
 		{"1KM", 0, true},
+		{"9223372036854775807K", 0, true},  // overflow: MaxInt64 * 1024
+		{"9999999999999999999G", 0, true},  // overflow: huge * 1G
 	}
 
 	for _, tt := range tests {

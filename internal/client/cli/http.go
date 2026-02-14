@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 
@@ -152,6 +153,11 @@ func parseBandwidth(s string) (int64, error) {
 	val, err := strconv.ParseInt(s, 10, 64)
 	if err != nil || val < 0 {
 		return 0, fmt.Errorf("invalid bandwidth value: %q (use format like 1M, 500K, 1G)", s)
+	}
+
+	const maxBandwidth = math.MaxInt64
+	if multiplier > 0 && val > maxBandwidth/multiplier {
+		return 0, fmt.Errorf("bandwidth value too large: %q", s)
 	}
 
 	return val * multiplier, nil
