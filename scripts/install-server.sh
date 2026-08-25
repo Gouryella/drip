@@ -696,26 +696,54 @@ setup_certificate() {
     esac
 }
 
-obtain_letsencrypt_cert() {
-    # Let's Encrypt original cert paths
-    local le_cert_path="/etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
-    local le_key_path="/etc/letsencrypt/live/${DOMAIN}/privkey.pem"
+# resolve_letsencrypt_live_dir prints the live directory that actually holds the
+# certificate for DOMAIN, or returns 1 when there is none.
+#
+# The canonical path cannot be assumed. When a lineage of the same name already
+# exists — an earlier install of this server, for instance — certbot creates
+# <domain>-0001, -0002 and so on, and the new certificate lands there instead.
+#
+# The most recently written candidate wins rather than the exact name, because a
+# host that has been through that already keeps the stale lineage next to the
+# fresh one, and the stale one is what the plain name points at.
+resolve_letsencrypt_live_dir() {
+    local base="/etc/letsencrypt/live"
+    local newest=""
+    local candidate
 
+    for candidate in "${base}/${DOMAIN}" "${base}/${DOMAIN}"-[0-9][0-9][0-9][0-9]; do
+        [[ -f "${candidate}/fullchain.pem" ]] || continue
+        [[ -f "${candidate}/privkey.pem" ]] || continue
+        if [[ -z "$newest" ]] || [[ "${candidate}/fullchain.pem" -nt "${newest}/fullchain.pem" ]]; then
+            newest="$candidate"
+        fi
+    done
+
+    [[ -n "$newest" ]] || return 1
+    echo "$newest"
+}
+
+obtain_letsencrypt_cert() {
     # We'll copy certs to CONFIG_DIR for proper permissions
     # Update global CERT_PATH and KEY_PATH
     CERT_PATH="${CONFIG_DIR}/server.crt"
     KEY_PATH="${CONFIG_DIR}/server.key"
 
+    local le_live_dir=""
+
     # Check if certificate already exists (either in Let's Encrypt or our copy)
     if [[ -f "$CERT_PATH" ]] && [[ -f "$KEY_PATH" ]]; then
         print_warning "$(msg cert_exists)"
+        create_certbot_renewal_hook
         return
     fi
 
     # Check if Let's Encrypt cert exists but we just need to copy it
-    if [[ -f "$le_cert_path" ]]; then
+    le_live_dir=$(resolve_letsencrypt_live_dir || true)
+    if [[ -n "$le_live_dir" ]]; then
         print_info "Let's Encrypt certificate found, copying with proper permissions..."
-        copy_letsencrypt_cert "$le_cert_path" "$le_key_path"
+        copy_letsencrypt_cert "${le_live_dir}/fullchain.pem" "${le_live_dir}/privkey.pem"
+        create_certbot_renewal_hook
         return
     fi
 
@@ -756,7 +784,10 @@ obtain_letsencrypt_cert() {
     fi
 
     # Build certbot command
-    local certbot_args="certonly --standalone -d ${DOMAIN}"
+    # --cert-name keeps the lineage named after the domain. Without it certbot
+    # invents <domain>-0001 whenever a lineage of that name already exists,
+    # leaving the certificate somewhere the installer would not look.
+    local certbot_args="certonly --standalone --cert-name ${DOMAIN} -d ${DOMAIN}"
     if [[ -n "$CERTBOT_EMAIL" ]]; then
         certbot_args="$certbot_args --email ${CERTBOT_EMAIL}"
     else
@@ -780,7 +811,12 @@ obtain_letsencrypt_cert() {
     [[ "$apache_was_running" == true ]] && (systemctl start apache2 2>/dev/null || systemctl start httpd 2>/dev/null)
 
     # Copy certificates with proper permissions
-    copy_letsencrypt_cert "$le_cert_path" "$le_key_path"
+    le_live_dir=$(resolve_letsencrypt_live_dir || true)
+    if [[ -z "$le_live_dir" ]]; then
+        print_error "Certificate was issued but could not be found under /etc/letsencrypt/live"
+        exit 1
+    fi
+    copy_letsencrypt_cert "${le_live_dir}/fullchain.pem" "${le_live_dir}/privkey.pem"
 
     # Create renewal hook for automatic certificate updates
     create_certbot_renewal_hook
@@ -815,39 +851,57 @@ create_certbot_renewal_hook() {
     local hook_dir="/etc/letsencrypt/renewal-hooks/deploy"
     mkdir -p "$hook_dir"
 
-    cat > "${hook_dir}/drip-server.sh" << 'HOOK_EOF'
-#!/bin/bash
-# Drip Server certificate renewal hook
-# This script copies renewed certificates and restarts the service
+    # The domain and paths are baked in, so the hook never has to guess which of
+    # the host's certificates belongs to Drip.
+    {
+        echo '#!/bin/bash'
+        echo '# Drip Server certificate renewal hook'
+        echo '# Copies the renewed certificate into place and restarts the service.'
+        echo
+        printf 'DRIP_DOMAIN=%q\n' "$DOMAIN"
+        printf 'CONFIG_DIR=%q\n' "$CONFIG_DIR"
+        printf 'SERVICE_USER=%q\n' "$SERVICE_USER"
+        cat << 'HOOK_EOF'
 
-DOMAIN_DIR="/etc/letsencrypt/live"
-CONFIG_DIR="/etc/drip"
-SERVICE_USER="drip"
+# Certbot exports RENEWED_LINEAGE and RENEWED_DOMAINS to deploy hooks. Trust
+# them: picking a directory by listing /etc/letsencrypt/live breaks as soon as
+# the host holds more than one certificate, and installing the wrong one is
+# silent — the service comes back up serving a certificate for another name.
+lineage="${RENEWED_LINEAGE:-}"
 
-# Find the domain from the renewed certificate
-for domain_path in "$DOMAIN_DIR"/*; do
-    if [[ -d "$domain_path" ]]; then
-        domain=$(basename "$domain_path")
-        le_cert="${domain_path}/fullchain.pem"
-        le_key="${domain_path}/privkey.pem"
-
-        if [[ -f "$le_cert" ]] && [[ -f "$le_key" ]]; then
-            # Copy certificates
-            cp -L "$le_cert" "${CONFIG_DIR}/server.crt"
-            cp -L "$le_key" "${CONFIG_DIR}/server.key"
-
-            # Set proper permissions
-            chmod 644 "${CONFIG_DIR}/server.crt"
-            chmod 640 "${CONFIG_DIR}/server.key"
-            chown root:"$SERVICE_USER" "${CONFIG_DIR}/server.key"
-
-            # Restart service
-            systemctl restart drip-server 2>/dev/null || true
-            break
+if [[ -n "$lineage" ]]; then
+    case " ${RENEWED_DOMAINS:-} " in
+        *" ${DRIP_DOMAIN} "*) ;;
+        *) exit 0 ;;
+    esac
+else
+    # Run by hand, without certbot's environment: resolve the lineage the same
+    # way the installer does, newest first.
+    newest=""
+    for candidate in "/etc/letsencrypt/live/${DRIP_DOMAIN}" "/etc/letsencrypt/live/${DRIP_DOMAIN}"-[0-9][0-9][0-9][0-9]; do
+        [[ -f "${candidate}/fullchain.pem" ]] || continue
+        [[ -f "${candidate}/privkey.pem" ]] || continue
+        if [[ -z "$newest" ]] || [[ "${candidate}/fullchain.pem" -nt "${newest}/fullchain.pem" ]]; then
+            newest="$candidate"
         fi
-    fi
-done
+    done
+    lineage="$newest"
+fi
+
+[[ -n "$lineage" ]] || exit 0
+[[ -f "${lineage}/fullchain.pem" ]] || exit 0
+[[ -f "${lineage}/privkey.pem" ]] || exit 0
+
+cp -L "${lineage}/fullchain.pem" "${CONFIG_DIR}/server.crt"
+cp -L "${lineage}/privkey.pem" "${CONFIG_DIR}/server.key"
+
+chmod 644 "${CONFIG_DIR}/server.crt"
+chmod 640 "${CONFIG_DIR}/server.key"
+chown root:"$SERVICE_USER" "${CONFIG_DIR}/server.key"
+
+systemctl restart drip-server 2>/dev/null || true
 HOOK_EOF
+    } > "${hook_dir}/drip-server.sh"
 
     chmod +x "${hook_dir}/drip-server.sh"
     print_success "$(msg renewal_hook_created)"
