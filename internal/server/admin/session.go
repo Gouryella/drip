@@ -155,6 +155,10 @@ func (s *Server) issueSession(ctx context.Context, w http.ResponseWriter, r *htt
 		return err
 	}
 
+	// #nosec G124 -- HttpOnly and SameSite=Strict are set; Secure follows
+	// s.secureCookies, which is true whenever the panel is served over TLS. The
+	// panel is often reached on a loopback address over plain HTTP, where a
+	// hard-coded Secure would stop the cookie being stored at all.
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookie,
 		Value:    token,
@@ -164,6 +168,9 @@ func (s *Server) issueSession(ctx context.Context, w http.ResponseWriter, r *htt
 		Secure:   s.secureCookies,
 		SameSite: http.SameSiteStrictMode,
 	})
+	// #nosec G124 -- HttpOnly is false by design: this is the readable half of
+	// the CSRF double-submit pair, and the panel's JavaScript has to send it
+	// back in a header. It carries no authority on its own.
 	http.SetCookie(w, &http.Cookie{
 		Name:     csrfCookie,
 		Value:    csrf,
@@ -180,6 +187,7 @@ func (s *Server) issueSession(ctx context.Context, w http.ResponseWriter, r *htt
 // clearSessionCookies expires both cookies in the browser.
 func (s *Server) clearSessionCookies(w http.ResponseWriter) {
 	for _, name := range []string{sessionCookie, csrfCookie} {
+		// #nosec G124 -- expires the pair issued above with the same attributes.
 		http.SetCookie(w, &http.Cookie{
 			Name:     name,
 			Value:    "",

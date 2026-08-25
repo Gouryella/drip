@@ -468,12 +468,7 @@ func (s *Server) handleServerInfo(w http.ResponseWriter, _ *http.Request) {
 	if d.TunnelDomain == "" {
 		d.TunnelDomain = d.Domain
 	}
-	writeJSON(w, http.StatusOK, serverInfoView{
-		Domain:       d.Domain,
-		TunnelDomain: d.TunnelDomain,
-		PublicPort:   d.PublicPort,
-		TLS:          d.TLS,
-	})
+	writeJSON(w, http.StatusOK, serverInfoView(d))
 }
 
 // ---- live tunnels and audit ----

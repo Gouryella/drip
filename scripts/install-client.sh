@@ -4,7 +4,7 @@ set -e
 # ============================================================================
 # Configuration
 # ============================================================================
-GITHUB_REPO="Gouryella/drip"
+GITHUB_REPO="${GITHUB_REPO:-nickolasdeluca/drip-ex}"
 INSTALL_DIR="${INSTALL_DIR:-}"
 VERSION="${VERSION:-}"
 BINARY_NAME="drip"

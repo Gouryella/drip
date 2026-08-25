@@ -1,5 +1,9 @@
 version: 2
 
+# Pinned so release assets stay drip_<version>_<os>_<arch>.tar.gz regardless of
+# the repository or checkout directory name. The installers match on that name.
+project_name: drip
+
 builds:
   - env:
       - CGO_ENABLED=0
@@ -42,5 +46,8 @@ archives:
   - formats: [tar.gz]
 
 release:
-  prerelease: true
+  # auto marks a release as a pre-release only when the tag carries a suffix
+  # such as -rc1. Marking every release as one hides it from the
+  # /releases/latest API, which is what the installers query.
+  prerelease: auto
   mode: replace

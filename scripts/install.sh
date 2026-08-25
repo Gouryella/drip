@@ -4,7 +4,7 @@ set -euo pipefail
 # Unified installer wrapper for Drip client and server
 # Chooses language first, then lets the user pick client or server.
 
-GITHUB_REPO="Gouryella/drip"
+GITHUB_REPO="${GITHUB_REPO:-nickolasdeluca/drip-ex}"
 RAW_BASE="${RAW_BASE:-https://raw.githubusercontent.com/${GITHUB_REPO}/main/scripts}"
 
 LANG_CODE="${LANG_CODE:-}"

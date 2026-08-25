@@ -28,7 +28,7 @@ Six phases. Keep this list current as phases land.
 5. **Claim flow** — `active_sessions` rows, "pin this running tunnel" endpoint,
    rename-on-pin.
 6. **Windows service** — `golang.org/x/sys/windows/svc` wrapper around the
-   existing tunnel runner.
+   tunnel runner. *Done.*
 
 ### Design decisions already made
 
@@ -192,6 +192,73 @@ no ALPN advertisement. ACME mode deliberately layers certmagic's
 which would advertise `h2` and `acme-tls/1` and silently change what the
 listener negotiates. Keep that property — there is a test asserting the two
 modes share a posture.
+
+## Windows service
+
+`drip service install|uninstall|start|stop|restart|status|run` (`cli/service.go`
+plus the `_windows.go` files) registers the client with the service control
+manager; `cli/tunnel_supervisor.go` is the headless runner it drives, and it is
+cross-platform.
+
+- **The supervisor is not `runTunnelWithUI`.** It draws nothing, retries transport
+  failures forever with jittered backoff, and only gives up on errors retrying
+  cannot fix. `drip http` and `drip start` still use the TUI runner; the two share
+  `buildConnectorConfig` and the error classifiers, nothing else.
+- **`--config` is mandatory in the service command line.** A service runs as
+  LocalSystem, whose home is `C:\Windows\system32\config\systemprofile`, so
+  `os.UserHomeDir()` can never reach the config a human wrote. `install` copies it
+  to `%ProgramData%\drip\config.yaml`, restricts the DACL to SYSTEM and
+  Administrators, and bakes the path into the service arguments; the service also
+  exports `DRIP_CONFIG` so fallback paths agree with it.
+- **The config is read inside `Execute`, after `svc.Run`.** Failing before the
+  dispatcher starts surfaces as a start timeout (error 1053) instead of the real
+  error; failing inside it returns exit code 1 and triggers the recovery actions.
+- **"Subdomain already taken" is fatal only before the first connect.** After a
+  drop the server can still hold the old session for a few seconds, and treating
+  that as fatal would leave a service permanently down over its own stale session.
+- **Logging goes through `utils.InitFileLogger`, not `zap.Config.OutputPaths`.**
+  zap parses output paths as URLs and rejects `C:\...` as an unknown scheme.
+- **`scripts/install-client.ps1` is the Windows installer**; the bash installers
+  cannot register a service and only run under Git Bash or MSYS. It can install
+  the service in the same pass (`-InstallService`), and it stops a running
+  service before replacing the binary, because Windows will not let an open
+  executable be overwritten.
+
+## Installers
+
+`scripts/install.sh` (wrapper), `install-client.sh`, `install-server.sh` and
+`install-client.ps1` all default to **this fork**, `nickolasdeluca/drip-ex`,
+overridable with `GITHUB_REPO=` or `-Repo`. They install from GitHub Releases, so
+a change to the client only reaches users after a tagged release.
+
+`.goreleaser.yaml` pins `project_name: drip` so assets stay
+`drip_<version>_<os>_<arch>.tar.gz` whatever the repository or checkout directory
+is called — `install-client.sh` builds that file name literally, and the
+PowerShell installer matches on the platform and architecture within it.
+
+## CI and publishing
+
+| Workflow | Trigger | Produces |
+|---|---|---|
+| `ci.yml` | push to main, every PR | `go test -race`, `go vet`, staticcheck, gosec, govulncheck |
+| `release.yml` | tag `v*.*.*` | GoReleaser build published to GitHub Releases |
+| `release.yml` | manual dispatch | Snapshot archives as workflow artifacts, nothing published |
+| `docker.yml` | manual dispatch only | Nothing by default — see below |
+
+- **No container image is published, deliberately.** Docker is unsupported for
+  now, so `docker.yml` has had its push triggers commented out and only runs when
+  someone starts it by hand. It still targets GHCR with the built-in
+  `GITHUB_TOKEN`; restoring the commented `push:` block is all it takes to turn
+  publishing back on. Do not "fix" the workflow by re-adding those triggers.
+- **The compose files build the image locally** (`docker compose up -d --build`)
+  because no published image exists to pull. They must not point at a registry
+  tag that nothing produces.
+- **GitHub Packages cannot host loose binaries.** Executables go to Releases,
+  which is what the installers read from.
+- **`Dockerfile.server`'s builder stage is pinned to `$BUILDPLATFORM`.** CGO is
+  off and `GOARCH` comes from `TARGETARCH`, so the arm64 image cross-compiles on
+  an amd64 runner. Dropping that pin makes the build run under QEMU, which is
+  both slow and needs a setup step the workflow does not have.
 
 ## Traps
 

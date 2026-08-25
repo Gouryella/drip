@@ -225,11 +225,10 @@ func (c *ServerConfig) Validate() error {
 // GetClientTLSConfig returns TLS config for client connections
 func GetClientTLSConfig(serverName string) *tls.Config {
 	return &tls.Config{
-		ServerName:               serverName,
-		MinVersion:               tls.VersionTLS13,
-		MaxVersion:               tls.VersionTLS13,
-		ClientSessionCache:       tls.NewLRUClientSessionCache(0),
-		PreferServerCipherSuites: true,
+		ServerName:         serverName,
+		MinVersion:         tls.VersionTLS13,
+		MaxVersion:         tls.VersionTLS13,
+		ClientSessionCache: tls.NewLRUClientSessionCache(0),
 		CipherSuites: []uint16{
 			tls.TLS_AES_128_GCM_SHA256,
 			tls.TLS_AES_256_GCM_SHA384,
@@ -249,11 +248,10 @@ func GetClientTLSConfigInsecure() *tls.Config {
 			"Only use this for testing or with trusted endpoints.")
 	})
 	return &tls.Config{
-		InsecureSkipVerify:       true, // #nosec G402 -- explicit --insecure/test-only mode; behavior intentionally preserved.
-		MinVersion:               tls.VersionTLS13,
-		MaxVersion:               tls.VersionTLS13,
-		ClientSessionCache:       tls.NewLRUClientSessionCache(0),
-		PreferServerCipherSuites: true,
+		InsecureSkipVerify: true, // #nosec G402 -- explicit --insecure/test-only mode; behavior intentionally preserved.
+		MinVersion:         tls.VersionTLS13,
+		MaxVersion:         tls.VersionTLS13,
+		ClientSessionCache: tls.NewLRUClientSessionCache(0),
 		CipherSuites: []uint16{
 			tls.TLS_AES_128_GCM_SHA256,
 			tls.TLS_AES_256_GCM_SHA384,

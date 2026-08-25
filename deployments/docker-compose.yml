@@ -1,6 +1,11 @@
 services:
   drip-server:
-    image: driptunnel/drip-server:${VERSION:-latest}
+    image: drip-server:${VERSION:-latest}
+    build:
+      context: ..
+      dockerfile: deployments/Dockerfile.server
+      args:
+        VERSION: ${VERSION:-dev}
     container_name: drip-server
     restart: unless-stopped
     ports:

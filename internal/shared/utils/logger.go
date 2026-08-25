@@ -1,7 +1,9 @@
 package utils
 
 import (
+	"fmt"
 	"os"
+	"path/filepath"
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -101,4 +103,76 @@ func Sync() {
 	if logger != nil {
 		_ = logger.Sync()
 	}
+}
+
+// maxLogFileBytes is the size at which a service log file is rotated.
+const maxLogFileBytes = 10 << 20
+
+// InitFileLogger initializes the global logger to append JSON lines to path
+// instead of writing to stdout. The Windows service has no console attached, so
+// anything written to stdout there is discarded.
+//
+// The core is assembled by hand rather than through zap.Config.OutputPaths
+// because zap parses output paths as URLs, and a Windows path like
+// C:\ProgramData\drip\logs\service.log is rejected as an unknown "c" scheme.
+func InitFileLogger(path string, verbose bool) error {
+	if path == "" {
+		return fmt.Errorf("log path is required")
+	}
+
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+		return fmt.Errorf("failed to create log directory: %w", err)
+	}
+
+	if err := rotateLogFile(path, maxLogFileBytes); err != nil {
+		return err
+	}
+
+	file, err := os.OpenFile(filepath.Clean(path), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600) // #nosec G304 -- the log path is chosen by the administrator installing the service
+	if err != nil {
+		return fmt.Errorf("failed to open log file: %w", err)
+	}
+
+	level := zapcore.InfoLevel
+	if verbose {
+		level = zapcore.DebugLevel
+	}
+
+	encoderConfig := zap.NewProductionEncoderConfig()
+	encoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
+
+	sink := zapcore.Lock(zapcore.AddSync(file))
+	logger = zap.New(
+		zapcore.NewCore(zapcore.NewJSONEncoder(encoderConfig), sink, level),
+		zap.ErrorOutput(sink),
+	)
+
+	return nil
+}
+
+// rotateLogFile renames path to path+".1" once it grows past maxBytes, keeping a
+// single previous generation. A service can run for months; an unbounded log is
+// a disk-full waiting to happen.
+func rotateLogFile(path string, maxBytes int64) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to stat log file: %w", err)
+	}
+
+	if info.Size() < maxBytes {
+		return nil
+	}
+
+	previous := path + ".1"
+	if err := os.Remove(previous); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to remove rotated log file: %w", err)
+	}
+	if err := os.Rename(path, previous); err != nil {
+		return fmt.Errorf("failed to rotate log file: %w", err)
+	}
+
+	return nil
 }

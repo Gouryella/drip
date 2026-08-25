@@ -1,7 +1,10 @@
 # =========================
 # Builder stage
 # =========================
-FROM golang:1.26.5-alpine AS builder
+# --platform=$BUILDPLATFORM keeps the builder on the runner's own architecture.
+# CGO is off and GOARCH comes from TARGETARCH below, so Go cross-compiles the
+# binary directly instead of the build running under QEMU emulation.
+FROM --platform=$BUILDPLATFORM golang:1.26.6-alpine AS builder
 
 RUN apk add --no-cache ca-certificates tzdata
 

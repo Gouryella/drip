@@ -74,11 +74,7 @@ func runStart(_ *cobra.Command, args []string) error {
 		return fmt.Errorf("no tunnels configured in %s", config.DefaultClientConfigPath())
 	}
 
-	var tunnelsToStart []*config.TunnelConfig
-
-	if startAll {
-		tunnelsToStart = cfg.Tunnels
-	} else if len(args) == 0 {
+	if !startAll && len(args) == 0 {
 		// No args and no --all flag, show available tunnels
 		fmt.Println(ui.Title("Available Tunnels"))
 		fmt.Println()
@@ -90,20 +86,11 @@ func runStart(_ *cobra.Command, args []string) error {
 		fmt.Println("  drip start <tunnel-name>    Start a specific tunnel")
 		fmt.Println("  drip start --all            Start all tunnels")
 		return nil
-	} else {
-		// Start specific tunnels by name
-		for _, name := range args {
-			t := cfg.GetTunnel(name)
-			if t == nil {
-				availableNames := cfg.GetTunnelNames()
-				return fmt.Errorf("tunnel '%s' not found. Available tunnels: %s", name, strings.Join(availableNames, ", "))
-			}
-			tunnelsToStart = append(tunnelsToStart, t)
-		}
 	}
 
-	if len(tunnelsToStart) == 0 {
-		return fmt.Errorf("no tunnels to start")
+	tunnelsToStart, err := selectTunnels(cfg, startAll, args)
+	if err != nil {
+		return err
 	}
 
 	for _, t := range tunnelsToStart {

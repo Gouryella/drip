@@ -4,6 +4,9 @@ on:
   push:
     tags:
       - 'v*.*.*'
+  # Manual runs produce an unreleased snapshot build, so the release pipeline can
+  # be exercised without burning a version number.
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -20,13 +23,24 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.26.5'
+          go-version: '1.26.6'
+          cache: true
 
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6
         with:
           distribution: goreleaser
           version: '~> v2'
-          args: release --clean
+          args: ${{ github.ref_type == 'tag' && 'release --clean' || 'release --clean --snapshot' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload snapshot archives
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: drip-snapshot
+          path: |
+            dist/*.tar.gz
+            dist/checksums.txt
+          retention-days: 14

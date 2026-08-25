@@ -4,7 +4,7 @@ set -e
 # ============================================================================
 # Configuration
 # ============================================================================
-GITHUB_REPO="Gouryella/drip"
+GITHUB_REPO="${GITHUB_REPO:-nickolasdeluca/drip-ex}"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
 SERVICE_USER="${SERVICE_USER:-drip}"
 CONFIG_DIR="/etc/drip"
@@ -913,7 +913,7 @@ create_systemd_service() {
 [Unit]
 Description=Drip Tunnel Server
 After=network.target
-Documentation=https://github.com/Gouryella/drip
+Documentation=https://github.com/nickolasdeluca/drip-ex
 
 [Service]
 Type=simple

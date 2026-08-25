@@ -118,7 +118,15 @@ func (c *ClientConfig) GetTunnelNames() []string {
 }
 
 // DefaultClientConfig returns the default configuration path
+//
+// DRIP_CONFIG wins over the home directory: a Windows service runs as
+// LocalSystem, whose home resolves to C:\Windows\system32\config\systemprofile,
+// so it can never reach the config a human wrote.
 func DefaultClientConfigPath() string {
+	if path := os.Getenv("DRIP_CONFIG"); path != "" {
+		return path
+	}
+
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return ".drip/config.yaml"
