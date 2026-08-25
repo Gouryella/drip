@@ -74,11 +74,9 @@ func (h *DataConnectionHandler) Handle(frame *protocol.Frame) error {
 		return fmt.Errorf("group manager not available")
 	}
 
-	if h.authToken != "" && subtle.ConstantTimeCompare([]byte(req.Token), []byte(h.authToken)) != 1 {
-		h.sendError("authentication_failed", "Invalid authentication token")
-		return fmt.Errorf("authentication failed for data connection")
-	}
-
+	// The token is validated against the group below. Comparing it against the
+	// shared server token first would reject per-client credentials, which are
+	// what the group actually recorded at registration time.
 	group, ok := h.groupManager.GetGroup(req.TunnelID)
 	if !ok || group == nil {
 		h.sendError("join_failed", "Tunnel not found")

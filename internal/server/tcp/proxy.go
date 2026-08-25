@@ -22,10 +22,16 @@ type Proxy struct {
 	subdomain string
 	logger    *zap.Logger
 
+	// mu guards listener and stopped. The connection goroutine starts the proxy
+	// while Stop may run concurrently from the shutdown path, so the accept
+	// loop's wg.Add and the stopped flag have to be published together.
+	mu       sync.Mutex
 	listener net.Listener
-	stopCh   chan struct{}
-	once     sync.Once
-	wg       sync.WaitGroup
+	stopped  bool
+
+	stopCh chan struct{}
+	once   sync.Once
+	wg     sync.WaitGroup
 
 	openStream func() (net.Conn, error)
 	stats      trafficStats
@@ -93,15 +99,27 @@ func (p *Proxy) StartWithListener(ln net.Listener) error {
 			return fmt.Errorf("failed to listen on port %d: %w", p.port, err)
 		}
 	}
+	// Publish the listener and register the accept loop with the wait group
+	// under one lock. Stop sets stopped under the same lock before it waits, so
+	// either this Add is visible to that Wait, or we observe stopped and never
+	// start at all. Without this a proxy stopped mid-startup would leave its
+	// accept loop running after Stop returned.
+	p.mu.Lock()
+	if p.stopped {
+		p.mu.Unlock()
+		_ = ln.Close()
+		return fmt.Errorf("tcp proxy for port %d is already stopped", p.port)
+	}
 	p.listener = ln
+	p.wg.Add(1)
+	p.mu.Unlock()
 
 	p.logger.Info("TCP proxy started",
 		zap.Int("port", p.port),
 		zap.String("subdomain", p.subdomain),
 	)
 
-	p.wg.Add(1)
-	go p.acceptLoop()
+	go p.acceptLoop(ln)
 	return nil
 }
 
@@ -110,8 +128,13 @@ func (p *Proxy) Stop() {
 		close(p.stopCh)
 		p.cancel()
 
-		if p.listener != nil {
-			_ = p.listener.Close()
+		p.mu.Lock()
+		p.stopped = true
+		ln := p.listener
+		p.mu.Unlock()
+
+		if ln != nil {
+			_ = ln.Close()
 		}
 
 		done := make(chan struct{})
@@ -138,10 +161,10 @@ func (p *Proxy) Stop() {
 	})
 }
 
-func (p *Proxy) acceptLoop() {
+func (p *Proxy) acceptLoop(ln net.Listener) {
 	defer p.wg.Done()
 
-	tcpLn, _ := p.listener.(*net.TCPListener)
+	tcpLn, _ := ln.(*net.TCPListener)
 
 	for {
 		select {
@@ -154,7 +177,7 @@ func (p *Proxy) acceptLoop() {
 			_ = tcpLn.SetDeadline(time.Now().Add(1 * time.Second))
 		}
 
-		conn, err := p.listener.Accept()
+		conn, err := ln.Accept()
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				continue

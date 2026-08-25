@@ -20,4 +20,7 @@ var (
 
 	// ErrReservedSubdomain is returned when trying to use a reserved subdomain
 	ErrReservedSubdomain = errors.New("subdomain is reserved")
+
+	// ErrTooManyForAccount is returned when an account is at its tunnel limit
+	ErrTooManyForAccount = errors.New("maximum tunnels for this account reached")
 )

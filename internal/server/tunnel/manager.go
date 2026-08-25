@@ -32,6 +32,20 @@ var (
 	ErrSubdomainGenerationFailed = errors.New("failed to generate unique subdomain")
 )
 
+// Owner identifies the control-plane client and account behind a registration.
+// A zero Owner means the registration is unauthenticated (anonymous server) or
+// authenticated with the legacy shared token, neither of which has an identity
+// in the database.
+type Owner struct {
+	ClientID  string
+	AccountID string
+	// MaxTunnels caps concurrent tunnels for the account. 0 means unlimited.
+	MaxTunnels int
+}
+
+// IsIdentified reports whether the owner came from the control plane.
+func (o Owner) IsIdentified() bool { return o.ClientID != "" }
+
 // shard holds a subset of tunnels with its own lock
 type shard struct {
 	tunnels map[string]*Connection
@@ -54,6 +68,10 @@ type Manager struct {
 	// Per-IP tracking (requires separate lock as it spans shards)
 	ipMu        sync.RWMutex
 	tunnelsByIP map[string]int // IP -> tunnel count
+
+	// Per-account tracking for authenticated clients
+	accountMu        sync.RWMutex
+	tunnelsByAccount map[string]int // account ID -> tunnel count
 
 	// Rate limiting
 	rateLimiter *RateLimiter
@@ -110,12 +128,13 @@ func NewManagerWithConfig(logger *zap.Logger, cfg ManagerConfig) *Manager {
 	)
 
 	m := &Manager{
-		logger:          logger,
-		maxTunnels:      cfg.MaxTunnels,
-		maxTunnelsPerIP: cfg.MaxTunnelsPerIP,
-		tunnelsByIP:     make(map[string]int),
-		rateLimiter:     NewRateLimiter(cfg.RateLimit, cfg.RateLimitWindow, logger),
-		stopCh:          make(chan struct{}),
+		logger:           logger,
+		maxTunnels:       cfg.MaxTunnels,
+		maxTunnelsPerIP:  cfg.MaxTunnelsPerIP,
+		tunnelsByIP:      make(map[string]int),
+		tunnelsByAccount: make(map[string]int),
+		rateLimiter:      NewRateLimiter(cfg.RateLimit, cfg.RateLimitWindow, logger),
+		stopCh:           make(chan struct{}),
 	}
 
 	// Initialize all shards
@@ -139,8 +158,19 @@ func (m *Manager) Register(conn *websocket.Conn, customSubdomain string) (string
 	return m.RegisterWithIP(conn, customSubdomain, "")
 }
 
-// RegisterWithIP registers a new tunnel with IP tracking
+// RegisterWithIP registers a new tunnel with IP tracking and no owner identity.
 func (m *Manager) RegisterWithIP(conn *websocket.Conn, customSubdomain string, remoteIP string) (string, error) {
+	return m.RegisterOwned(conn, customSubdomain, remoteIP, Owner{})
+}
+
+// RegisterOwned registers a new tunnel on behalf of a control-plane identity.
+//
+// Authenticated registrations are exempt from the per-IP tunnel cap and the
+// per-IP registration rate limit: those exist to stop anonymous abuse, and they
+// would otherwise punish a whole fleet of legitimate clients sharing one NAT
+// egress address. Authenticated clients are bounded by their account limit and
+// by the global tunnel cap instead.
+func (m *Manager) RegisterOwned(conn *websocket.Conn, customSubdomain string, remoteIP string, owner Owner) (string, error) {
 	// Reserve a global slot atomically using CAS loop
 	for {
 		current := m.tunnelCount.Load()
@@ -172,7 +202,7 @@ func (m *Manager) RegisterWithIP(conn *websocket.Conn, customSubdomain string, r
 	}
 
 	rollbackPerIP := func() {
-		if remoteIP != "" {
+		if remoteIP != "" && !owner.IsIdentified() {
 			m.ipMu.Lock()
 			if m.tunnelsByIP[remoteIP] > 0 {
 				m.tunnelsByIP[remoteIP]--
@@ -187,10 +217,43 @@ func (m *Manager) RegisterWithIP(conn *websocket.Conn, customSubdomain string, r
 		}
 	}
 
+	rollbackPerAccount := func() {
+		if owner.AccountID != "" {
+			m.accountMu.Lock()
+			if m.tunnelsByAccount[owner.AccountID] > 0 {
+				m.tunnelsByAccount[owner.AccountID]--
+				if m.tunnelsByAccount[owner.AccountID] == 0 {
+					delete(m.tunnelsByAccount, owner.AccountID)
+				}
+			}
+			m.accountMu.Unlock()
+		}
+	}
+
+	// Reserve the account slot for authenticated registrations.
+	if owner.AccountID != "" {
+		m.accountMu.Lock()
+		if owner.MaxTunnels > 0 && m.tunnelsByAccount[owner.AccountID] >= owner.MaxTunnels {
+			current := m.tunnelsByAccount[owner.AccountID]
+			m.accountMu.Unlock()
+			rollbackGlobal()
+			m.logger.Warn("Per-account tunnel limit reached",
+				zap.String("account_id", owner.AccountID),
+				zap.Int("current", current),
+				zap.Int("max", owner.MaxTunnels),
+			)
+			metrics.TunnelRegistrationFailures.WithLabelValues("max_per_account").Inc()
+			return "", ErrTooManyForAccount
+		}
+		m.tunnelsByAccount[owner.AccountID]++
+		m.accountMu.Unlock()
+	}
+
 	// Check per-IP limits and reserve slot atomically
-	if remoteIP != "" {
+	if remoteIP != "" && !owner.IsIdentified() {
 		// Check rate limit first (has its own lock)
 		if !m.rateLimiter.CheckAndIncrement(remoteIP) {
+			rollbackPerAccount()
 			rollbackGlobal()
 			metrics.TunnelRegistrationFailures.WithLabelValues("rate_limit").Inc()
 			return "", ErrRateLimitExceeded
@@ -202,6 +265,7 @@ func (m *Manager) RegisterWithIP(conn *websocket.Conn, customSubdomain string, r
 			currentPerIP := m.tunnelsByIP[remoteIP]
 			m.ipMu.Unlock()
 			rollbackRateLimit()
+			rollbackPerAccount()
 			rollbackGlobal()
 			m.logger.Warn("Per-IP tunnel limit reached",
 				zap.String("ip", remoteIP),
@@ -231,6 +295,8 @@ func (m *Manager) RegisterWithIP(conn *websocket.Conn, customSubdomain string, r
 
 		tc := NewConnection(candidate, conn, m.logger)
 		tc.remoteIP = remoteIP
+		tc.clientID = owner.ClientID
+		tc.accountID = owner.AccountID
 		s.tunnels[candidate] = tc
 		s.used[candidate] = true
 		subdomain = candidate
@@ -242,12 +308,14 @@ func (m *Manager) RegisterWithIP(conn *websocket.Conn, customSubdomain string, r
 		if !utils.ValidateSubdomain(customSubdomain) {
 			rollbackRateLimit()
 			rollbackPerIP()
+			rollbackPerAccount()
 			rollbackGlobal()
 			return "", ErrInvalidSubdomain
 		}
 		if utils.IsReserved(customSubdomain) {
 			rollbackRateLimit()
 			rollbackPerIP()
+			rollbackPerAccount()
 			rollbackGlobal()
 			return "", ErrReservedSubdomain
 		}
@@ -255,6 +323,7 @@ func (m *Manager) RegisterWithIP(conn *websocket.Conn, customSubdomain string, r
 		if !registerSubdomain(customSubdomain) {
 			rollbackRateLimit()
 			rollbackPerIP()
+			rollbackPerAccount()
 			rollbackGlobal()
 			return "", ErrSubdomainTaken
 		}
@@ -289,6 +358,7 @@ func (m *Manager) RegisterWithIP(conn *websocket.Conn, customSubdomain string, r
 		if !registered {
 			rollbackRateLimit()
 			rollbackPerIP()
+			rollbackPerAccount()
 			rollbackGlobal()
 			return "", ErrSubdomainGenerationFailed
 		}
@@ -328,6 +398,7 @@ func (m *Manager) Unregister(subdomain string) {
 	}
 
 	remoteIP := tc.remoteIP
+	_, accountID := tc.Owner()
 	tunnelType := tc.GetTunnelType().String()
 	tc.Close()
 	delete(s.tunnels, subdomain)
@@ -341,6 +412,16 @@ func (m *Manager) Unregister(subdomain string) {
 
 	// Update counters
 	m.tunnelCount.Add(-1)
+	if accountID != "" {
+		m.accountMu.Lock()
+		if m.tunnelsByAccount[accountID] > 0 {
+			m.tunnelsByAccount[accountID]--
+			if m.tunnelsByAccount[accountID] == 0 {
+				delete(m.tunnelsByAccount, accountID)
+			}
+		}
+		m.accountMu.Unlock()
+	}
 	if remoteIP != "" {
 		m.ipMu.Lock()
 		if m.tunnelsByIP[remoteIP] > 0 {
@@ -469,6 +550,10 @@ func (m *Manager) Shutdown() {
 			s.used = make(map[string]bool)
 			s.mu.Unlock()
 		}
+
+		m.accountMu.Lock()
+		m.tunnelsByAccount = make(map[string]int)
+		m.accountMu.Unlock()
 
 		m.tunnelCount.Store(0)
 	})

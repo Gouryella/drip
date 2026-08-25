@@ -82,3 +82,156 @@ func TestServerConfigValidateRejectsNegativeRequestBodyLimit(t *testing.T) {
 		t.Fatal("Validate() expected error for negative MaxRequestBodyBytes")
 	}
 }
+
+func baseValidServerConfig() *ServerConfig {
+	return &ServerConfig{
+		Port:       8443,
+		Domain:     "example.com",
+		TCPPortMin: 30000,
+		TCPPortMax: 30100,
+	}
+}
+
+func TestResolveTLSMode(t *testing.T) {
+	cases := []struct {
+		name    string
+		mutate  func(*ServerConfig)
+		want    string
+		wantErr bool
+	}{
+		{
+			name:   "bare config is plain",
+			mutate: func(*ServerConfig) {},
+			want:   "none",
+		},
+		{
+			name: "certificate pair implies manual",
+			mutate: func(c *ServerConfig) {
+				c.TLSCertFile = "cert.pem"
+				c.TLSKeyFile = "key.pem"
+			},
+			want: "manual",
+		},
+		{
+			name:   "tls_enabled implies manual",
+			mutate: func(c *ServerConfig) { c.TLSEnabled = true },
+			want:   "manual",
+		},
+		{
+			name:   "acme credentials imply acme",
+			mutate: func(c *ServerConfig) { c.ACME.DNSProvider = "cloudflare" },
+			want:   "acme",
+		},
+		{
+			name: "explicit mode wins over inference",
+			mutate: func(c *ServerConfig) {
+				c.TLSMode = "none"
+				c.ACME.DNSProvider = "cloudflare"
+				c.TLSEnabled = true
+			},
+			want: "none",
+		},
+		{
+			name:    "unknown mode is rejected",
+			mutate:  func(c *ServerConfig) { c.TLSMode = "autocert" },
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := baseValidServerConfig()
+			tc.mutate(cfg)
+
+			got, err := cfg.ResolveTLSMode()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("ResolveTLSMode() = %q, want error", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ResolveTLSMode() error = %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("ResolveTLSMode() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestValidateTLSModes(t *testing.T) {
+	cases := []struct {
+		name    string
+		mutate  func(*ServerConfig)
+		wantErr bool
+	}{
+		{
+			name:   "plain needs nothing",
+			mutate: func(*ServerConfig) {},
+		},
+		{
+			name: "manual without a key is rejected",
+			mutate: func(c *ServerConfig) {
+				c.TLSMode = "manual"
+				c.TLSCertFile = "cert.pem"
+			},
+			wantErr: true,
+		},
+		{
+			name: "manual with both files is accepted",
+			mutate: func(c *ServerConfig) {
+				c.TLSCertFile = "cert.pem"
+				c.TLSKeyFile = "key.pem"
+			},
+		},
+		{
+			name:    "acme without a DNS provider is rejected",
+			mutate:  func(c *ServerConfig) { c.TLSMode = "acme" },
+			wantErr: true,
+		},
+		{
+			name: "acme without a token is rejected",
+			mutate: func(c *ServerConfig) {
+				c.ACME.DNSProvider = "cloudflare"
+			},
+			wantErr: true,
+		},
+		{
+			name: "acme with provider and token is accepted",
+			mutate: func(c *ServerConfig) {
+				c.ACME.DNSProvider = "cloudflare"
+				c.ACME.DNSAPIToken = "token"
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := baseValidServerConfig()
+			tc.mutate(cfg)
+
+			err := cfg.Validate()
+			if tc.wantErr && err == nil {
+				t.Fatal("Validate() = nil, want error")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("Validate() error = %v", err)
+			}
+		})
+	}
+}
+
+func TestRequireAuthNeedsACredentialSource(t *testing.T) {
+	cfg := baseValidServerConfig()
+	cfg.RequireAuth = true
+
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate() = nil, want an error for require_auth with no credential source")
+	}
+
+	cfg.DBPath = "/var/lib/drip/control.db"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+}

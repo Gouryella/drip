@@ -1,4 +1,4 @@
-.PHONY: all build build-all clean test e2e run-server run-client install deps fmt lint
+.PHONY: all build build-all clean test e2e demo demo-stop run-server run-client install deps fmt lint
 
 # Variables
 BINARY=bin/drip
@@ -54,6 +54,13 @@ test:
 # Full end-to-end functional tests (starts local server/client/backends)
 e2e: build
 	bash scripts/test/e2e-full.sh
+
+# Local demo: server, admin panel, control plane, two connected clients
+demo:
+	bash scripts/dev/local-demo.sh
+
+demo-stop:
+	bash scripts/dev/local-demo.sh stop
 
 # Run tests with coverage
 test-coverage:

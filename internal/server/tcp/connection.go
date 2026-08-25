@@ -17,19 +17,29 @@ import (
 	json "github.com/goccy/go-json"
 	"github.com/hashicorp/yamux"
 
+	"drip/internal/server/auth"
+	"drip/internal/server/reservations"
 	"drip/internal/server/tunnel"
 	"drip/internal/shared/constants"
 	"drip/internal/shared/httputil"
 	"drip/internal/shared/protocol"
 	"drip/internal/shared/qos"
+	"drip/internal/shared/units"
 	"drip/internal/shared/utils"
 
 	"go.uber.org/zap"
 )
 
 type ConnectionConfig struct {
-	Conn         net.Conn
-	AuthToken    string
+	Conn net.Conn
+	// AuthToken is the legacy shared server token. Prefer Authenticator.
+	AuthToken string
+	// Authenticator resolves registration tokens to control-plane identities.
+	// Nil falls back to the legacy AuthToken comparison.
+	Authenticator *auth.Authenticator
+	// Resolver applies tunnel reservation policy. Nil means every registration
+	// resolves to an ephemeral tunnel.
+	Resolver     *reservations.Resolver
 	Manager      *tunnel.Manager
 	Logger       *zap.Logger
 	PortAlloc    *PortAllocator
@@ -45,6 +55,9 @@ type ConnectionConfig struct {
 type Connection struct {
 	conn             net.Conn
 	authToken        string
+	authenticator    *auth.Authenticator
+	identity         *auth.Identity
+	resolver         *reservations.Resolver
 	manager          *tunnel.Manager
 	logger           *zap.Logger
 	subdomain        string
@@ -87,6 +100,8 @@ func NewConnection(cfg ConnectionConfig) *Connection {
 	c := &Connection{
 		conn:             cfg.Conn,
 		authToken:        cfg.AuthToken,
+		authenticator:    cfg.Authenticator,
+		resolver:         cfg.Resolver,
 		manager:          cfg.Manager,
 		logger:           cfg.Logger,
 		portAlloc:        cfg.PortAlloc,
@@ -108,6 +123,40 @@ func NewConnection(cfg ConnectionConfig) *Connection {
 	c.lifecycleManager.SetConnection(cfg.Conn)
 
 	return c
+}
+
+// authenticate resolves the registration token to an identity. When no
+// Authenticator is configured the legacy shared-token comparison applies, which
+// keeps existing self-hosted deployments working unchanged.
+func (c *Connection) authenticate(token string) (*auth.Identity, error) {
+	if c.authenticator != nil {
+		ctx, cancel := context.WithTimeout(c.ctx, 5*time.Second)
+		defer cancel()
+		return c.authenticator.Authenticate(ctx, token, c.remoteIP)
+	}
+
+	if c.authToken != "" && subtle.ConstantTimeCompare([]byte(token), []byte(c.authToken)) != 1 {
+		return nil, auth.ErrInvalidCredential
+	}
+	if c.authToken != "" {
+		return &auth.Identity{Legacy: true}, nil
+	}
+	return &auth.Identity{Anonymous: true}, nil
+}
+
+// owner converts the authenticated identity into a tunnel.Owner.
+func (c *Connection) owner() tunnel.Owner {
+	if c.identity == nil || !c.identity.IsStored() {
+		return tunnel.Owner{}
+	}
+	owner := tunnel.Owner{
+		ClientID:  c.identity.Client.ID,
+		AccountID: c.identity.Client.AccountID,
+	}
+	if c.identity.Account != nil {
+		owner.MaxTunnels = c.identity.Account.MaxTunnels
+	}
+	return owner
 }
 
 func (c *Connection) Handle() error {
@@ -180,10 +229,18 @@ func (c *Connection) Handle() error {
 		return fmt.Errorf("tunnel type not allowed: %s", req.TunnelType)
 	}
 
-	if c.authToken != "" && subtle.ConstantTimeCompare([]byte(req.Token), []byte(c.authToken)) != 1 {
+	identity, err := c.authenticate(req.Token)
+	if err != nil {
+		// The client is told only that authentication failed; the specific
+		// reason stays server-side so a probe cannot enumerate credentials.
 		c.sendError("authentication_failed", "Invalid authentication token")
-		return fmt.Errorf("authentication failed")
+		c.logger.Warn("Registration authentication failed",
+			zap.String("remote_ip", c.remoteIP),
+			zap.Error(err),
+		)
+		return fmt.Errorf("authentication failed: %w", err)
 	}
+	c.identity = identity
 
 	// Use RegistrationHandler for registration logic
 	regHandler := NewRegistrationHandler(
@@ -195,6 +252,7 @@ func (c *Connection) Handle() error {
 		c.publicPort,
 		c.logger,
 	)
+	regHandler.SetResolver(c.resolver)
 
 	regReq := &RegistrationRequest{
 		TunnelType:       req.TunnelType,
@@ -206,9 +264,10 @@ func (c *Connection) Handle() error {
 		ProxyAuth:        req.ProxyAuth,
 		LocalPort:        req.LocalPort,
 		RemoteIP:         c.remoteIP,
+		Owner:            c.owner(),
 	}
 
-	result, err := regHandler.Register(regReq)
+	result, err := regHandler.Register(c.ctx, regReq)
 	if err != nil {
 		c.sendError("registration_failed", err.Error())
 		return fmt.Errorf("registration failed: %w", err)
@@ -218,7 +277,9 @@ func (c *Connection) Handle() error {
 	c.subdomain = result.Subdomain
 	c.port = result.Port
 	c.tunnelConn = result.TunnelConn
-	c.tunnelConn.Conn = nil
+	// The tunnel connection is registered with a nil websocket (this is the raw
+	// TCP path), so Conn is already nil. Assigning it here again would race the
+	// write pump goroutine the manager starts at registration.
 
 	// Update lifecycle manager with registration info
 	if c.lifecycleManager != nil {
@@ -243,8 +304,22 @@ func (c *Connection) Handle() error {
 		)
 	}
 
-	// Configure bandwidth limiting
+	// Configure bandwidth limiting. The effective limit is the smallest of the
+	// server default, the reservation override and whatever the client asked
+	// for, so no party can raise a limit another one set.
 	effectiveBandwidth := c.bandwidth
+	if result.Bandwidth != "" {
+		reserved, berr := units.ParseBandwidth(result.Bandwidth)
+		if berr != nil {
+			c.logger.Warn("Ignoring invalid reservation bandwidth",
+				zap.String("subdomain", c.subdomain),
+				zap.String("bandwidth", result.Bandwidth),
+				zap.Error(berr),
+			)
+		} else if reserved > 0 && (effectiveBandwidth == 0 || reserved < effectiveBandwidth) {
+			effectiveBandwidth = reserved
+		}
+	}
 	if req.Bandwidth > 0 {
 		if effectiveBandwidth == 0 || req.Bandwidth < effectiveBandwidth {
 			effectiveBandwidth = req.Bandwidth

@@ -10,8 +10,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"drip/internal/server/auth"
 	"drip/internal/server/metrics"
 	"drip/internal/server/proxy"
+	"drip/internal/server/reservations"
 	"drip/internal/server/tunnel"
 	"drip/internal/shared/netutil"
 	"drip/internal/shared/pool"
@@ -23,9 +25,14 @@ import (
 )
 
 type ListenerConfig struct {
-	Address      string
-	TLSConfig    *tls.Config
-	AuthToken    string
+	Address   string
+	TLSConfig *tls.Config
+	// AuthToken is the legacy shared server token. Prefer Authenticator.
+	AuthToken string
+	// Authenticator resolves registration tokens to control-plane identities.
+	Authenticator *auth.Authenticator
+	// Resolver applies tunnel reservation policy.
+	Resolver     *reservations.Resolver
 	Manager      *tunnel.Manager
 	Logger       *zap.Logger
 	PortAlloc    *PortAllocator
@@ -36,30 +43,32 @@ type ListenerConfig struct {
 }
 
 type Listener struct {
-	address      string
-	tlsConfig    *tls.Config
-	authToken    string
-	manager      *tunnel.Manager
-	portAlloc    *PortAllocator
-	logger       *zap.Logger
-	domain       string
-	tunnelDomain string
-	publicPort   int
-	httpHandler  http.Handler
-	listener     net.Listener
-	stopCh       chan struct{}
-	stopOnce     sync.Once
-	wg           sync.WaitGroup
-	connections  sync.Map // map[string]*Connection, sync.Map for better concurrent read performance
-	connCount    atomic.Int64
-	connIDSeq    atomic.Int64  // unique connection ID sequence
-	connSem      chan struct{} // semaphore to limit max connections
-	workerPool   *pool.WorkerPool
-	recoverer    *recovery.Recoverer
-	panicMetrics *recovery.PanicMetrics
-	groupManager *ConnectionGroupManager
-	httpServer   *http.Server
-	httpListener *connQueueListener
+	address       string
+	tlsConfig     *tls.Config
+	authToken     string
+	authenticator *auth.Authenticator
+	resolver      *reservations.Resolver
+	manager       *tunnel.Manager
+	portAlloc     *PortAllocator
+	logger        *zap.Logger
+	domain        string
+	tunnelDomain  string
+	publicPort    int
+	httpHandler   http.Handler
+	listener      net.Listener
+	stopCh        chan struct{}
+	stopOnce      sync.Once
+	wg            sync.WaitGroup
+	connections   sync.Map // map[string]*Connection, sync.Map for better concurrent read performance
+	connCount     atomic.Int64
+	connIDSeq     atomic.Int64  // unique connection ID sequence
+	connSem       chan struct{} // semaphore to limit max connections
+	workerPool    *pool.WorkerPool
+	recoverer     *recovery.Recoverer
+	panicMetrics  *recovery.PanicMetrics
+	groupManager  *ConnectionGroupManager
+	httpServer    *http.Server
+	httpListener  *connQueueListener
 
 	// Server capabilities
 	allowedTransports  []string
@@ -89,22 +98,24 @@ func NewListener(cfg ListenerConfig) *Listener {
 	metrics.WorkerPoolSize.Set(float64(workers))
 
 	l := &Listener{
-		address:      cfg.Address,
-		tlsConfig:    cfg.TLSConfig,
-		authToken:    cfg.AuthToken,
-		manager:      cfg.Manager,
-		portAlloc:    cfg.PortAlloc,
-		logger:       cfg.Logger,
-		domain:       cfg.Domain,
-		tunnelDomain: cfg.TunnelDomain,
-		publicPort:   cfg.PublicPort,
-		httpHandler:  cfg.HTTPHandler,
-		stopCh:       make(chan struct{}),
-		connSem:      make(chan struct{}, maxConns),
-		workerPool:   workerPool,
-		recoverer:    recoverer,
-		panicMetrics: panicMetrics,
-		groupManager: NewConnectionGroupManager(cfg.Logger),
+		address:       cfg.Address,
+		tlsConfig:     cfg.TLSConfig,
+		authToken:     cfg.AuthToken,
+		authenticator: cfg.Authenticator,
+		resolver:      cfg.Resolver,
+		manager:       cfg.Manager,
+		portAlloc:     cfg.PortAlloc,
+		logger:        cfg.Logger,
+		domain:        cfg.Domain,
+		tunnelDomain:  cfg.TunnelDomain,
+		publicPort:    cfg.PublicPort,
+		httpHandler:   cfg.HTTPHandler,
+		stopCh:        make(chan struct{}),
+		connSem:       make(chan struct{}, maxConns),
+		workerPool:    workerPool,
+		recoverer:     recoverer,
+		panicMetrics:  panicMetrics,
+		groupManager:  NewConnectionGroupManager(cfg.Logger),
 	}
 
 	// Set up WebSocket connection handler if httpHandler supports it
@@ -317,18 +328,20 @@ func (l *Listener) handleConnection(netConn net.Conn) {
 	}
 
 	conn := NewConnection(ConnectionConfig{
-		Conn:         netConn,
-		AuthToken:    l.authToken,
-		Manager:      l.manager,
-		Logger:       l.logger,
-		PortAlloc:    l.portAlloc,
-		Domain:       l.domain,
-		TunnelDomain: l.tunnelDomain,
-		PublicPort:   l.publicPort,
-		HTTPHandler:  l.httpHandler,
-		GroupManager: l.groupManager,
-		HTTPListener: l.httpListener,
-		RemoteIP:     remoteIP,
+		Conn:          netConn,
+		AuthToken:     l.authToken,
+		Authenticator: l.authenticator,
+		Resolver:      l.resolver,
+		Manager:       l.manager,
+		Logger:        l.logger,
+		PortAlloc:     l.portAlloc,
+		Domain:        l.domain,
+		TunnelDomain:  l.tunnelDomain,
+		PublicPort:    l.publicPort,
+		HTTPHandler:   l.httpHandler,
+		GroupManager:  l.groupManager,
+		HTTPListener:  l.httpListener,
+		RemoteIP:      remoteIP,
 	})
 	conn.SetAllowedTunnelTypes(l.allowedTunnelTypes)
 	conn.SetAllowedTransports(l.allowedTransports)
@@ -420,6 +433,14 @@ func (l *Listener) Stop() error {
 	return nil
 }
 
+// Addr returns the address the listener is bound to, or nil before Start.
+func (l *Listener) Addr() net.Addr {
+	if l.listener == nil {
+		return nil
+	}
+	return l.listener.Addr()
+}
+
 func (l *Listener) GetActiveConnections() int {
 	return int(l.connCount.Load())
 }
@@ -462,18 +483,20 @@ func (l *Listener) HandleWSConnection(conn net.Conn, remoteAddr string) {
 
 	// Create connection handler (no TLS verification needed - already done by HTTP server)
 	tcpConn := NewConnection(ConnectionConfig{
-		Conn:         conn,
-		AuthToken:    l.authToken,
-		Manager:      l.manager,
-		Logger:       l.logger,
-		PortAlloc:    l.portAlloc,
-		Domain:       l.domain,
-		TunnelDomain: l.tunnelDomain,
-		PublicPort:   l.publicPort,
-		HTTPHandler:  l.httpHandler,
-		GroupManager: l.groupManager,
-		HTTPListener: l.httpListener,
-		RemoteIP:     remoteIP,
+		Conn:          conn,
+		AuthToken:     l.authToken,
+		Authenticator: l.authenticator,
+		Resolver:      l.resolver,
+		Manager:       l.manager,
+		Logger:        l.logger,
+		PortAlloc:     l.portAlloc,
+		Domain:        l.domain,
+		TunnelDomain:  l.tunnelDomain,
+		PublicPort:    l.publicPort,
+		HTTPHandler:   l.httpHandler,
+		GroupManager:  l.groupManager,
+		HTTPListener:  l.httpListener,
+		RemoteIP:      remoteIP,
 	})
 	tcpConn.SetAllowedTunnelTypes(l.allowedTunnelTypes)
 	tcpConn.SetAllowedTransports(l.allowedTransports)

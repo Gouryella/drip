@@ -14,7 +14,9 @@ domain: tunnel.example.com
 token: your-secret-token
 
 # TLS settings
-# drip-server handles TLS directly, requires certificate files
+# drip-server handles TLS directly, requires certificate files.
+# For automatic wildcard certificates instead, see config.acme.example.yaml.
+tls_mode: manual
 tls_enabled: true
 tls_cert: /app/certs/fullchain.pem
 tls_key: /app/certs/privkey.pem

@@ -56,3 +56,9 @@ benchmark-results/
 drip-linux-amd64
 ./drip
 drip
+
+# Impeccable review screenshots
+.impeccable/review/
+
+# Local demo environment
+.local-demo/

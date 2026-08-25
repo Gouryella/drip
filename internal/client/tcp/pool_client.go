@@ -59,10 +59,10 @@ type PoolClient struct {
 
 	primary *sessionHandle
 
-	mu           sync.RWMutex
-	dataSessions map[string]*sessionHandle
-	desiredTotal int
-	lastScale    time.Time
+	mu              sync.RWMutex
+	dataSessions    map[string]*sessionHandle
+	desiredTotal    int
+	lastScale       time.Time
 	pendingSessions int
 
 	logger *zap.Logger

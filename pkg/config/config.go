@@ -24,13 +24,42 @@ type ServerConfig struct {
 	TCPPortMax int `yaml:"tcp_port_max"`
 
 	// TLS settings
+	// TLSMode selects how the server obtains its certificate: "none" (a reverse
+	// proxy terminates TLS), "manual" (tls_cert/tls_key), or "acme" (the server
+	// obtains a DNS-01 wildcard itself). Empty is inferred - see ResolveTLSMode.
+	TLSMode     string `yaml:"tls_mode,omitempty"`
 	TLSEnabled  bool   `yaml:"tls_enabled"`
 	TLSCertFile string `yaml:"tls_cert"`
 	TLSKeyFile  string `yaml:"tls_key"`
 
+	// ACME configures certificate issuance when TLSMode is "acme".
+	ACME ACMEConfig `yaml:"acme,omitempty"`
+
 	// Security
 	AuthToken    string `yaml:"token"`
 	MetricsToken string `yaml:"metrics_token"`
+
+	// Control plane
+	// DBPath enables the SQLite control plane (accounts, client credentials,
+	// tunnel reservations, admin users). Empty keeps the server stateless and
+	// falls back to the shared token in AuthToken.
+	DBPath string `yaml:"db_path,omitempty"`
+	// ReservationsOnly rejects any registration that does not bind a
+	// reservation, turning the deployment into a closed fleet where every
+	// tunnel is pre-allocated in the admin panel.
+	ReservationsOnly bool `yaml:"reservations_only,omitempty"`
+	// AdminAddress enables the admin panel on its own listener, e.g.
+	// "127.0.0.1:8444". Administrative traffic never shares a port with tunnel
+	// traffic. The loopback default is deliberate: the panel has a first-run
+	// setup screen that is unauthenticated by necessity, so it should be
+	// reached over a VPN or an SSH tunnel rather than published.
+	AdminAddress string `yaml:"admin_address,omitempty"`
+	// AdminSessionHours bounds a signed-in panel session. 0 uses 12 hours.
+	AdminSessionHours int `yaml:"admin_session_hours,omitempty"`
+	// RequireAuth rejects registrations that carry no recognised credential.
+	// Without it a server with neither DBPath nor AuthToken accepts anyone,
+	// which is the historical single-user self-hosted default.
+	RequireAuth bool `yaml:"require_auth,omitempty"`
 
 	// Logging
 	Debug bool `yaml:"debug"`
@@ -51,6 +80,62 @@ type ServerConfig struct {
 	// Optional HTTP request body limit for tunneled HTTP/HTTPS traffic.
 	// 0 disables the limit and preserves full reverse-proxy behavior.
 	MaxRequestBodyBytes int64 `yaml:"max_request_body_bytes,omitempty"`
+}
+
+// ACMEConfig configures automatic certificate issuance.
+//
+// A wildcard certificate requires the DNS-01 challenge, which requires API
+// credentials for the zone hosting the tunnel domain. HTTP-01 cannot issue
+// wildcards, so there is no credential-free path to covering every tunnel
+// subdomain with one certificate.
+type ACMEConfig struct {
+	// Email is the ACME account contact used for expiry notices.
+	Email string `yaml:"email,omitempty"`
+	// Domains overrides the certificate names, which otherwise default to the
+	// server domain, the tunnel domain, and *.<tunnel domain>.
+	Domains []string `yaml:"domains,omitempty"`
+	// DNSProvider names the DNS API to use, e.g. "cloudflare".
+	DNSProvider string `yaml:"dns_provider,omitempty"`
+	// DNSAPIToken is the provider's scoped API token.
+	DNSAPIToken string `yaml:"dns_api_token,omitempty"`
+	// CA is "production" (default), "staging", or an ACME directory URL. Use
+	// staging while testing: production issuance is rate limited to 50
+	// certificates per registered domain per week.
+	CA string `yaml:"ca,omitempty"`
+	// CacheDir stores certificates and the ACME account key.
+	CacheDir string `yaml:"cache_dir,omitempty"`
+	// PropagationTimeoutSeconds bounds the wait for the challenge TXT record to
+	// become visible. 0 uses the two-minute default.
+	PropagationTimeoutSeconds int `yaml:"propagation_timeout_seconds,omitempty"`
+	// Resolvers optionally pins the DNS servers used for propagation checks,
+	// for hosts whose resolver serves stale or split-horizon answers.
+	Resolvers []string `yaml:"resolvers,omitempty"`
+}
+
+// ResolveTLSMode determines the effective TLS mode.
+//
+// An explicit tls_mode always wins. Otherwise the mode is inferred so that
+// existing configuration files keep working unchanged: ACME credentials imply
+// acme, a certificate pair (or tls_enabled) implies manual, and a bare config
+// implies none.
+func (c *ServerConfig) ResolveTLSMode() (string, error) {
+	if c.TLSMode != "" {
+		mode := strings.ToLower(strings.TrimSpace(c.TLSMode))
+		switch mode {
+		case "none", "manual", "acme":
+			return mode, nil
+		default:
+			return "", fmt.Errorf("unknown tls_mode %q: want none, manual or acme", c.TLSMode)
+		}
+	}
+
+	if c.ACME.DNSProvider != "" {
+		return "acme", nil
+	}
+	if c.TLSEnabled || (c.TLSCertFile != "" && c.TLSKeyFile != "") {
+		return "manual", nil
+	}
+	return "none", nil
 }
 
 // Validate checks if the server configuration is valid
@@ -90,12 +175,27 @@ func (c *ServerConfig) Validate() error {
 	}
 
 	// Validate TLS settings
-	if c.TLSEnabled {
+	mode, err := c.ResolveTLSMode()
+	if err != nil {
+		return err
+	}
+	switch mode {
+	case "manual":
 		if c.TLSCertFile == "" {
-			return fmt.Errorf("TLS certificate file is required when TLS is enabled")
+			return fmt.Errorf("tls_cert is required in manual TLS mode")
 		}
 		if c.TLSKeyFile == "" {
-			return fmt.Errorf("TLS key file is required when TLS is enabled")
+			return fmt.Errorf("tls_key is required in manual TLS mode")
+		}
+	case "acme":
+		if c.ACME.DNSProvider == "" {
+			return fmt.Errorf("acme.dns_provider is required in acme TLS mode: a wildcard certificate needs the DNS-01 challenge")
+		}
+		if c.ACME.DNSAPIToken == "" {
+			return fmt.Errorf("acme.dns_api_token is required in acme TLS mode")
+		}
+		if c.ACME.PropagationTimeoutSeconds < 0 {
+			return fmt.Errorf("acme.propagation_timeout_seconds must be >= 0")
 		}
 	}
 
@@ -103,47 +203,23 @@ func (c *ServerConfig) Validate() error {
 		return fmt.Errorf("max_request_body_bytes must be >= 0")
 	}
 
+	if c.RequireAuth && c.DBPath == "" && c.AuthToken == "" {
+		return fmt.Errorf("require_auth needs either db_path or token to be set")
+	}
+
+	if c.AdminAddress != "" && c.DBPath == "" {
+		return fmt.Errorf("admin_address needs db_path to be set: the panel manages the control plane database")
+	}
+
+	if c.AdminSessionHours < 0 {
+		return fmt.Errorf("admin_session_hours must be >= 0")
+	}
+
+	if c.ReservationsOnly && c.DBPath == "" {
+		return fmt.Errorf("reservations_only needs db_path to be set: reservations live in the control plane database")
+	}
+
 	return nil
-}
-
-// LoadTLSConfig loads TLS configuration
-func (c *ServerConfig) LoadTLSConfig() (*tls.Config, error) {
-	if !c.TLSEnabled {
-		return nil, nil
-	}
-
-	if c.TLSCertFile == "" || c.TLSKeyFile == "" {
-		return nil, fmt.Errorf("TLS enabled but certificate files not specified")
-	}
-
-	if _, err := os.Stat(c.TLSCertFile); os.IsNotExist(err) {
-		return nil, fmt.Errorf("certificate file not found: %s", c.TLSCertFile)
-	}
-
-	if _, err := os.Stat(c.TLSKeyFile); os.IsNotExist(err) {
-		return nil, fmt.Errorf("key file not found: %s", c.TLSKeyFile)
-	}
-
-	cert, err := tls.LoadX509KeyPair(c.TLSCertFile, c.TLSKeyFile)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load certificate: %w", err)
-	}
-
-	// Force TLS 1.3 only
-	tlsConfig := &tls.Config{
-		Certificates:             []tls.Certificate{cert},
-		MinVersion:               tls.VersionTLS13,                  // Only TLS 1.3
-		MaxVersion:               tls.VersionTLS13,                  // Only TLS 1.3
-		PreferServerCipherSuites: true,                              // Prefer server cipher suites (ignored in TLS 1.3 but set for consistency)
-		ClientSessionCache:       tls.NewLRUClientSessionCache(128), // Enable session resumption
-		CipherSuites: []uint16{
-			tls.TLS_AES_128_GCM_SHA256,
-			tls.TLS_AES_256_GCM_SHA384,
-			tls.TLS_CHACHA20_POLY1305_SHA256,
-		},
-	}
-
-	return tlsConfig, nil
 }
 
 // GetClientTLSConfig returns TLS config for client connections

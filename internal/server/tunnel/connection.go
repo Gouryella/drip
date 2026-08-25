@@ -28,6 +28,11 @@ type Connection struct {
 	openStream    func() (net.Conn, error)
 	remoteIP      string
 
+	// Control plane ownership. Empty for legacy shared-token and anonymous
+	// registrations, which have no identity in the database.
+	clientID  string
+	accountID string
+
 	bytesIn           atomic.Int64
 	bytesOut          atomic.Int64
 	activeConnections atomic.Int64
@@ -181,6 +186,21 @@ func (c *Connection) DecActiveConnections() {
 }
 
 func (c *Connection) GetActiveConnections() int64 { return c.activeConnections.Load() }
+
+// SetOwner records which control-plane client and account own this tunnel.
+func (c *Connection) SetOwner(clientID, accountID string) {
+	c.mu.Lock()
+	c.clientID = clientID
+	c.accountID = accountID
+	c.mu.Unlock()
+}
+
+// Owner returns the control-plane client and account owning this tunnel.
+func (c *Connection) Owner() (clientID, accountID string) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.clientID, c.accountID
+}
 
 func (c *Connection) SetIPAccessControl(allowCIDRs, denyIPs []string) {
 	c.mu.Lock()

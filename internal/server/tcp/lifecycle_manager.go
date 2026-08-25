@@ -18,6 +18,11 @@ type ConnectionLifecycleManager struct {
 	cancel func()
 	logger *zap.Logger
 
+	// mu guards the resource fields below: they are populated by the connection
+	// goroutine as registration progresses, while Close may run concurrently
+	// from the listener's shutdown path.
+	mu sync.Mutex
+
 	// Resources to clean up
 	conn interface {
 		Close() error
@@ -52,26 +57,36 @@ func (clm *ConnectionLifecycleManager) SetConnection(conn interface {
 	Close() error
 	SetDeadline(time.Time) error
 }) {
+	clm.mu.Lock()
+	defer clm.mu.Unlock()
 	clm.conn = conn
 }
 
 // SetFrameWriter sets the frame writer to close.
 func (clm *ConnectionLifecycleManager) SetFrameWriter(fw *protocol.FrameWriter) {
+	clm.mu.Lock()
+	defer clm.mu.Unlock()
 	clm.frameWriter = fw
 }
 
 // SetProxy sets the proxy to stop.
 func (clm *ConnectionLifecycleManager) SetProxy(proxy interface{ Stop() }) {
+	clm.mu.Lock()
+	defer clm.mu.Unlock()
 	clm.proxy = proxy
 }
 
 // SetSession sets the yamux session to close.
 func (clm *ConnectionLifecycleManager) SetSession(session *yamux.Session) {
+	clm.mu.Lock()
+	defer clm.mu.Unlock()
 	clm.session = session
 }
 
 // SetPortAllocation sets the port allocation to release.
 func (clm *ConnectionLifecycleManager) SetPortAllocation(portAlloc *PortAllocator, port int) {
+	clm.mu.Lock()
+	defer clm.mu.Unlock()
 	clm.portAlloc = portAlloc
 	clm.port = port
 }
@@ -83,6 +98,8 @@ func (clm *ConnectionLifecycleManager) SetTunnelRegistration(
 	tunnelID string,
 	groupManager *ConnectionGroupManager,
 ) {
+	clm.mu.Lock()
+	defer clm.mu.Unlock()
 	clm.manager = manager
 	clm.subdomain = subdomain
 	clm.tunnelID = tunnelID
@@ -99,39 +116,54 @@ func (clm *ConnectionLifecycleManager) Close() {
 			clm.cancel()
 		}
 
-		if clm.conn != nil {
-			_ = clm.conn.SetDeadline(time.Now())
+		// Snapshot the resources, then release the lock: closing a session or
+		// unregistering a tunnel takes other locks and must not run under mu.
+		clm.mu.Lock()
+		conn := clm.conn
+		frameWriter := clm.frameWriter
+		proxy := clm.proxy
+		session := clm.session
+		portAlloc := clm.portAlloc
+		port := clm.port
+		manager := clm.manager
+		subdomain := clm.subdomain
+		tunnelID := clm.tunnelID
+		groupManager := clm.groupManager
+		clm.mu.Unlock()
+
+		if conn != nil {
+			_ = conn.SetDeadline(time.Now())
 		}
 
-		if clm.frameWriter != nil {
-			_ = clm.frameWriter.Close()
+		if frameWriter != nil {
+			_ = frameWriter.Close()
 		}
 
-		if clm.proxy != nil {
-			clm.proxy.Stop()
+		if proxy != nil {
+			proxy.Stop()
 		}
 
-		if clm.session != nil {
-			_ = clm.session.Close()
+		if session != nil {
+			_ = session.Close()
 		}
 
-		if clm.conn != nil {
-			_ = clm.conn.Close()
+		if conn != nil {
+			_ = conn.Close()
 		}
 
-		if clm.port > 0 && clm.portAlloc != nil {
-			clm.portAlloc.Release(clm.port)
+		if port > 0 && portAlloc != nil {
+			portAlloc.Release(port)
 		}
 
-		if clm.subdomain != "" && clm.manager != nil {
-			clm.manager.Unregister(clm.subdomain)
-			if clm.tunnelID != "" && clm.groupManager != nil {
-				clm.groupManager.RemoveGroup(clm.tunnelID)
+		if subdomain != "" && manager != nil {
+			manager.Unregister(subdomain)
+			if tunnelID != "" && groupManager != nil {
+				groupManager.RemoveGroup(tunnelID)
 			}
 		}
 
 		clm.logger.Info("Connection closed",
-			zap.String("subdomain", clm.subdomain),
+			zap.String("subdomain", subdomain),
 		)
 	})
 }

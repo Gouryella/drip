@@ -1,0 +1,65 @@
+# Drip Server Configuration (automatic wildcard TLS)
+#
+# The server obtains and renews its own certificates over ACME, using the
+# DNS-01 challenge so that one wildcard covers every tunnel subdomain. No
+# reverse proxy and no certificate files are needed.
+#
+# DNS-01 is the only challenge type that can issue a wildcard, so API
+# credentials for the zone hosting the tunnel domain are required.
+
+port: 443
+domain: tunnel.example.com
+
+# Tunnel URLs live under this domain; *.<tunnel_domain> is what the wildcard
+# certificate covers. Defaults to `domain` when unset.
+# tunnel_domain: example.com
+
+tls_mode: acme
+
+acme:
+  # Contact address for expiry notices. Optional but strongly recommended.
+  email: ops@example.com
+
+  # DNS provider for the DNS-01 challenge.
+  # Cloudflare needs a scoped API token with Zone.DNS:Write on the zone.
+  dns_provider: cloudflare
+  dns_api_token: ${CF_API_TOKEN}
+
+  # "production" (default), "staging", or an ACME directory URL.
+  # Use staging while testing: production issuance is limited to 50
+  # certificates per registered domain per week, and a failed loop burns
+  # through that quota quickly.
+  ca: staging
+
+  # Certificates and the ACME account key. Back this directory up, or the
+  # server re-issues on every fresh deployment.
+  cache_dir: /var/lib/drip/certs
+
+  # Override the certificate names. Defaults to the server domain, the tunnel
+  # domain, and *.<tunnel_domain>.
+  # domains:
+  #   - tunnel.example.com
+  #   - "*.example.com"
+
+  # Pin the resolvers used for propagation checks, for hosts whose resolver
+  # serves stale or split-horizon answers.
+  # resolvers:
+  #   - 1.1.1.1
+  #   - 8.8.8.8
+
+  # Wait longer for slow DNS propagation. 0 uses the two-minute default.
+  # propagation_timeout_seconds: 300
+
+# Control plane: per-client credentials and, later, tunnel reservations.
+db_path: /var/lib/drip/control.db
+require_auth: true
+
+# Closed fleet: every tunnel must be pre-allocated in the control plane.
+# Leave false to let authenticated clients also open ad-hoc tunnels.
+# reservations_only: true
+
+tcp_port_min: 20000
+tcp_port_max: 20100
+
+# metrics_token: secret
+# debug: false
