@@ -183,8 +183,16 @@ explicitly disabled rather than left to fail on a server that may not own port
 
 Adding a DNS provider is one import plus one entry in the `dnsProviders`
 registry in `tls/dns.go`; it only has to satisfy `libdns.RecordAppender` and
-`libdns.RecordDeleter`. Cloudflare ships today. Weigh the dependency tree before
-adding heavy SDKs (Route53 pulls all of aws-sdk-go-v2).
+`libdns.RecordDeleter`. Cloudflare (upstream `libdns/cloudflare`) and Hostinger
+(`tls/hostinger`, written here because no libdns provider exists) ship today.
+Weigh the dependency tree before adding heavy SDKs (Route53 pulls all of
+aws-sdk-go-v2).
+
+`tls/hostinger` bridges an RRset-shaped API onto libdns: entries are
+(name, type, ttl) tuples holding a list of contents, `PUT` takes an `overwrite`
+flag that maps onto append versus set, and `DELETE` only filters by
+(name, type). Exact-value deletes are therefore a read-modify-write under a
+mutex — see the comments there before changing it.
 
 All three modes build on `baseTLSConfig()`: TLS 1.3 only, three cipher suites,
 no ALPN advertisement. ACME mode deliberately layers certmagic's

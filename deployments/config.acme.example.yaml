@@ -20,8 +20,10 @@ acme:
   # Contact address for expiry notices. Optional but strongly recommended.
   email: ops@example.com
 
-  # DNS provider for the DNS-01 challenge.
-  # Cloudflare needs a scoped API token with Zone.DNS:Write on the zone.
+  # DNS provider for the DNS-01 challenge: cloudflare or hostinger.
+  #   cloudflare  a scoped API token with Zone.DNS:Write on the zone
+  #   hostinger   an API token generated in hPanel under API; mind the expiry
+  #               date it is created with, since renewals fail once it lapses
   dns_provider: cloudflare
   dns_api_token: ${CF_API_TOKEN}
 

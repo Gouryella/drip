@@ -7,6 +7,8 @@ import (
 
 	"github.com/caddyserver/certmagic"
 	"github.com/libdns/cloudflare"
+
+	"drip/internal/server/tls/hostinger"
 )
 
 // DNSProviderConfig is the credential material a DNS provider needs to answer
@@ -15,7 +17,8 @@ type DNSProviderConfig struct {
 	// Name selects the provider, e.g. "cloudflare".
 	Name string
 	// APIToken is the provider's scoped API token. Cloudflare needs a token
-	// with Zone.DNS:Write on the zone hosting the tunnel domain.
+	// with Zone.DNS:Write on the zone hosting the tunnel domain; Hostinger
+	// needs an hPanel API token with DNS access to it.
 	APIToken string
 }
 
@@ -31,6 +34,12 @@ var dnsProviders = map[string]dnsProviderFactory{
 			return nil, fmt.Errorf("cloudflare needs an API token with Zone.DNS:Write")
 		}
 		return &cloudflare.Provider{APIToken: cfg.APIToken}, nil
+	},
+	"hostinger": func(cfg DNSProviderConfig) (certmagic.DNSProvider, error) {
+		if cfg.APIToken == "" {
+			return nil, fmt.Errorf("hostinger needs an API token with DNS access to the zone")
+		}
+		return &hostinger.Provider{APIToken: cfg.APIToken}, nil
 	},
 }
 

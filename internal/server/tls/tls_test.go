@@ -191,12 +191,14 @@ func TestResolveCA(t *testing.T) {
 }
 
 func TestNewDNSProvider(t *testing.T) {
-	provider, err := newDNSProvider(DNSProviderConfig{Name: "cloudflare", APIToken: "token"})
-	if err != nil {
-		t.Fatalf("newDNSProvider() error = %v", err)
-	}
-	if provider == nil {
-		t.Fatal("newDNSProvider() = nil provider")
+	for _, name := range []string{"cloudflare", "hostinger", "HOSTINGER", " hostinger "} {
+		provider, err := newDNSProvider(DNSProviderConfig{Name: name, APIToken: "token"})
+		if err != nil {
+			t.Fatalf("newDNSProvider(%q) error = %v", name, err)
+		}
+		if provider == nil {
+			t.Fatalf("newDNSProvider(%q) = nil provider", name)
+		}
 	}
 }
 
@@ -209,6 +211,9 @@ func TestNewDNSProviderErrors(t *testing.T) {
 	}
 	if _, err := newDNSProvider(DNSProviderConfig{Name: "cloudflare"}); err == nil {
 		t.Error("newDNSProvider() with no token = nil error, want failure")
+	}
+	if _, err := newDNSProvider(DNSProviderConfig{Name: "hostinger"}); err == nil {
+		t.Error("newDNSProvider() with no hostinger token = nil error, want failure")
 	}
 }
 

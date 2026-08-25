@@ -275,8 +275,17 @@ three TLS modes:
 | `none` | A reverse proxy in front (Caddy, nginx) | Something else terminates TLS |
 
 Only DNS-01 can issue a wildcard, and tunnel subdomains are unpredictable, so
-`acme` mode requires DNS provider API credentials. Cloudflare ships today; adding
-a provider is one import plus one entry in `internal/server/tls/dns.go`.
+`acme` mode requires DNS provider API credentials:
+
+| `acme.dns_provider` | Credential |
+|---|---|
+| `cloudflare` | An API token with `Zone.DNS:Write` on the zone |
+| `hostinger` | An API token generated in hPanel under **API** |
+
+Hostinger tokens expire on a date chosen when they are created. Pick one well
+past the certificate lifetime, or renewals start failing with HTTP 401 months
+after setup. Adding another provider is one import plus one entry in
+`internal/server/tls/dns.go`.
 
 ### Docker
 

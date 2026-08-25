@@ -266,7 +266,15 @@ drip service run --config C:\ProgramData\drip\config.yaml --all --verbose
 | `none` | 前面的反向代理（Caddy、nginx） | 由其他组件终止 TLS |
 
 只有 DNS-01 能签发通配符证书，而隧道子域名是不可预测的，所以 `acme` 模式必须提供
-DNS 服务商的 API 凭据。目前内置 Cloudflare；新增服务商只需一个 import 加上
+DNS 服务商的 API 凭据：
+
+| `acme.dns_provider` | 凭据 |
+|---|---|
+| `cloudflare` | 对该 zone 具有 `Zone.DNS:Write` 权限的 API token |
+| `hostinger` | 在 hPanel 的 **API** 页面生成的 API token |
+
+Hostinger 的 token 在创建时会指定过期日期。请选择远晚于证书有效期的日期，否则几个月后
+续期会以 HTTP 401 失败。新增其他服务商只需一个 import 加上
 `internal/server/tls/dns.go` 中的一条注册项。
 
 ### Docker
