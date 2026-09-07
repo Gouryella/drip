@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -50,13 +51,17 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request, tconn 
 		http.Error(w, "Failed to hijack connection", http.StatusInternalServerError)
 		return
 	}
+	defer stream.Close()
+	defer clientConn.Close()
+	defer tconn.DecActiveConnections()
+
+	_ = clientConn.SetDeadline(time.Time{})
+	_ = stream.SetWriteDeadline(time.Now().Add(defaultForwardWriteTimeout))
 
 	if err := r.Write(stream); err != nil {
-		_ = stream.Close()
-		_ = clientConn.Close()
-		tconn.DecActiveConnections()
 		return
 	}
+	_ = stream.SetWriteDeadline(time.Time{})
 
 	var limitedStream net.Conn = stream
 	if limiter := tconn.GetLimiter(); limiter != nil && limiter.IsLimited() {
@@ -65,24 +70,27 @@ func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request, tconn 
 		}
 	}
 
-	go func() {
-		defer stream.Close()
-		defer clientConn.Close()
-		defer tconn.DecActiveConnections()
-
-		var clientRW io.ReadWriteCloser = clientConn
-		if clientBuf != nil && clientBuf.Reader.Buffered() > 0 {
-			clientRW = &bufferedReadWriteCloser{
-				Reader: clientBuf.Reader,
-				Conn:   clientConn,
-			}
+	var clientRW io.ReadWriteCloser = clientConn
+	if clientBuf != nil && clientBuf.Reader.Buffered() > 0 {
+		clientRW = &bufferedReadWriteCloser{
+			Reader: clientBuf.Reader,
+			Conn:   clientConn,
 		}
+	}
 
-		_ = netutil.PipeWithCallbacks(r.Context(), limitedStream, clientRW,
-			func(n int64) { tconn.AddBytesOut(n) },
-			func(n int64) { tconn.AddBytesIn(n) },
-		)
-	}()
+	var bytesOut atomic.Int64
+	var bytesIn atomic.Int64
+	err = netutil.PipeWithCallbacks(r.Context(), limitedStream, clientRW,
+		func(n int64) {
+			bytesOut.Add(n)
+			tconn.AddBytesOut(n)
+		},
+		func(n int64) {
+			bytesIn.Add(n)
+			tconn.AddBytesIn(n)
+		},
+	)
+	h.recordProxyTransferResult(r.Context(), proxyTransferWebSocket, bytesOut.Load()+bytesIn.Load(), err)
 }
 
 func (h *Handler) handleTunnelWebSocket(w http.ResponseWriter, r *http.Request) {
@@ -95,6 +103,12 @@ func (h *Handler) handleTunnelWebSocket(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "WebSocket tunnel not configured", http.StatusServiceUnavailable)
 		return
 	}
+	if authenticator, ok := h.wsConnHandler.(interface{ AuthenticateWebSocket(string) bool }); ok {
+		if !authenticator.AuthenticateWebSocket(extractBearerToken(r.Header.Get("Authorization"))) {
+			h.serveBearerAuthRequired(w, "drip")
+			return
+		}
+	}
 
 	ws, err := h.wsUpgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -104,7 +118,7 @@ func (h *Handler) handleTunnelWebSocket(w http.ResponseWriter, r *http.Request) 
 
 	ws.SetReadLimit(protocol.MaxFrameSize + protocol.FrameHeaderSize + 1024)
 
-	remoteAddr := netutil.ExtractClientIP(r)
+	remoteAddr := netutil.ExtractClientIPWithTrustedProxies(r, h.trustedProxies)
 
 	h.logger.Info("WebSocket tunnel connection established",
 		zap.String("remote_addr", remoteAddr),

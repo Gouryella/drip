@@ -1,9 +1,9 @@
 package proxy
 
 import (
+	"container/list"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
 	"html"
@@ -14,6 +14,7 @@ import (
 
 	"drip/internal/server/tunnel"
 	"drip/internal/shared/protocol"
+	"drip/internal/shared/utils"
 )
 
 const authCookieName = "drip_auth"
@@ -28,14 +29,18 @@ const (
 )
 
 type authSession struct {
-	subdomain string
-	expiresAt time.Time
+	subdomain     string
+	authID        string
+	expiresAt     time.Time
+	token         string
+	expiryElement *list.Element
 }
 
 type authSessionStore struct {
-	mu       sync.RWMutex
-	sessions map[string]*authSession
-	stopCh   chan struct{}
+	mu          sync.RWMutex
+	sessions    map[string]*authSession
+	stopCh      chan struct{}
+	expiryOrder list.List
 }
 
 type authRateLimitEntry struct {
@@ -48,6 +53,13 @@ type authRateLimiter struct {
 	mu      sync.RWMutex
 	entries map[string]*authRateLimitEntry
 	stopCh  chan struct{}
+}
+
+func authRateLimitKey(clientIP, subdomain string) string {
+	if clientIP == "" {
+		return ""
+	}
+	return subdomain + "\x00" + clientIP
 }
 
 var authLimiter = &authRateLimiter{
@@ -101,9 +113,34 @@ func (s *authSessionStore) cleanup() {
 }
 
 func (s *authSessionStore) cleanupExpiredLocked(now time.Time) {
-	for token, session := range s.sessions {
-		if now.After(session.expiresAt) {
-			delete(s.sessions, token)
+	for entry := s.expiryOrder.Front(); entry != nil; entry = s.expiryOrder.Front() {
+		session := entry.Value.(*authSession)
+		if !now.After(session.expiresAt) {
+			return
+		}
+		s.removeSessionLocked(session.token)
+	}
+}
+
+// All sessions have a fixed TTL, assigned under mu, and validation does not
+// renew it. Insertion order is therefore expiration order: each session is
+// appended and unlinked once, giving amortized O(1) creation and expiration.
+func (s *authSessionStore) addSessionLocked(token string, session *authSession) {
+	if s.sessions == nil {
+		s.sessions = make(map[string]*authSession)
+	}
+	s.removeSessionLocked(token)
+	session.token = token
+	session.expiryElement = s.expiryOrder.PushBack(session)
+	s.sessions[token] = session
+}
+
+func (s *authSessionStore) removeSessionLocked(token string) {
+	if session, ok := s.sessions[token]; ok {
+		delete(s.sessions, token)
+		if session.expiryElement != nil {
+			s.expiryOrder.Remove(session.expiryElement)
+			session.expiryElement = nil
 		}
 	}
 }
@@ -195,40 +232,35 @@ func (rl *authRateLimiter) cleanup() {
 	}
 }
 
-func (s *authSessionStore) create(subdomain string) string {
-	now := time.Now()
+func (s *authSessionStore) create(subdomain string, authID ...string) string {
 	token := generateSessionToken()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now := time.Now()
 
 	s.cleanupExpiredLocked(now)
 
 	// Enforce session limit to prevent unbounded memory growth
 	if len(s.sessions) >= maxAuthSessions {
-		var oldestToken string
-		var oldestExpiry time.Time
-		found := false
-		for t, sess := range s.sessions {
-			if !found || sess.expiresAt.Before(oldestExpiry) {
-				oldestToken = t
-				oldestExpiry = sess.expiresAt
-				found = true
-			}
-		}
-		if !found {
+		oldest := s.expiryOrder.Front()
+		if oldest == nil {
 			return ""
 		}
-		delete(s.sessions, oldestToken)
+		s.removeSessionLocked(oldest.Value.(*authSession).token)
 	}
 
-	s.sessions[token] = &authSession{
+	session := &authSession{
 		subdomain: subdomain,
 		expiresAt: now.Add(authSessionDuration),
 	}
+	if len(authID) > 0 {
+		session.authID = authID[0]
+	}
+	s.addSessionLocked(token, session)
 	return token
 }
 
-func (s *authSessionStore) validate(token, subdomain string) bool {
+func (s *authSessionStore) validate(token, subdomain string, authID ...string) bool {
 	// Fast path: read lock for the common case
 	s.mu.RLock()
 	session, ok := s.sessions[token]
@@ -238,6 +270,7 @@ func (s *authSessionStore) validate(token, subdomain string) bool {
 	}
 	expiresAt := session.expiresAt
 	sd := session.subdomain
+	id := session.authID
 	s.mu.RUnlock()
 
 	if time.Now().After(expiresAt) {
@@ -245,12 +278,12 @@ func (s *authSessionStore) validate(token, subdomain string) bool {
 		s.mu.Lock()
 		// Re-check under write lock (another goroutine may have deleted it)
 		if sess, stillExists := s.sessions[token]; stillExists && time.Now().After(sess.expiresAt) {
-			delete(s.sessions, token)
+			s.removeSessionLocked(token)
 		}
 		s.mu.Unlock()
 		return false
 	}
-	return sd == subdomain
+	return sd == subdomain && (len(authID) == 0 || id == authID[0])
 }
 
 func generateSessionToken() string {
@@ -274,12 +307,19 @@ func isBearerProxyAuth(auth *protocol.ProxyAuth) bool {
 	return auth.Token != ""
 }
 
+func proxyAuthType(auth *protocol.ProxyAuth) string {
+	if isBearerProxyAuth(auth) {
+		return proxyAuthTypeBearer
+	}
+	return proxyAuthTypePassword
+}
+
 func extractBearerToken(header string) string {
 	if header == "" {
 		return ""
 	}
 	parts := strings.Fields(header)
-	if len(parts) < 2 {
+	if len(parts) != 2 {
 		return ""
 	}
 	if !strings.EqualFold(parts[0], "Bearer") {
@@ -288,20 +328,23 @@ func extractBearerToken(header string) string {
 	return parts[1]
 }
 
-func (h *Handler) isProxyAuthenticated(r *http.Request, subdomain string) bool {
+func (h *Handler) isProxyAuthenticated(r *http.Request, subdomain string, tconn *tunnel.Connection) bool {
 	cookie, err := r.Cookie(authCookieName + "_" + subdomain)
 	if err != nil {
 		return false
 	}
-	return sessionStore.validate(cookie.Value, subdomain)
+	return sessionStore.validate(cookie.Value, subdomain, tconn.ProxyAuthID())
 }
 
-func (h *Handler) isBearerAuthenticated(r *http.Request, auth *protocol.ProxyAuth) bool {
+func (h *Handler) checkBearerAuthenticated(r *http.Request, auth *protocol.ProxyAuth) (bool, string) {
 	token := extractBearerToken(r.Header.Get("Authorization"))
 	if token == "" {
-		return false
+		return false, proxyAuthReasonMissingToken
 	}
-	return subtle.ConstantTimeCompare([]byte(token), []byte(auth.Token)) == 1
+	if !utils.ConstantTimeEqualString(token, auth.Token) {
+		return false, proxyAuthReasonInvalidToken
+	}
+	return true, ""
 }
 
 func (h *Handler) serveBearerAuthRequired(w http.ResponseWriter, realm string) {
@@ -314,37 +357,42 @@ func (h *Handler) serveBearerAuthRequired(w http.ResponseWriter, realm string) {
 }
 
 func (h *Handler) handleProxyLoginWithRateLimit(w http.ResponseWriter, r *http.Request, tconn *tunnel.Connection, subdomain string, clientIP string) {
+	rateLimitKey := authRateLimitKey(clientIP, subdomain)
 	if r.Method != http.MethodPost {
 		h.serveLoginPage(w, r, subdomain, "")
 		return
 	}
 
-	if clientIP != "" && authLimiter.isRateLimited(clientIP) {
+	if clientIP != "" && authLimiter.isRateLimited(rateLimitKey) {
+		h.recordProxyAuthLockout(r, proxyAuthTypePassword, subdomain, clientIP)
 		w.Header().Set("Retry-After", "60")
 		http.Error(w, "Too many failed authentication attempts. Please try again later.", http.StatusTooManyRequests)
 		return
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
 	if err := r.ParseForm(); err != nil {
 		h.serveLoginPage(w, r, subdomain, "Invalid form data")
 		return
 	}
 
 	password := r.FormValue("password")
+	authID := tconn.ProxyAuthID()
 
 	if !tconn.ValidateProxyAuth(password) {
 		if clientIP != "" {
-			authLimiter.recordFailure(clientIP)
+			authLimiter.recordFailure(rateLimitKey)
 		}
+		h.recordProxyAuthFailure(r, proxyAuthTypePassword, proxyAuthReasonInvalidPassword, subdomain, clientIP)
 		h.serveLoginPage(w, r, subdomain, "Invalid password")
 		return
 	}
 
 	if clientIP != "" {
-		authLimiter.resetFailures(clientIP)
+		authLimiter.resetFailures(rateLimitKey)
 	}
 
-	token := sessionStore.create(subdomain)
+	token := sessionStore.create(subdomain, authID)
 	if token == "" {
 		http.Error(w, "Too many sessions, try again later", http.StatusServiceUnavailable)
 		return
