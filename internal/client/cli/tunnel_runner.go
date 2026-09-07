@@ -1,7 +1,10 @@
 package cli
 
 import (
+	crand "crypto/rand"
+	"errors"
 	"fmt"
+	"math/big"
 	"os"
 	"os/signal"
 	"strings"
@@ -17,9 +20,20 @@ import (
 )
 
 const (
-	maxReconnectAttempts = 5
-	reconnectInterval    = 3 * time.Second
+	maxReconnectAttempts     = 5
+	reconnectBaseInterval    = 1 * time.Second
+	reconnectMaxInterval     = 30 * time.Second
+	reconnectStableResetTime = 30 * time.Second
 )
+
+var (
+	newTunnelClient   = tcp.NewTunnelClient
+	nextReconnectWait = defaultReconnectWait
+	reconnectTimer    = time.After
+	tunnelRunnerNow   = time.Now
+)
+
+var errTunnelDisconnected = errors.New("connection lost")
 
 func runTunnelWithUI(connConfig *tcp.ConnectorConfig, daemonInfo *DaemonInfo) error {
 	tuning.ApplyMode(tuning.ModeClient)
@@ -33,14 +47,29 @@ func runTunnelWithUI(connConfig *tcp.ConnectorConfig, daemonInfo *DaemonInfo) er
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(quit)
 
 	reconnectAttempts := 0
+	reconnectingAfterDisconnect := false
+	var lastErr error
 	for {
-		connector := tcp.NewTunnelClient(connConfig, logger)
+		connector := newTunnelClient(connConfig, logger)
 
 		fmt.Println(ui.RenderConnecting(connConfig.ServerAddr, reconnectAttempts, maxReconnectAttempts))
 
-		if err := connector.Connect(); err != nil {
+		connectDone := make(chan error, 1)
+		go func() { connectDone <- connector.Connect() }()
+		var connectErr error
+		select {
+		case connectErr = <-connectDone:
+		case <-quit:
+			_ = connector.Close()
+			fmt.Println(ui.RenderShuttingDown())
+			return nil
+		}
+		if err := connectErr; err != nil {
+			_ = connector.Close()
+			lastErr = err
 			if isConfigurationError(err) {
 				fmt.Println(ui.Warning(fmt.Sprintf("Configuration error: %v", err)))
 				return fmt.Errorf("configuration error: %w", err)
@@ -52,21 +81,25 @@ func runTunnelWithUI(connConfig *tcp.ConnectorConfig, daemonInfo *DaemonInfo) er
 
 			reconnectAttempts++
 			if reconnectAttempts >= maxReconnectAttempts {
-				return fmt.Errorf("failed to connect after %d attempts: %w", maxReconnectAttempts, err)
+				return fmt.Errorf("failed to connect after %d attempts: %w", maxReconnectAttempts, lastErr)
 			}
+			wait := nextReconnectWait(reconnectAttempts)
 			fmt.Println(ui.RenderConnectionFailed(err))
-			fmt.Println(ui.RenderRetrying(reconnectInterval))
+			fmt.Println(ui.RenderRetrying(wait))
 
 			select {
 			case <-quit:
 				fmt.Println(ui.RenderShuttingDown())
 				return nil
-			case <-time.After(reconnectInterval):
+			case <-reconnectTimer(wait):
 				continue
 			}
 		}
 
-		reconnectAttempts = 0
+		if !reconnectingAfterDisconnect {
+			reconnectAttempts = 0
+		}
+		connectedAt := tunnelRunnerNow()
 		if assignedSubdomain := connector.GetSubdomain(); assignedSubdomain != "" {
 			connConfig.Subdomain = assignedSubdomain
 			if daemonInfo != nil {
@@ -192,21 +225,64 @@ func runTunnelWithUI(connConfig *tcp.ConnectorConfig, daemonInfo *DaemonInfo) er
 			close(stopDisplay)
 			fmt.Println()
 			fmt.Println(ui.RenderConnectionLost())
-			reconnectAttempts++
-			if reconnectAttempts >= maxReconnectAttempts {
-				return fmt.Errorf("connection lost after %d reconnect attempts", maxReconnectAttempts)
+			if tunnelRunnerNow().Sub(connectedAt) >= reconnectStableResetTime {
+				reconnectAttempts = 0
 			}
-			fmt.Println(ui.RenderRetrying(reconnectInterval))
+			lastErr = errTunnelDisconnected
+			reconnectAttempts++
+			reconnectingAfterDisconnect = true
+			if reconnectAttempts >= maxReconnectAttempts {
+				return fmt.Errorf("connection lost after %d reconnect attempts: %w", maxReconnectAttempts, lastErr)
+			}
+			wait := nextReconnectWait(reconnectAttempts)
+			fmt.Println(ui.RenderRetrying(wait))
 
 			select {
 			case <-quit:
 				fmt.Println(ui.RenderShuttingDown())
 				return nil
-			case <-time.After(reconnectInterval):
+			case <-reconnectTimer(wait):
 				continue
 			}
 		}
 	}
+}
+
+func defaultReconnectWait(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+
+	wait := reconnectBaseInterval
+	for i := 1; i < attempt; i++ {
+		if wait >= reconnectMaxInterval {
+			wait = reconnectMaxInterval
+			break
+		}
+		wait *= 2
+		if wait > reconnectMaxInterval {
+			wait = reconnectMaxInterval
+			break
+		}
+	}
+
+	jitterRange := wait / 2
+	if jitterRange <= 0 {
+		return wait
+	}
+	return wait/2 + randomDuration(jitterRange)
+}
+
+func randomDuration(maxInclusive time.Duration) time.Duration {
+	if maxInclusive <= 0 {
+		return 0
+	}
+
+	n, err := crand.Int(crand.Reader, big.NewInt(int64(maxInclusive)+1))
+	if err != nil {
+		return maxInclusive / 2
+	}
+	return time.Duration(n.Int64())
 }
 
 func clearLines(lines int) string {
