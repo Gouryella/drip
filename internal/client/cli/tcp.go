@@ -59,6 +59,8 @@ func init() {
 	tcpCmd.Flags().BoolVar(&skipLocalTLSVerify, "skip-local-tls-verify", false, "Ignored for TCP tunnels; kept for daemon argument compatibility")
 	tcpCmd.Flags().BoolVar(&daemonMarker, "daemon-child", false, "Internal flag for daemon child process")
 	_ = tcpCmd.Flags().MarkHidden("daemon-child")
+	tcpCmd.Flags().StringVar(&daemonSecretFile, daemonSecretFileFlagName, "", "Internal daemon secret file")
+	_ = tcpCmd.Flags().MarkHidden(daemonSecretFileFlagName)
 	rootCmd.AddCommand(tcpCmd)
 }
 
@@ -68,8 +70,20 @@ func runTCP(_ *cobra.Command, args []string) error {
 		return fmt.Errorf("invalid port number: %s", args[0])
 	}
 
+	if err := validateIPAccessFlags(); err != nil {
+		return err
+	}
+
 	if daemonMode && !daemonMarker {
-		return StartDaemon("tcp", port, buildDaemonArgs("tcp", args, subdomain, localAddress))
+		daemonArgs, err := buildDaemonArgs("tcp", args, subdomain, localAddress)
+		if err != nil {
+			return err
+		}
+		return StartDaemon("tcp", port, daemonArgs)
+	}
+
+	if err := applyDaemonSecretFile(); err != nil {
+		return err
 	}
 
 	serverAddr, token, err := resolveServerAddrAndToken("tcp", port)

@@ -59,6 +59,8 @@ func init() {
 	httpsCmd.Flags().BoolVar(&skipLocalTLSVerify, "skip-local-tls-verify", false, "Skip TLS verification for local HTTPS backends")
 	httpsCmd.Flags().BoolVar(&daemonMarker, "daemon-child", false, "Internal flag for daemon child process")
 	_ = httpsCmd.Flags().MarkHidden("daemon-child")
+	httpsCmd.Flags().StringVar(&daemonSecretFile, daemonSecretFileFlagName, "", "Internal daemon secret file")
+	_ = httpsCmd.Flags().MarkHidden(daemonSecretFileFlagName)
 	rootCmd.AddCommand(httpsCmd)
 }
 
@@ -68,8 +70,20 @@ func runHTTPS(_ *cobra.Command, args []string) error {
 		return fmt.Errorf("invalid port number: %s", args[0])
 	}
 
+	if err := validateIPAccessFlags(); err != nil {
+		return err
+	}
+
 	if daemonMode && !daemonMarker {
-		return StartDaemon("https", port, buildDaemonArgs("https", args, subdomain, localAddress))
+		daemonArgs, err := buildDaemonArgs("https", args, subdomain, localAddress)
+		if err != nil {
+			return err
+		}
+		return StartDaemon("https", port, daemonArgs)
+	}
+
+	if err := applyDaemonSecretFile(); err != nil {
+		return err
 	}
 
 	if authPass != "" && authBearer != "" {
