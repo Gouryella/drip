@@ -1,15 +1,26 @@
 package config
 
 import (
+	"bytes"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 
+	"drip/internal/shared/netutil"
 	"gopkg.in/yaml.v3"
+)
+
+const (
+	// DefaultMaxRequestBodyBytes is the public-server default for tunneled
+	// HTTP request bodies. Set max_request_body_bytes to 0 only as an explicit
+	// high-risk opt-in for unlimited uploads.
+	DefaultMaxRequestBodyBytes int64 = 32 << 20
 )
 
 // ServerConfig holds the server configuration
@@ -29,8 +40,10 @@ type ServerConfig struct {
 	TLSKeyFile  string `yaml:"tls_key"`
 
 	// Security
-	AuthToken    string `yaml:"token"`
-	MetricsToken string `yaml:"metrics_token"`
+	AuthToken      string   `yaml:"token"`
+	AllowAnonymous bool     `yaml:"allow_anonymous"`
+	MetricsToken   string   `yaml:"metrics_token"`
+	TrustedProxies []string `yaml:"trusted_proxies"`
 
 	// Logging
 	Debug bool `yaml:"debug"`
@@ -49,8 +62,97 @@ type ServerConfig struct {
 	BurstMultiplier float64 `yaml:"burst_multiplier,omitempty"`
 
 	// Optional HTTP request body limit for tunneled HTTP/HTTPS traffic.
-	// 0 disables the limit and preserves full reverse-proxy behavior.
+	// 0 disables the limit and preserves full reverse-proxy behavior. Omitting
+	// this field uses DefaultMaxRequestBodyBytes.
 	MaxRequestBodyBytes int64 `yaml:"max_request_body_bytes,omitempty"`
+
+	maxRequestBodyBytesSet bool
+}
+
+// MaxRequestBodyBytesExplicit reports whether max_request_body_bytes was set
+// in the loaded YAML. It is used to preserve explicit 0 = unlimited semantics
+// while still applying a safe default when the field is omitted.
+func (c *ServerConfig) MaxRequestBodyBytesExplicit() bool {
+	return c.maxRequestBodyBytesSet
+}
+
+// UnmarshalYAML applies safe defaults before decoding optional fields.
+func (c *ServerConfig) UnmarshalYAML(value *yaml.Node) error {
+	type serverConfigYAML ServerConfig
+
+	if err := validateYAMLMappingKeys(value, serverConfigYAMLKeys); err != nil {
+		return err
+	}
+
+	raw := serverConfigYAML{
+		MaxRequestBodyBytes: DefaultMaxRequestBodyBytes,
+	}
+	if err := value.Decode(&raw); err != nil {
+		return err
+	}
+
+	*c = ServerConfig(raw)
+	c.maxRequestBodyBytesSet = yamlMappingHasKey(value, "max_request_body_bytes")
+	return nil
+}
+
+var serverConfigYAMLKeys = map[string]struct{}{
+	"port":                   {},
+	"public_port":            {},
+	"domain":                 {},
+	"tunnel_domain":          {},
+	"tcp_port_min":           {},
+	"tcp_port_max":           {},
+	"tls_enabled":            {},
+	"tls_cert":               {},
+	"tls_key":                {},
+	"token":                  {},
+	"allow_anonymous":        {},
+	"metrics_token":          {},
+	"trusted_proxies":        {},
+	"debug":                  {},
+	"pprof_port":             {},
+	"transports":             {},
+	"tunnel_types":           {},
+	"bandwidth":              {},
+	"burst_multiplier":       {},
+	"max_request_body_bytes": {},
+}
+
+func validateYAMLMappingKeys(value *yaml.Node, allowed map[string]struct{}) error {
+	if value == nil || value.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(value.Content); i += 2 {
+		key := value.Content[i].Value
+		if _, ok := allowed[key]; !ok {
+			return fmt.Errorf("unknown field %q", key)
+		}
+	}
+	return nil
+}
+
+func yamlMappingHasKey(value *yaml.Node, key string) bool {
+	if value == nil || value.Kind != yaml.MappingNode {
+		return false
+	}
+	for i := 0; i+1 < len(value.Content); i += 2 {
+		if value.Content[i].Value == key {
+			return true
+		}
+	}
+	return false
+}
+
+var placeholderSecrets = map[string]bool{
+	"changeme":          true,
+	"change-me":         true,
+	"default":           true,
+	"password":          true,
+	"secret":            true,
+	"your-secret":       true,
+	"your-secret-token": true,
+	"your-token":        true,
 }
 
 // Validate checks if the server configuration is valid
@@ -99,8 +201,22 @@ func (c *ServerConfig) Validate() error {
 		}
 	}
 
+	if isPlaceholderSecret(c.AuthToken) {
+		return fmt.Errorf("token uses a placeholder value; set a real secret or set allow_anonymous to true")
+	}
+	if isPlaceholderSecret(c.MetricsToken) {
+		return fmt.Errorf("metrics_token uses a placeholder value; set a real secret or leave it empty")
+	}
+	if !c.AllowAnonymous && strings.TrimSpace(c.AuthToken) == "" {
+		return fmt.Errorf("token is required unless allow_anonymous is true")
+	}
+
 	if c.MaxRequestBodyBytes < 0 {
 		return fmt.Errorf("max_request_body_bytes must be >= 0")
+	}
+
+	if _, err := netutil.NewTrustedProxySet(c.TrustedProxies); err != nil {
+		return err
 	}
 
 	return nil
@@ -120,8 +236,15 @@ func (c *ServerConfig) LoadTLSConfig() (*tls.Config, error) {
 		return nil, fmt.Errorf("certificate file not found: %s", c.TLSCertFile)
 	}
 
-	if _, err := os.Stat(c.TLSKeyFile); os.IsNotExist(err) {
+	keyInfo, err := os.Stat(c.TLSKeyFile)
+	if os.IsNotExist(err) {
 		return nil, fmt.Errorf("key file not found: %s", c.TLSKeyFile)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to stat key file: %w", err)
+	}
+	if err := checkSensitiveFilePermissions(c.TLSKeyFile, keyInfo, "TLS key file"); err != nil {
+		return nil, err
 	}
 
 	cert, err := tls.LoadX509KeyPair(c.TLSCertFile, c.TLSKeyFile)
@@ -131,11 +254,10 @@ func (c *ServerConfig) LoadTLSConfig() (*tls.Config, error) {
 
 	// Force TLS 1.3 only
 	tlsConfig := &tls.Config{
-		Certificates:             []tls.Certificate{cert},
-		MinVersion:               tls.VersionTLS13,                  // Only TLS 1.3
-		MaxVersion:               tls.VersionTLS13,                  // Only TLS 1.3
-		PreferServerCipherSuites: true,                              // Prefer server cipher suites (ignored in TLS 1.3 but set for consistency)
-		ClientSessionCache:       tls.NewLRUClientSessionCache(128), // Enable session resumption
+		Certificates:       []tls.Certificate{cert},
+		MinVersion:         tls.VersionTLS13,                  // Only TLS 1.3
+		MaxVersion:         tls.VersionTLS13,                  // Only TLS 1.3
+		ClientSessionCache: tls.NewLRUClientSessionCache(128), // Enable session resumption
 		CipherSuites: []uint16{
 			tls.TLS_AES_128_GCM_SHA256,
 			tls.TLS_AES_256_GCM_SHA384,
@@ -149,11 +271,10 @@ func (c *ServerConfig) LoadTLSConfig() (*tls.Config, error) {
 // GetClientTLSConfig returns TLS config for client connections
 func GetClientTLSConfig(serverName string) *tls.Config {
 	return &tls.Config{
-		ServerName:               serverName,
-		MinVersion:               tls.VersionTLS13,
-		MaxVersion:               tls.VersionTLS13,
-		ClientSessionCache:       tls.NewLRUClientSessionCache(0),
-		PreferServerCipherSuites: true,
+		ServerName:         serverName,
+		MinVersion:         tls.VersionTLS13,
+		MaxVersion:         tls.VersionTLS13,
+		ClientSessionCache: tls.NewLRUClientSessionCache(0),
 		CipherSuites: []uint16{
 			tls.TLS_AES_128_GCM_SHA256,
 			tls.TLS_AES_256_GCM_SHA384,
@@ -173,11 +294,10 @@ func GetClientTLSConfigInsecure() *tls.Config {
 			"Only use this for testing or with trusted endpoints.")
 	})
 	return &tls.Config{
-		InsecureSkipVerify:       true, // #nosec G402 -- explicit --insecure/test-only mode; behavior intentionally preserved.
-		MinVersion:               tls.VersionTLS13,
-		MaxVersion:               tls.VersionTLS13,
-		ClientSessionCache:       tls.NewLRUClientSessionCache(0),
-		PreferServerCipherSuites: true,
+		InsecureSkipVerify: true, // #nosec G402 -- explicit --insecure/test-only mode; behavior intentionally preserved.
+		MinVersion:         tls.VersionTLS13,
+		MaxVersion:         tls.VersionTLS13,
+		ClientSessionCache: tls.NewLRUClientSessionCache(0),
 		CipherSuites: []uint16{
 			tls.TLS_AES_128_GCM_SHA256,
 			tls.TLS_AES_256_GCM_SHA384,
@@ -210,6 +330,14 @@ func LoadServerConfig(path string) (*ServerConfig, error) {
 
 	cleanPath := filepath.Clean(path)
 
+	info, err := os.Stat(cleanPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("config file not found at %s", path)
+		}
+		return nil, fmt.Errorf("failed to stat config file: %w", err)
+	}
+
 	data, err := os.ReadFile(cleanPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -219,8 +347,14 @@ func LoadServerConfig(path string) (*ServerConfig, error) {
 	}
 
 	var config ServerConfig
-	if err := yaml.Unmarshal(data, &config); err != nil {
+	if err := decodeYAMLStrict(data, &config); err != nil {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
+	}
+
+	if serverConfigContainsSecrets(&config) {
+		if err := checkSensitiveFilePermissions(cleanPath, info, "config file containing token fields"); err != nil {
+			return nil, err
+		}
 	}
 
 	return &config, nil
@@ -245,7 +379,7 @@ func SaveServerConfig(config *ServerConfig, path string) error {
 		return fmt.Errorf("failed to marshal config: %w", err)
 	}
 
-	if err := os.WriteFile(cleanPath, data, 0600); err != nil {
+	if err := writeConfigFile(cleanPath, data); err != nil {
 		return fmt.Errorf("failed to write config file: %w", err)
 	}
 
@@ -259,4 +393,61 @@ func ServerConfigExists(path string) bool {
 	}
 	_, err := os.Stat(path)
 	return err == nil
+}
+
+func decodeYAMLStrict(data []byte, out interface{}) error {
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
+	err := decoder.Decode(out)
+	if err == io.EOF {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var extra interface{}
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("configuration must contain exactly one YAML document")
+	}
+	return nil
+}
+
+func checkSensitiveFilePermissions(path string, info os.FileInfo, description string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+
+	perm := info.Mode().Perm()
+	if isDockerSecretPath(path) && perm&0333 == 0 {
+		return nil
+	}
+
+	if perm&^0640 != 0 {
+		return fmt.Errorf("%s %s has overly broad permissions %04o; use 0600 or 0640 with a trusted service group", description, path, perm)
+	}
+
+	if perm&0040 != 0 {
+		gid, ok := fileGID(info)
+		if !ok || !processInGroup(gid) {
+			return fmt.Errorf("%s %s is group-readable by gid %d, which is not one of this process's groups; use 0600 or chgrp to the service group", description, path, gid)
+		}
+	}
+
+	return nil
+}
+
+func isDockerSecretPath(path string) bool {
+	clean := filepath.Clean(path)
+	return clean == "/run/secrets" || strings.HasPrefix(clean, "/run/secrets/")
+}
+
+func serverConfigContainsSecrets(config *ServerConfig) bool {
+	return config.AuthToken != "" || config.MetricsToken != ""
+}
+
+func isPlaceholderSecret(value string) bool {
+	return placeholderSecrets[strings.ToLower(strings.TrimSpace(value))]
 }
