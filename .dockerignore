@@ -1,5 +1,6 @@
 # Git
 .git
+.worktrees/
 .gitignore
 .gitattributes
 
@@ -9,6 +10,7 @@ docs/
 LICENSE
 
 # Build artifacts
+/drip
 bin/
 dist/
 *.exe
@@ -61,6 +63,8 @@ vendor/
 .travis.yml
 
 # Development tools
+.claude/
+benchmark-results/
 Makefile
 scripts/
 

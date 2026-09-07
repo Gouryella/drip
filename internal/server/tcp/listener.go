@@ -3,6 +3,7 @@ package tcp
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -23,43 +24,48 @@ import (
 )
 
 type ListenerConfig struct {
-	Address      string
-	TLSConfig    *tls.Config
-	AuthToken    string
-	Manager      *tunnel.Manager
-	Logger       *zap.Logger
-	PortAlloc    *PortAllocator
-	Domain       string
-	TunnelDomain string
-	PublicPort   int
-	HTTPHandler  http.Handler
+	Address        string
+	TLSConfig      *tls.Config
+	AuthToken      string
+	AllowAnonymous bool
+	Manager        *tunnel.Manager
+	Logger         *zap.Logger
+	PortAlloc      *PortAllocator
+	Domain         string
+	TunnelDomain   string
+	PublicPort     int
+	HTTPHandler    http.Handler
+	MaxDataConns   int
 }
 
 type Listener struct {
-	address      string
-	tlsConfig    *tls.Config
-	authToken    string
-	manager      *tunnel.Manager
-	portAlloc    *PortAllocator
-	logger       *zap.Logger
-	domain       string
-	tunnelDomain string
-	publicPort   int
-	httpHandler  http.Handler
-	listener     net.Listener
-	stopCh       chan struct{}
-	stopOnce     sync.Once
-	wg           sync.WaitGroup
-	connections  sync.Map // map[string]*Connection, sync.Map for better concurrent read performance
-	connCount    atomic.Int64
-	connIDSeq    atomic.Int64  // unique connection ID sequence
-	connSem      chan struct{} // semaphore to limit max connections
-	workerPool   *pool.WorkerPool
-	recoverer    *recovery.Recoverer
-	panicMetrics *recovery.PanicMetrics
-	groupManager *ConnectionGroupManager
-	httpServer   *http.Server
-	httpListener *connQueueListener
+	address        string
+	tlsConfig      *tls.Config
+	authToken      string
+	allowAnonymous bool
+	manager        *tunnel.Manager
+	portAlloc      *PortAllocator
+	logger         *zap.Logger
+	domain         string
+	tunnelDomain   string
+	publicPort     int
+	httpHandler    http.Handler
+	listener       net.Listener
+	stopCh         chan struct{}
+	stopOnce       sync.Once
+	wg             sync.WaitGroup
+	connections    sync.Map // map[string]*Connection, sync.Map for better concurrent read performance
+	pendingConns   sync.Map // net.Conn -> struct{}, includes queued TLS handshakes
+	admissionMu    sync.Mutex
+	connCount      atomic.Int64
+	connIDSeq      atomic.Int64  // unique connection ID sequence
+	connSem        chan struct{} // semaphore to limit max connections
+	workerPool     *pool.WorkerPool
+	recoverer      *recovery.Recoverer
+	panicMetrics   *recovery.PanicMetrics
+	groupManager   *ConnectionGroupManager
+	httpServer     *http.Server
+	httpListener   *connQueueListener
 
 	// Server capabilities
 	allowedTransports  []string
@@ -89,22 +95,23 @@ func NewListener(cfg ListenerConfig) *Listener {
 	metrics.WorkerPoolSize.Set(float64(workers))
 
 	l := &Listener{
-		address:      cfg.Address,
-		tlsConfig:    cfg.TLSConfig,
-		authToken:    cfg.AuthToken,
-		manager:      cfg.Manager,
-		portAlloc:    cfg.PortAlloc,
-		logger:       cfg.Logger,
-		domain:       cfg.Domain,
-		tunnelDomain: cfg.TunnelDomain,
-		publicPort:   cfg.PublicPort,
-		httpHandler:  cfg.HTTPHandler,
-		stopCh:       make(chan struct{}),
-		connSem:      make(chan struct{}, maxConns),
-		workerPool:   workerPool,
-		recoverer:    recoverer,
-		panicMetrics: panicMetrics,
-		groupManager: NewConnectionGroupManager(cfg.Logger),
+		address:        cfg.Address,
+		tlsConfig:      cfg.TLSConfig,
+		authToken:      cfg.AuthToken,
+		allowAnonymous: cfg.AllowAnonymous,
+		manager:        cfg.Manager,
+		portAlloc:      cfg.PortAlloc,
+		logger:         cfg.Logger,
+		domain:         cfg.Domain,
+		tunnelDomain:   cfg.TunnelDomain,
+		publicPort:     cfg.PublicPort,
+		httpHandler:    cfg.HTTPHandler,
+		stopCh:         make(chan struct{}),
+		connSem:        make(chan struct{}, maxConns),
+		workerPool:     workerPool,
+		recoverer:      recoverer,
+		panicMetrics:   panicMetrics,
+		groupManager:   NewConnectionGroupManagerWithMaxDataConns(cfg.Logger, cfg.MaxDataConns),
 	}
 
 	// Set up WebSocket connection handler if httpHandler supports it
@@ -121,7 +128,9 @@ func (l *Listener) Start() error {
 
 	// Support both TLS and plain TCP modes
 	if l.tlsConfig != nil {
-		l.listener, err = tls.Listen("tcp", l.address, l.tlsConfig)
+		tlsConfig := l.tlsConfig.Clone()
+		tlsConfig.NextProtos = append([]string{"h2", "http/1.1"}, tlsConfig.NextProtos...)
+		l.listener, err = tls.Listen("tcp", l.address, tlsConfig)
 		if err != nil {
 			return fmt.Errorf("failed to start TLS listener: %w", err)
 		}
@@ -140,9 +149,19 @@ func (l *Listener) Start() error {
 	}
 
 	l.httpListener = newConnQueueListener(l.listener.Addr(), 4096)
+	httpHandler := l.httpHandler
+	if httpHandler == nil {
+		httpHandler = http.NotFoundHandler()
+	}
 
 	l.httpServer = &http.Server{
-		Handler:           l.httpHandler,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.TLS == nil {
+				r.TLS, _ = r.Context().Value(httpTLSStateKey{}).(*tls.ConnectionState)
+			}
+			httpHandler.ServeHTTP(w, r)
+		}),
+		ConnContext:       httpConnectionContext,
 		ReadHeaderTimeout: 10 * time.Second,  // Time to read request headers
 		ReadTimeout:       30 * time.Second,  // Total time to read request (prevents slow-loris)
 		WriteTimeout:      60 * time.Second,  // Time to write response (allows large responses)
@@ -174,9 +193,23 @@ func (l *Listener) Start() error {
 	return nil
 }
 
+type httpTLSStateKey struct{}
+
+func httpConnectionContext(ctx context.Context, conn net.Conn) context.Context {
+	if buffered, ok := conn.(*bufferedConn); ok {
+		conn = buffered.Conn
+	}
+	if tlsConn, ok := conn.(*tls.Conn); ok {
+		state := tlsConn.ConnectionState()
+		return context.WithValue(ctx, httpTLSStateKey{}, &state)
+	}
+	return ctx
+}
+
 func (l *Listener) acceptLoop() {
 	defer l.wg.Done()
 	defer l.recoverer.Recover("acceptLoop")
+	retryDelay := 5 * time.Millisecond
 
 	for {
 		select {
@@ -191,6 +224,9 @@ func (l *Listener) acceptLoop() {
 
 		conn, err := l.listener.Accept()
 		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				continue
 			}
@@ -199,14 +235,32 @@ func (l *Listener) acceptLoop() {
 				return
 			default:
 				l.logger.Error("Failed to accept connection", zap.Error(err))
-				continue
 			}
+			timer := time.NewTimer(retryDelay)
+			select {
+			case <-l.stopCh:
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			retryDelay = min(retryDelay*2, time.Second)
+			continue
 		}
+		retryDelay = 5 * time.Millisecond
 
-		// Check connection limit
+		l.admissionMu.Lock()
+		select {
+		case <-l.stopCh:
+			l.admissionMu.Unlock()
+			_ = conn.Close()
+			return
+		default:
+		}
+		// Check connection limit before adding work that Stop must wait for.
 		select {
 		case l.connSem <- struct{}{}:
 		default:
+			l.admissionMu.Unlock()
 			l.logger.Warn("Connection limit reached, rejecting connection",
 				zap.String("remote_addr", conn.RemoteAddr().String()),
 				zap.Int64("max_conns", maxConns),
@@ -216,6 +270,8 @@ func (l *Listener) acceptLoop() {
 		}
 
 		l.wg.Add(1)
+		l.pendingConns.Store(conn, struct{}{})
+		l.admissionMu.Unlock()
 		connAddr := conn.RemoteAddr().String()
 		submitted := l.workerPool.Submit(l.recoverer.WrapGoroutine(
 			fmt.Sprintf("handleConnection-%s", connAddr),
@@ -229,6 +285,7 @@ func (l *Listener) acceptLoop() {
 				zap.String("remote_addr", connAddr),
 			)
 			l.wg.Done()
+			l.pendingConns.Delete(conn)
 			_ = conn.Close()
 			<-l.connSem
 		}
@@ -236,8 +293,7 @@ func (l *Listener) acceptLoop() {
 }
 
 func (l *Listener) handleConnection(netConn net.Conn) {
-	defer l.wg.Done()
-	defer func() { <-l.connSem }() // release connection slot
+	serving := false
 	remoteAddr := netConn.RemoteAddr().String()
 	connID := fmt.Sprintf("%s#%d", remoteAddr, l.connIDSeq.Add(1))
 	defer l.recoverer.Recover("handleConnection")
@@ -247,11 +303,16 @@ func (l *Listener) handleConnection(netConn net.Conn) {
 		if !cleanupRegistered {
 			_ = netConn.Close()
 		}
+		if !serving {
+			l.pendingConns.Delete(netConn)
+			<-l.connSem
+			l.wg.Done()
+		}
 	}()
 
 	// Handle TLS connections
 	if tlsConn, ok := netConn.(*tls.Conn); ok {
-		if err := tlsConn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		if err := tlsConn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
 			l.logger.Warn("Failed to set read deadline",
 				zap.String("remote_addr", remoteAddr),
 				zap.Error(err),
@@ -267,7 +328,7 @@ func (l *Listener) handleConnection(netConn net.Conn) {
 			return
 		}
 
-		if err := tlsConn.SetReadDeadline(time.Time{}); err != nil {
+		if err := tlsConn.SetDeadline(time.Time{}); err != nil {
 			l.logger.Warn("Failed to clear read deadline",
 				zap.String("remote_addr", remoteAddr),
 				zap.Error(err),
@@ -296,6 +357,14 @@ func (l *Listener) handleConnection(netConn net.Conn) {
 			)
 			return
 		}
+		// Preserve the concrete *tls.Conn for net/http's ALPN handling.
+		// Reading the HTTP/2 preface as a Drip frame rejects valid h2 clients.
+		if state.NegotiatedProtocol == "h2" || state.NegotiatedProtocol == "http/1.1" {
+			if l.httpListener != nil && l.httpListener.Enqueue(tlsConn) {
+				cleanupRegistered = true
+			}
+			return
+		}
 	} else {
 		// Handle plain TCP connections (reverse proxy mode)
 		if tcpConn, ok := netConn.(*net.TCPConn); ok {
@@ -311,35 +380,68 @@ func (l *Listener) handleConnection(netConn net.Conn) {
 		)
 	}
 
-	remoteIP := netutil.ExtractIP(remoteAddr)
-	if netutil.IsPrivateIP(remoteIP) {
-		remoteIP = ""
-	}
-
 	conn := NewConnection(ConnectionConfig{
-		Conn:         netConn,
-		AuthToken:    l.authToken,
-		Manager:      l.manager,
-		Logger:       l.logger,
-		PortAlloc:    l.portAlloc,
-		Domain:       l.domain,
-		TunnelDomain: l.tunnelDomain,
-		PublicPort:   l.publicPort,
-		HTTPHandler:  l.httpHandler,
-		GroupManager: l.groupManager,
-		HTTPListener: l.httpListener,
-		RemoteIP:     remoteIP,
+		Conn:           netConn,
+		AuthToken:      l.authToken,
+		AllowAnonymous: l.allowAnonymous,
+		Manager:        l.manager,
+		Logger:         l.logger,
+		PortAlloc:      l.portAlloc,
+		Domain:         l.domain,
+		TunnelDomain:   l.tunnelDomain,
+		PublicPort:     l.publicPort,
+		HTTPHandler:    l.httpHandler,
+		GroupManager:   l.groupManager,
+		HTTPListener:   l.httpListener,
+		RemoteIP:       netutil.ExtractIP(remoteAddr),
 	})
 	conn.SetAllowedTunnelTypes(l.allowedTunnelTypes)
 	conn.SetAllowedTransports(l.allowedTransports)
 	conn.SetBandwidthConfig(l.bandwidth, l.burstMultiplier)
 
+	l.admissionMu.Lock()
+	select {
+	case <-l.stopCh:
+		l.admissionMu.Unlock()
+		return
+	default:
+	}
 	l.connections.Store(connID, conn)
+	l.pendingConns.Delete(netConn)
 	l.connCount.Add(1)
 
 	// Update connection metrics
 	metrics.TotalConnections.Inc()
 	metrics.ActiveConnections.Inc()
+	l.admissionMu.Unlock()
+	cleanupRegistered = true
+	serving = true
+	// Workers bound handshakes. Established tunnels may live for hours and
+	// must not prevent other tunnels or HTTP requests from being accepted.
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		l.serveConnection(connID, netConn, conn)
+	}()
+	// Keep unauthenticated protocol payloads bounded by the worker count too.
+	// The slot is released once registration finishes, before the long-lived
+	// session starts waiting for traffic.
+	select {
+	case <-conn.readyCh:
+	case <-finished:
+	case <-l.stopCh:
+	}
+}
+
+func (l *Listener) AuthenticateWebSocket(token string) bool {
+	return isAuthTokenAccepted(token, l.authToken, l.allowAnonymous)
+}
+
+func (l *Listener) serveConnection(connID string, netConn net.Conn, conn *Connection) {
+	defer l.wg.Done()
+	defer func() { <-l.connSem }()
+	defer l.recoverer.Recover("serveConnection")
+	remoteAddr := netConn.RemoteAddr().String()
 
 	defer func() {
 		l.connections.Delete(connID)
@@ -351,8 +453,6 @@ func (l *Listener) handleConnection(netConn net.Conn) {
 			_ = netConn.Close()
 		}
 	}()
-	cleanupRegistered = true
-
 	if err := conn.Handle(); err != nil {
 		errStr := err.Error()
 
@@ -378,25 +478,29 @@ func (l *Listener) Stop() error {
 	l.stopOnce.Do(func() {
 		l.logger.Info("Stopping TCP listener")
 
+		l.admissionMu.Lock()
 		close(l.stopCh)
+		l.admissionMu.Unlock()
+		if l.listener != nil {
+			_ = l.listener.Close()
+		}
+		l.pendingConns.Range(func(key, value interface{}) bool {
+			_ = key.(net.Conn).Close()
+			return true
+		})
 
 		if l.httpServer != nil {
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			if err := l.httpServer.Shutdown(shutdownCtx); err != nil {
 				l.logger.Warn("HTTP server shutdown error", zap.Error(err))
+				_ = l.httpServer.Close()
 			}
 			l.logger.Info("HTTP server shutdown complete")
 		}
 
 		if l.httpListener != nil {
 			_ = l.httpListener.Close()
-		}
-
-		if l.listener != nil {
-			if err := l.listener.Close(); err != nil {
-				l.logger.Error("Failed to close listener", zap.Error(err))
-			}
 		}
 
 		l.connections.Range(func(key, value interface{}) bool {
@@ -426,10 +530,19 @@ func (l *Listener) GetActiveConnections() int {
 
 // HandleWSConnection implements proxy.WSConnectionHandler for WebSocket tunnel connections
 func (l *Listener) HandleWSConnection(conn net.Conn, remoteAddr string) {
+	l.admissionMu.Lock()
+	select {
+	case <-l.stopCh:
+		l.admissionMu.Unlock()
+		_ = conn.Close()
+		return
+	default:
+	}
 	// Enforce connection limit for WebSocket connections too
 	select {
 	case l.connSem <- struct{}{}:
 	default:
+		l.admissionMu.Unlock()
 		l.logger.Warn("Connection limit reached, rejecting WebSocket connection",
 			zap.String("remote_addr", remoteAddr),
 		)
@@ -456,24 +569,23 @@ func (l *Listener) HandleWSConnection(conn net.Conn, remoteAddr string) {
 	if remoteIP == "" {
 		remoteIP = netutil.ExtractIP(connAddr)
 	}
-	if netutil.IsPrivateIP(remoteIP) {
-		remoteIP = ""
-	}
 
 	// Create connection handler (no TLS verification needed - already done by HTTP server)
 	tcpConn := NewConnection(ConnectionConfig{
-		Conn:         conn,
-		AuthToken:    l.authToken,
-		Manager:      l.manager,
-		Logger:       l.logger,
-		PortAlloc:    l.portAlloc,
-		Domain:       l.domain,
-		TunnelDomain: l.tunnelDomain,
-		PublicPort:   l.publicPort,
-		HTTPHandler:  l.httpHandler,
-		GroupManager: l.groupManager,
-		HTTPListener: l.httpListener,
-		RemoteIP:     remoteIP,
+		Conn:           conn,
+		AuthToken:      l.authToken,
+		AllowAnonymous: l.allowAnonymous,
+		Manager:        l.manager,
+		Logger:         l.logger,
+		PortAlloc:      l.portAlloc,
+		Domain:         l.domain,
+		TunnelDomain:   l.tunnelDomain,
+		PublicPort:     l.publicPort,
+		HTTPHandler:    l.httpHandler,
+		GroupManager:   l.groupManager,
+		HTTPListener:   l.httpListener,
+		RemoteIP:       remoteIP,
+		Transport:      "wss",
 	})
 	tcpConn.SetAllowedTunnelTypes(l.allowedTunnelTypes)
 	tcpConn.SetAllowedTransports(l.allowedTransports)
@@ -484,6 +596,7 @@ func (l *Listener) HandleWSConnection(conn net.Conn, remoteAddr string) {
 
 	metrics.TotalConnections.Inc()
 	metrics.ActiveConnections.Inc()
+	l.admissionMu.Unlock()
 
 	defer func() {
 		l.connections.Delete(connID)

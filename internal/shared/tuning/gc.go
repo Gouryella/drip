@@ -2,7 +2,7 @@ package tuning
 
 import (
 	"math"
-	"runtime"
+	"os"
 	"runtime/debug"
 )
 
@@ -28,7 +28,7 @@ func safeUint64ToInt64(v uint64) int64 {
 func DefaultClientConfig() Config {
 	total := safeUint64ToInt64(getSystemTotalMemory())
 	limit := total / 4
-	if limit < 64*1024*1024 {
+	if limit <= 0 {
 		limit = 64 * 1024 * 1024
 	}
 	return Config{
@@ -39,8 +39,8 @@ func DefaultClientConfig() Config {
 
 func DefaultServerConfig() Config {
 	total := safeUint64ToInt64(getSystemTotalMemory())
-	limit := total * 3 / 4
-	if limit < 128*1024*1024 {
+	limit := total / 4 * 3
+	if limit <= 0 {
 		limit = 128 * 1024 * 1024
 	}
 	return Config{
@@ -50,11 +50,11 @@ func DefaultServerConfig() Config {
 }
 
 func Apply(cfg Config) {
-	runtime.GOMAXPROCS(runtime.NumCPU())
-	if cfg.GCPercent > 0 {
+	// Leave GOMAXPROCS to Go's container-aware default or the operator.
+	if cfg.GCPercent > 0 && os.Getenv("GOGC") == "" {
 		debug.SetGCPercent(cfg.GCPercent)
 	}
-	if cfg.MemoryLimit > 0 {
+	if cfg.MemoryLimit > 0 && os.Getenv("GOMEMLIMIT") == "" {
 		debug.SetMemoryLimit(cfg.MemoryLimit)
 	}
 }

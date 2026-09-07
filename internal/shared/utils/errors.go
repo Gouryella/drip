@@ -1,6 +1,20 @@
 package utils
 
-import "strings"
+import (
+	"context"
+	"errors"
+	"io"
+	"net"
+	"strings"
+)
+
+const (
+	TransferResultOK               = "ok"
+	TransferResultEOF              = "eof"
+	TransferResultCanceled         = "canceled"
+	TransferResultClientDisconnect = "client_disconnect"
+	TransferResultError            = "error"
+)
 
 // IsNetworkError checks if an error message indicates a common network error
 // that should be handled gracefully (not logged as severe errors).
@@ -32,4 +46,35 @@ func ContainsAny(s string, substrings ...string) bool {
 		}
 	}
 	return false
+}
+
+// ClassifyTransferError maps copy/pipe outcomes into low-cardinality buckets
+// suitable for logs and metrics.
+func ClassifyTransferError(ctx context.Context, err error) string {
+	if err == nil {
+		return TransferResultOK
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return TransferResultCanceled
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return TransferResultCanceled
+	}
+	if errors.Is(err, io.EOF) {
+		return TransferResultEOF
+	}
+	if errors.Is(err, net.ErrClosed) {
+		return TransferResultClientDisconnect
+	}
+	if IsNetworkError(err.Error()) {
+		return TransferResultClientDisconnect
+	}
+	return TransferResultError
+}
+
+func IsExpectedTransferResult(result string) bool {
+	return result == TransferResultOK ||
+		result == TransferResultEOF ||
+		result == TransferResultCanceled ||
+		result == TransferResultClientDisconnect
 }

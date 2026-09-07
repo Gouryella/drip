@@ -23,6 +23,7 @@ SKIP=0
 
 DRIP_BIN="${DRIP_BIN:-./bin/drip}"
 SERVER_PORT="${SERVER_PORT:-18443}"
+SERVER_DOMAIN="${SERVER_DOMAIN:-localhost}"
 HTTP_BACKEND_PORT="${HTTP_BACKEND_PORT:-13000}"
 TCP_BACKEND_PORT="${TCP_BACKEND_PORT:-13001}"
 TCP_PORT_MIN="${TCP_PORT_MIN:-21000}"
@@ -275,7 +276,7 @@ start_server() {
   log_step "Starting Drip server on :${SERVER_PORT}"
   "$DRIP_BIN" server \
     --port "$SERVER_PORT" \
-    --domain localhost \
+    --domain "$SERVER_DOMAIN" \
     --tls-cert "${CERT_DIR}/server.crt" \
     --tls-key "${CERT_DIR}/server.key" \
     --tcp-port-min "$TCP_PORT_MIN" \
@@ -362,14 +363,14 @@ test_server_health() {
     fail "discover endpoint status=$code body=$(cat "${LOG_DIR}/discover.out" 2>/dev/null || true)"
   fi
 
-  code="$(curl -sk -o "${LOG_DIR}/metrics-unauth.out" -w '%{http_code}' "https://127.0.0.1:${SERVER_PORT}/metrics" || true)"
+  code="$(curl -sk -H "Host: ${SERVER_DOMAIN}" -o "${LOG_DIR}/metrics-unauth.out" -w '%{http_code}' "https://127.0.0.1:${SERVER_PORT}/metrics" || true)"
   if [[ "$code" == "401" || "$code" == "403" ]]; then
     pass "metrics rejects unauthenticated"
   else
     fail "metrics unauth status=$code"
   fi
 
-  code="$(curl -sk -o "${LOG_DIR}/metrics.out" -w '%{http_code}' \
+  code="$(curl -sk -H "Host: ${SERVER_DOMAIN}" -o "${LOG_DIR}/metrics.out" -w '%{http_code}' \
     -H "Authorization: Bearer ${METRICS_TOKEN}" \
     "https://127.0.0.1:${SERVER_PORT}/metrics" || true)"
   if [[ "$code" == "200" ]]; then

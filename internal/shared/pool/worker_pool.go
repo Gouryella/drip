@@ -7,7 +7,7 @@ import (
 
 // NumCPU returns the number of logical CPUs available
 func NumCPU() int {
-	return runtime.NumCPU()
+	return runtime.GOMAXPROCS(0)
 }
 
 // WorkerPool is a fixed-size goroutine pool for handling tasks
@@ -62,11 +62,11 @@ func (p *WorkerPool) Submit(job func()) bool {
 	}
 
 	p.mu.RLock()
+	defer p.mu.RUnlock()
+
 	if p.closed {
-		p.mu.RUnlock()
 		return false
 	}
-	p.mu.RUnlock()
 
 	select {
 	case p.jobQueue <- job:
@@ -102,9 +102,9 @@ func (p *WorkerPool) Close() {
 	p.once.Do(func() {
 		p.mu.Lock()
 		p.closed = true
+		close(p.jobQueue)
 		p.mu.Unlock()
 
-		close(p.jobQueue)
 		p.wg.Wait()
 	})
 }

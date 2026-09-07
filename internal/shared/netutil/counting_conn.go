@@ -31,3 +31,17 @@ func (c *CountingConn) Write(p []byte) (int, error) {
 	}
 	return n, err
 }
+
+func (c *CountingConn) CloseRead() error {
+	if conn, ok := c.Conn.(interface{ CloseRead() error }); ok {
+		return conn.CloseRead()
+	}
+	return nil
+}
+
+func (c *CountingConn) CloseWrite() error {
+	if conn, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return conn.CloseWrite()
+	}
+	return c.Conn.Close()
+}

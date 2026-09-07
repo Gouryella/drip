@@ -3,19 +3,19 @@ package tcp
 import (
 	"net"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
 // connQueueListener is a net.Listener backed by a channel of pre-accepted conns.
 // It lets the TCP/TLS multiplexer hand off HTTP connections to a standard http.Server.
 type connQueueListener struct {
-	addr   net.Addr
-	conns  chan net.Conn
-	done   chan struct{}
-	once   sync.Once
-	closed atomic.Bool
-	mu     sync.Mutex // serializes Enqueue with Close to avoid post-close queue leaks
+	addr  net.Addr
+	conns chan net.Conn
+	done  chan struct{}
+	once  sync.Once
+	mu    sync.Mutex
+
+	closed bool
 }
 
 func newConnQueueListener(addr net.Addr, buffer int) *connQueueListener {
@@ -37,6 +37,13 @@ func (l *connQueueListener) Accept() (net.Conn, error) {
 		if conn == nil {
 			return nil, net.ErrClosed
 		}
+		select {
+		case <-l.done:
+			_ = conn.SetDeadline(time.Now())
+			_ = conn.Close()
+			return nil, net.ErrClosed
+		default:
+		}
 		return conn, nil
 	}
 }
@@ -44,10 +51,11 @@ func (l *connQueueListener) Accept() (net.Conn, error) {
 func (l *connQueueListener) Close() error {
 	l.once.Do(func() {
 		l.mu.Lock()
-		l.closed.Store(true)
+		defer l.mu.Unlock()
+
+		l.closed = true
 		close(l.done)
-		l.mu.Unlock()
-		l.drain()
+		l.drainLocked()
 	})
 	return nil
 }
@@ -58,11 +66,10 @@ func (l *connQueueListener) Enqueue(conn net.Conn) bool {
 	if conn == nil {
 		return false
 	}
-
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	if l.closed.Load() {
+	if l.closed {
 		return false
 	}
 
@@ -74,7 +81,7 @@ func (l *connQueueListener) Enqueue(conn net.Conn) bool {
 	}
 }
 
-func (l *connQueueListener) drain() {
+func (l *connQueueListener) drainLocked() {
 	for {
 		select {
 		case conn := <-l.conns:

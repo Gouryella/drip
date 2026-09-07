@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -55,5 +56,37 @@ func TestParseBandwidth(t *testing.T) {
 				t.Errorf("parseBandwidth(%q) = %d, want %d", tt.input, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestRunHTTPRejectsInvalidIPAccessBeforeConfigResolution(t *testing.T) {
+	oldAllowIPs := allowIPs
+	oldDenyIPs := denyIPs
+	oldDaemonMode := daemonMode
+	oldDaemonMarker := daemonMarker
+	oldAuthPass := authPass
+	oldAuthBearer := authBearer
+	t.Cleanup(func() {
+		allowIPs = oldAllowIPs
+		denyIPs = oldDenyIPs
+		daemonMode = oldDaemonMode
+		daemonMarker = oldDaemonMarker
+		authPass = oldAuthPass
+		authBearer = oldAuthBearer
+	})
+
+	allowIPs = []string{"not-a-cidr"}
+	denyIPs = nil
+	daemonMode = false
+	daemonMarker = false
+	authPass = ""
+	authBearer = ""
+
+	err := runHTTP(nil, []string{"3000"})
+	if err == nil {
+		t.Fatal("runHTTP expected error for invalid allow IP")
+	}
+	if !strings.Contains(err.Error(), "invalid IP access flags") {
+		t.Fatalf("runHTTP error = %v, want invalid IP access flags", err)
 	}
 }

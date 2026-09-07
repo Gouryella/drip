@@ -14,8 +14,10 @@ domain: tunnel.example.com
 # Domain for tunnel URLs (optional, defaults to domain)
 # tunnel_domain: example.com
 
-# Authentication token (optional, but recommended)
-token: your-secret-token
+# Authentication token (required unless allow_anonymous is true)
+# Generate a real secret before enabling; placeholder values are rejected.
+# token: replace-with-a-long-random-token
+# allow_anonymous: false    # Explicitly allow public unauthenticated tunnels
 
 # TLS disabled - Caddy handles TLS termination
 tls_enabled: false
@@ -28,7 +30,9 @@ tcp_port_min: 20000
 tcp_port_max: 20100
 
 # Optional settings
-# metrics_token: secret     # Token for /metrics endpoint
+# metrics_token: replace-with-a-long-random-token  # Token for /stats and /metrics endpoints
+# trusted_proxies:          # Reverse proxy IPs/CIDRs allowed to supply X-Forwarded-For
+#   - 172.18.0.0/16         # Replace with the actual Caddy/container network range
 # debug: false              # Enable debug logging
 # pprof_port: 6060          # Enable pprof profiling
 # transports:               # Allowed transports (default: tcp,wss)

@@ -18,7 +18,12 @@ func NewLimiter(cfg Config) *Limiter {
 	if cfg.Bandwidth > 0 {
 		burst := cfg.Burst
 		if burst <= 0 {
-			burst = int(cfg.Bandwidth * 2)
+			maxInt := int(^uint(0) >> 1)
+			if cfg.Bandwidth > int64(maxInt)/2 {
+				burst = maxInt
+			} else {
+				burst = int(cfg.Bandwidth * 2)
+			}
 		}
 		l.limiter = rate.NewLimiter(rate.Limit(cfg.Bandwidth), burst)
 	}

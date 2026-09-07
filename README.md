@@ -17,7 +17,7 @@
 
 <div align="center">
 
-[![Go](https://img.shields.io/badge/Go-1.21+-00ADD8?style=flat&logo=go)](https://golang.org/)
+[![Go](https://img.shields.io/badge/Go-1.26.8+-00ADD8?style=flat&logo=go)](https://golang.org/)
 [![License](https://img.shields.io/badge/License-BSD--3--Clause-blue.svg)](LICENSE)
 [![TLS](https://img.shields.io/badge/TLS-1.3-green.svg)](https://tools.ietf.org/html/rfc8446)
 
@@ -60,9 +60,43 @@ burst_multiplier: 2.5
 
 ### Install
 
+Choose a release tag and verify downloads before executing anything. The
+installers now refuse unpinned release downloads unless `--allow-latest` is set,
+and they verify the release archive SHA256 before extraction.
+
 ```bash
-bash <(curl -sL https://driptunnel.app/install.sh)
+VERSION=v0.7.0
+SCRIPT=install-client.sh
+SCRIPT_SHA256=<sha256-of-install-client.sh>
+ARCHIVE_SHA256=<sha256-from-the-GitHub-Release-checksums-file>
+
+curl -fsSLO "https://raw.githubusercontent.com/Gouryella/drip/${VERSION}/scripts/${SCRIPT}"
+
+# Linux:
+printf '%s  %s\n' "$SCRIPT_SHA256" "$SCRIPT" | sha256sum -c -
+
+# macOS:
+printf '%s  %s\n' "$SCRIPT_SHA256" "$SCRIPT" | shasum -a 256 -c -
+
+bash "$SCRIPT" --version "$VERSION" --checksum "$ARCHIVE_SHA256"
 ```
+
+For a manual binary install, verify the release checksum file first:
+
+```bash
+VERSION=v0.7.0
+VERSION_NUMBER="${VERSION#v}"
+ARCHIVE="drip_${VERSION_NUMBER}_linux_amd64.tar.gz"
+
+curl -fsSLO "https://github.com/Gouryella/drip/releases/download/${VERSION}/${ARCHIVE}"
+curl -fsSLO "https://github.com/Gouryella/drip/releases/download/${VERSION}/drip_${VERSION_NUMBER}_checksums.txt"
+grep " ${ARCHIVE}$" "drip_${VERSION_NUMBER}_checksums.txt" | sha256sum -c -
+tar -xzf "$ARCHIVE"
+```
+
+Avoid `curl | bash` for production installs. If you intentionally use a pipe for
+a disposable environment, pin `--version`, provide `--checksum`, and review the
+script first.
 
 ### Basic Usage
 

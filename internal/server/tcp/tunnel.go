@@ -40,7 +40,7 @@ func (c *Connection) handleTCPTunnel(reader *bufio.Reader) error {
 		c.lifecycleManager.SetSession(session)
 	}
 
-	openStream := session.Open
+	openStream := func() (net.Conn, error) { return mux.OpenStream(session) }
 	if c.groupManager != nil {
 		if group, ok := c.groupManager.GetGroup(c.tunnelID); ok && group != nil {
 			group.AddSession("primary", session)
@@ -61,16 +61,10 @@ func (c *Connection) handleTCPTunnel(reader *bufio.Reader) error {
 		c.lifecycleManager.SetProxy(c.proxy)
 	}
 
-	var heldListener net.Listener
-	if c.portAlloc != nil {
-		if ln, ok := c.portAlloc.TakeListener(c.port); ok {
-			heldListener = ln
-		}
-	}
-
-	if err := c.proxy.StartWithListener(heldListener); err != nil {
+	if err := c.proxy.StartWithListener(c.portAlloc.TakeListener(c.port)); err != nil {
 		return fmt.Errorf("failed to start tcp proxy: %w", err)
 	}
+	c.markReady()
 
 	select {
 	case <-c.stopCh:
@@ -101,7 +95,7 @@ func (c *Connection) handleHTTPProxyTunnel(reader *bufio.Reader) error {
 		c.lifecycleManager.SetSession(session)
 	}
 
-	openStream := session.Open
+	openStream := func() (net.Conn, error) { return mux.OpenStream(session) }
 	if c.groupManager != nil {
 		if group, ok := c.groupManager.GetGroup(c.tunnelID); ok && group != nil {
 			group.AddSession("primary", session)
@@ -112,6 +106,7 @@ func (c *Connection) handleHTTPProxyTunnel(reader *bufio.Reader) error {
 	if c.tunnelConn != nil {
 		c.tunnelConn.SetOpenStream(openStream)
 	}
+	c.markReady()
 
 	select {
 	case <-c.stopCh:

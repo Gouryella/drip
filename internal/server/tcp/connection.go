@@ -3,7 +3,6 @@ package tcp
 import (
 	"bufio"
 	"context"
-	"crypto/subtle"
 	"errors"
 	"fmt"
 	"math"
@@ -28,23 +27,26 @@ import (
 )
 
 type ConnectionConfig struct {
-	Conn         net.Conn
-	AuthToken    string
-	Manager      *tunnel.Manager
-	Logger       *zap.Logger
-	PortAlloc    *PortAllocator
-	Domain       string
-	TunnelDomain string
-	PublicPort   int
-	HTTPHandler  http.Handler
-	GroupManager *ConnectionGroupManager
-	HTTPListener *connQueueListener
-	RemoteIP     string
+	Conn           net.Conn
+	AuthToken      string
+	AllowAnonymous bool
+	Manager        *tunnel.Manager
+	Logger         *zap.Logger
+	PortAlloc      *PortAllocator
+	Domain         string
+	TunnelDomain   string
+	PublicPort     int
+	HTTPHandler    http.Handler
+	GroupManager   *ConnectionGroupManager
+	HTTPListener   *connQueueListener
+	RemoteIP       string
+	Transport      string
 }
 
 type Connection struct {
 	conn             net.Conn
 	authToken        string
+	allowAnonymous   bool
 	manager          *tunnel.Manager
 	logger           *zap.Logger
 	subdomain        string
@@ -56,6 +58,8 @@ type Connection struct {
 	tunnelConn       *tunnel.Connection
 	stopCh           chan struct{}
 	once             sync.Once
+	readyOnce        sync.Once
+	readyCh          chan struct{}
 	lastHeartbeat    time.Time
 	mu               sync.RWMutex
 	frameWriter      *protocol.FrameWriter
@@ -77,16 +81,21 @@ type Connection struct {
 	bandwidth          int64
 	burstMultiplier    float64
 	remoteIP           string
+	transport          string
 }
 
 // NewConnection creates a new connection handler
 func NewConnection(cfg ConnectionConfig) *Connection {
+	if cfg.Transport == "" {
+		cfg.Transport = "tcp"
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	stopCh := make(chan struct{})
 
 	c := &Connection{
 		conn:             cfg.Conn,
 		authToken:        cfg.AuthToken,
+		allowAnonymous:   cfg.AllowAnonymous,
 		manager:          cfg.Manager,
 		logger:           cfg.Logger,
 		portAlloc:        cfg.PortAlloc,
@@ -95,6 +104,7 @@ func NewConnection(cfg ConnectionConfig) *Connection {
 		publicPort:       cfg.PublicPort,
 		httpHandler:      cfg.HTTPHandler,
 		stopCh:           stopCh,
+		readyCh:          make(chan struct{}),
 		lastHeartbeat:    time.Now(),
 		ctx:              ctx,
 		cancel:           cancel,
@@ -102,6 +112,7 @@ func NewConnection(cfg ConnectionConfig) *Connection {
 		httpListener:     cfg.HTTPListener,
 		lifecycleManager: NewConnectionLifecycleManager(stopCh, cancel, cfg.Logger),
 		remoteIP:         cfg.RemoteIP,
+		transport:        cfg.Transport,
 	}
 
 	// Set connection in lifecycle manager
@@ -130,9 +141,9 @@ func (c *Connection) Handle() error {
 	}
 
 	// Check if TCP transport is allowed (only for Drip protocol connections, not HTTP)
-	if !c.isTransportAllowed("tcp") {
-		c.logger.Warn("TCP transport not allowed, rejecting Drip protocol connection")
-		return fmt.Errorf("TCP transport not allowed")
+	if !c.isTransportAllowed(c.transport) {
+		c.logger.Warn("Transport not allowed", zap.String("transport", c.transport))
+		return fmt.Errorf("%s transport not allowed", c.transport)
 	}
 
 	frame, err := protocol.ReadFrame(reader)
@@ -147,6 +158,7 @@ func (c *Connection) Handle() error {
 			c.conn,
 			reader,
 			c.authToken,
+			c.allowAnonymous,
 			c.groupManager,
 			c.stopCh,
 			c.logger,
@@ -156,6 +168,7 @@ func (c *Connection) Handle() error {
 			if c.lifecycleManager != nil {
 				c.lifecycleManager.SetSession(session)
 			}
+			c.markReady()
 		})
 		handler.SetTunnelIDHandler(func(tunnelID string) {
 			c.tunnelID = tunnelID
@@ -180,8 +193,8 @@ func (c *Connection) Handle() error {
 		return fmt.Errorf("tunnel type not allowed: %s", req.TunnelType)
 	}
 
-	if c.authToken != "" && subtle.ConstantTimeCompare([]byte(req.Token), []byte(c.authToken)) != 1 {
-		c.sendError("authentication_failed", "Invalid authentication token")
+	if !isAuthTokenAccepted(req.Token, c.authToken, c.allowAnonymous) {
+		c.sendError(authFailureCode, authFailureMessage)
 		return fmt.Errorf("authentication failed")
 	}
 
@@ -210,7 +223,15 @@ func (c *Connection) Handle() error {
 
 	result, err := regHandler.Register(regReq)
 	if err != nil {
-		c.sendError("registration_failed", err.Error())
+		reason := registrationFailureReason(err)
+		c.logger.Warn("Tunnel registration failed",
+			zap.String("reason", reason),
+			zap.String("tunnel_type", string(req.TunnelType)),
+			zap.Bool("custom_subdomain_requested", req.CustomSubdomain != ""),
+			zap.Error(err),
+		)
+		code, message := publicRegistrationError(err)
+		c.sendError(code, message)
 		return fmt.Errorf("registration failed: %w", err)
 	}
 
@@ -218,28 +239,28 @@ func (c *Connection) Handle() error {
 	c.subdomain = result.Subdomain
 	c.port = result.Port
 	c.tunnelConn = result.TunnelConn
-	c.tunnelConn.Conn = nil
 
 	// Update lifecycle manager with registration info
 	if c.lifecycleManager != nil {
 		c.lifecycleManager.SetPortAllocation(c.portAlloc, c.port)
-		c.lifecycleManager.SetTunnelRegistration(c.manager, c.subdomain, "", c.groupManager)
+		c.lifecycleManager.SetTunnelRegistration(c.manager, c.subdomain, "", c.groupManager, c.tunnelConn)
 	}
 
 	// Handle connection groups
 	if result.SupportsDataConn && c.groupManager != nil {
-		group := c.groupManager.CreateGroup(result.Subdomain, req.Token, c, req.TunnelType)
+		group := c.groupManager.CreateGroupWithMaxDataConns(result.Subdomain, req.Token, c, req.TunnelType, result.MaxDataConns)
 		result.TunnelID = group.TunnelID
 		c.tunnelID = result.TunnelID
 
 		// Update lifecycle manager with tunnel ID
 		if c.lifecycleManager != nil {
-			c.lifecycleManager.SetTunnelRegistration(c.manager, c.subdomain, c.tunnelID, c.groupManager)
+			c.lifecycleManager.SetTunnelRegistration(c.manager, c.subdomain, c.tunnelID, c.groupManager, c.tunnelConn)
 		}
 
 		c.logger.Info("Created connection group for multi-connection support",
 			zap.String("tunnel_id", result.TunnelID),
-			zap.Int("max_data_conns", req.PoolCapabilities.MaxDataConns),
+			zap.Int("client_max_data_conns", req.PoolCapabilities.MaxDataConns),
+			zap.Int("max_data_conns", group.MaxDataConns),
 		)
 	}
 
@@ -327,7 +348,12 @@ func (c *Connection) Handle() error {
 		c.logger.Info("Client requested close")
 	})
 
+	c.markReady()
 	return frameHandler.HandleFrames()
+}
+
+func (c *Connection) markReady() {
+	c.readyOnce.Do(func() { close(c.readyCh) })
 }
 
 func (c *Connection) handleHTTPRequest(reader *bufio.Reader) error {
@@ -433,8 +459,16 @@ func (c *Connection) Close() {
 
 		// If handed off, don't close the connection - HTTP handler owns it now
 		if handedOff {
-			protocol.UnregisterConnection()
-			c.logger.Debug("Connection handed off to HTTP handler, skipping close")
+			c.logger.Debug("Connection handed off to HTTP handler, preserving net.Conn during cleanup")
+			if c.lifecycleManager != nil {
+				c.lifecycleManager.ClosePreservingConnection()
+			} else {
+				protocol.UnregisterConnection()
+				close(c.stopCh)
+				if c.cancel != nil {
+					c.cancel()
+				}
+			}
 			return
 		}
 
@@ -479,7 +513,7 @@ func (c *Connection) Close() {
 			}
 
 			if c.subdomain != "" {
-				c.manager.Unregister(c.subdomain)
+				c.manager.UnregisterIf(c.subdomain, c.tunnelConn)
 				if c.tunnelID != "" && c.groupManager != nil {
 					c.groupManager.RemoveGroup(c.tunnelID)
 				}
