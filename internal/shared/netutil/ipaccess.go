@@ -1,6 +1,7 @@
 package netutil
 
 import (
+	"fmt"
 	"net"
 	"strings"
 )
@@ -16,64 +17,78 @@ type IPAccessChecker struct {
 // NewIPAccessChecker creates a new IP access checker from CIDR and IP lists.
 // allowCIDRs: list of CIDR ranges to allow (e.g., "192.168.1.0/24", "10.0.0.0/8")
 // denyIPs: list of CIDR ranges or IP addresses to deny (e.g., "192.168.0.0/16", "1.2.3.4")
-func NewIPAccessChecker(allowCIDRs, denyIPs []string) *IPAccessChecker {
-	checker := &IPAccessChecker{}
-
-	// Parse allowed CIDRs
-	for _, cidr := range allowCIDRs {
-		cidr = strings.TrimSpace(cidr)
-		if cidr == "" {
-			continue
-		}
-
-		// If no "/" in the string, treat it as a single IP (/32 for IPv4, /128 for IPv6)
-		if !strings.Contains(cidr, "/") {
-			ip := net.ParseIP(cidr)
-			if ip != nil {
-				if ip.To4() != nil {
-					cidr = cidr + "/32"
-				} else {
-					cidr = cidr + "/128"
-				}
-			}
-		}
-
-		_, ipNet, err := net.ParseCIDR(cidr)
-		if err != nil {
-			continue
-		}
-		checker.allowNets = append(checker.allowNets, ipNet)
+func NewIPAccessChecker(allowCIDRs, denyIPs []string) (*IPAccessChecker, error) {
+	allowNets, denyNets, err := parseIPAccessRules(allowCIDRs, denyIPs)
+	if err != nil {
+		return nil, err
 	}
-	checker.hasAllow = len(checker.allowNets) > 0
 
-	// Parse denied IPs/CIDRs
-	for _, ipStr := range denyIPs {
-		ipStr = strings.TrimSpace(ipStr)
-		if ipStr == "" {
-			continue
-		}
+	return &IPAccessChecker{
+		allowNets: allowNets,
+		denyNets:  denyNets,
+		hasAllow:  len(allowNets) > 0,
+		hasDeny:   len(denyNets) > 0,
+	}, nil
+}
 
-		// If no "/" in the string, treat it as a single IP (/32 for IPv4, /128 for IPv6)
-		if !strings.Contains(ipStr, "/") {
-			ip := net.ParseIP(ipStr)
-			if ip != nil {
-				if ip.To4() != nil {
-					ipStr = ipStr + "/32"
-				} else {
-					ipStr = ipStr + "/128"
-				}
-			}
-		}
+// ValidateIPAccessRules verifies that all allow/deny entries are valid IPs or CIDR ranges.
+func ValidateIPAccessRules(allowCIDRs, denyIPs []string) error {
+	_, _, err := parseIPAccessRules(allowCIDRs, denyIPs)
+	return err
+}
 
-		_, ipNet, err := net.ParseCIDR(ipStr)
-		if err != nil {
-			continue
-		}
-		checker.denyNets = append(checker.denyNets, ipNet)
+func parseIPAccessRules(allowCIDRs, denyIPs []string) ([]*net.IPNet, []*net.IPNet, error) {
+	allowNets, err := parseIPAccessEntries("allow IP/CIDR", allowCIDRs)
+	if err != nil {
+		return nil, nil, err
 	}
-	checker.hasDeny = len(checker.denyNets) > 0
 
-	return checker
+	denyNets, err := parseIPAccessEntries("deny IP/CIDR", denyIPs)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return allowNets, denyNets, nil
+}
+
+func parseIPAccessEntries(label string, entries []string) ([]*net.IPNet, error) {
+	nets := make([]*net.IPNet, 0, len(entries))
+
+	for i, entry := range entries {
+		normalized, err := normalizeIPAccessEntry(entry)
+		if err != nil {
+			return nil, fmt.Errorf("%s entry %d (%q): %w", label, i+1, entry, err)
+		}
+
+		_, ipNet, err := net.ParseCIDR(normalized)
+		if err != nil {
+			return nil, fmt.Errorf("%s entry %d (%q): %w", label, i+1, entry, err)
+		}
+		nets = append(nets, ipNet)
+	}
+
+	return nets, nil
+}
+
+func normalizeIPAccessEntry(entry string) (string, error) {
+	entry = strings.TrimSpace(entry)
+	if entry == "" {
+		return "", fmt.Errorf("must not be empty")
+	}
+
+	if strings.Contains(entry, "/") {
+		return entry, nil
+	}
+
+	ip := net.ParseIP(entry)
+	if ip == nil {
+		return "", fmt.Errorf("must be an IP address or CIDR range")
+	}
+
+	if ip.To4() != nil {
+		return entry + "/32", nil
+	}
+	return entry + "/128", nil
 }
 
 // IsAllowed checks if the given IP address is allowed.
