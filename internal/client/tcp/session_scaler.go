@@ -87,6 +87,17 @@ func (s *SessionScaler) scalerLoop() {
 		load := float64(activeConns) / float64(capacity)
 
 		now := time.Now()
+		// Replace lost sessions even when traffic is low. Load-based scaling
+		// alone never restores the pool after a data connection disconnects.
+		if current < desired {
+			if now.Sub(lastScale) >= s.scaleUpCooldown {
+				_ = s.client.addDataSession()
+				s.client.mu.Lock()
+				s.client.lastScale = now
+				s.client.mu.Unlock()
+			}
+			continue
+		}
 
 		// Burst scaling: rapid scale-up under extreme load
 		if load > s.burstThreshold && current < s.client.maxSessions {
@@ -96,11 +107,15 @@ func (s *SessionScaler) scalerLoop() {
 				zap.Int("adding", toAdd),
 				zap.Float64("load", load),
 			)
+			added := 0
 			for i := 0; i < toAdd; i++ {
-				_ = s.client.addDataSession()
+				if err := s.client.addDataSession(); err != nil {
+					break
+				}
+				added++
 			}
 			s.client.mu.Lock()
-			s.client.desiredTotal = current + toAdd
+			s.client.desiredTotal = current + added
 			s.client.lastScale = now
 			s.client.mu.Unlock()
 			continue
@@ -118,9 +133,11 @@ func (s *SessionScaler) scalerLoop() {
 					zap.Int("desired", newDesired),
 					zap.Float64("load", load),
 				)
-				_ = s.client.addDataSession()
+				err := s.client.addDataSession()
 				s.client.mu.Lock()
-				s.client.desiredTotal = newDesired
+				if err == nil {
+					s.client.desiredTotal = newDesired
+				}
 				s.client.lastScale = now
 				s.client.mu.Unlock()
 			}
@@ -139,9 +156,11 @@ func (s *SessionScaler) scalerLoop() {
 					zap.Int("desired", newDesired),
 					zap.Float64("load", load),
 				)
-				s.client.removeIdleSessions(1)
+				removed := s.client.removeIdleSessions(1)
 				s.client.mu.Lock()
-				s.client.desiredTotal = newDesired
+				if removed > 0 {
+					s.client.desiredTotal = newDesired
+				}
 				s.client.lastScale = now
 				s.client.mu.Unlock()
 			}

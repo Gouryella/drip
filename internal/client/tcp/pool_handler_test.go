@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -19,6 +20,51 @@ import (
 
 	"go.uber.org/zap"
 )
+
+func TestHandleHTTPStreamCancelsPostEventStreamWhenTunnelCloses(t *testing.T) {
+	backendCanceled := make(chan struct{})
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "data: ready\n\n")
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+		close(backendCanceled)
+	}))
+	defer backend.Close()
+	host, portText, _ := net.SplitHostPort(backend.Listener.Addr().String())
+	port, _ := strconv.Atoi(portText)
+	c := NewPoolClient(&ConnectorConfig{ServerAddr: "localhost:443", TunnelType: protocol.TunnelTypeHTTP, LocalHost: host, LocalPort: port}, zap.NewNop())
+	defer c.Close()
+	serverSide, clientSide := net.Pipe()
+	defer serverSide.Close()
+	defer clientSide.Close()
+	done := make(chan struct{})
+	go func() { defer close(done); c.handleHTTPStream(clientSide) }()
+	req, _ := http.NewRequest(http.MethodPost, "http://demo.test/events", strings.NewReader("request-body"))
+	if err := req.Write(serverSide); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(serverSide), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if got := readClientBodyWithin(t, resp.Body, len("data: ready\n\n"), time.Second); got != "data: ready\n\n" {
+		t.Fatalf("event = %q", got)
+	}
+	_ = serverSide.Close()
+	select {
+	case <-backendCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("POST event stream did not cancel its backend request")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("POST handler did not stop")
+	}
+}
 
 type recordingConn struct {
 	net.Conn
@@ -39,7 +85,7 @@ func (c *recordingConn) lastWriteDeadline() time.Time {
 	return c.writeDeadline
 }
 
-func TestHandleHTTPStreamForwardsEventStreamWithoutShortWriteDeadline(t *testing.T) {
+func TestHandleHTTPStreamForwardsEventStreamWithStreamingWriteDeadline(t *testing.T) {
 	release := make(chan struct{})
 	var releaseOnce sync.Once
 
@@ -119,8 +165,10 @@ func TestHandleHTTPStreamForwardsEventStreamWithoutShortWriteDeadline(t *testing
 		t.Fatalf("body prefix = %q, want first SSE event", got)
 	}
 
-	if deadline := clientSide.lastWriteDeadline(); !deadline.IsZero() {
-		t.Fatalf("SSE stream write deadline = %v, want zero", deadline)
+	if deadline := clientSide.lastWriteDeadline(); deadline.IsZero() {
+		t.Fatal("SSE stream write deadline is zero, want bounded deadline")
+	} else if time.Until(deadline) <= 0 {
+		t.Fatalf("SSE stream write deadline = %v, want future deadline", deadline)
 	}
 
 	releaseOnce.Do(func() { close(release) })
@@ -129,6 +177,17 @@ func TestHandleHTTPStreamForwardsEventStreamWithoutShortWriteDeadline(t *testing
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatalf("handleHTTPStream did not return after stream close")
+	}
+}
+
+func TestLocalHTTPClientLimitsResponseHeaders(t *testing.T) {
+	client := newLocalHTTPClient(protocol.TunnelTypeHTTP, false)
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("Transport = %T, want *http.Transport", client.Transport)
+	}
+	if transport.MaxResponseHeaderBytes != maxLocalResponseHeaderBytes {
+		t.Fatalf("MaxResponseHeaderBytes = %d, want %d", transport.MaxResponseHeaderBytes, maxLocalResponseHeaderBytes)
 	}
 }
 
