@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync/atomic"
 
 	"drip/internal/shared/pool"
 )
@@ -29,6 +30,23 @@ const (
 	FrameTypeDataConnect    FrameType = 0x07
 	FrameTypeDataConnectAck FrameType = 0x08
 )
+
+// IsValid returns true for frame types understood by the protocol.
+func (t FrameType) IsValid() bool {
+	switch t {
+	case FrameTypeRegister,
+		FrameTypeRegisterAck,
+		FrameTypeHeartbeat,
+		FrameTypeHeartbeatAck,
+		FrameTypeClose,
+		FrameTypeError,
+		FrameTypeDataConnect,
+		FrameTypeDataConnectAck:
+		return true
+	default:
+		return false
+	}
+}
 
 // String returns the string representation of frame type
 func (t FrameType) String() string {
@@ -60,7 +78,7 @@ type Frame struct {
 	poolBuffer *[]byte
 	// queuedBytes is set by FrameWriter when the frame is enqueued.
 	// It allows the writer to decrement backlog counters exactly once.
-	queuedBytes int64
+	queuedBytes atomic.Int64
 }
 
 func WriteFrame(w io.Writer, frame *Frame) error {
@@ -74,16 +92,20 @@ func WriteFrame(w io.Writer, frame *Frame) error {
 	header[4] = byte(frame.Type)
 
 	if payloadLen == 0 {
-		if _, err := w.Write(header[:]); err != nil {
+		if n, err := w.Write(header[:]); err != nil {
 			return fmt.Errorf("failed to write frame header: %w", err)
+		} else if n != len(header) {
+			return io.ErrShortWrite
 		}
 		return nil
 	}
 
 	// net.Buffers will use writev for TCP connections and falls back to
 	// sequential writes for other io.Writer implementations (e.g. TLS).
-	if _, err := (&net.Buffers{header[:], frame.Payload}).WriteTo(w); err != nil {
+	if n, err := (&net.Buffers{header[:], frame.Payload}).WriteTo(w); err != nil {
 		return fmt.Errorf("failed to write frame: %w", err)
+	} else if n != int64(FrameHeaderSize+payloadLen) {
+		return io.ErrShortWrite
 	}
 
 	return nil
@@ -102,6 +124,9 @@ func ReadFrame(r io.Reader) (*Frame, error) {
 	}
 
 	frameType := FrameType(header[4])
+	if !frameType.IsValid() {
+		return nil, fmt.Errorf("invalid frame type: %d", frameType)
+	}
 
 	var payload []byte
 	var poolBuf *[]byte
@@ -137,7 +162,7 @@ func (f *Frame) Release() {
 		f.Payload = nil
 	}
 	// Reset queued marker to avoid carrying over stale state if the frame is reused.
-	f.queuedBytes = 0
+	f.queuedBytes.Store(0)
 }
 
 // NewFrame creates a new frame
