@@ -12,11 +12,15 @@ import (
 	"go.uber.org/zap"
 )
 
+const DefaultMaxDataConns = 64
+
 // ConnectionGroupManager manages all connection groups
 type ConnectionGroupManager struct {
 	groups map[string]*ConnectionGroup // TunnelID -> ConnectionGroup
 	mu     sync.RWMutex
 	logger *zap.Logger
+
+	maxDataConns int
 
 	// Cleanup
 	cleanupInterval time.Duration
@@ -27,9 +31,20 @@ type ConnectionGroupManager struct {
 
 // NewConnectionGroupManager creates a new connection group manager
 func NewConnectionGroupManager(logger *zap.Logger) *ConnectionGroupManager {
+	return NewConnectionGroupManagerWithMaxDataConns(logger, DefaultMaxDataConns)
+}
+
+// NewConnectionGroupManagerWithMaxDataConns creates a new connection group manager
+// with a server-enforced per-tunnel data connection cap.
+func NewConnectionGroupManagerWithMaxDataConns(logger *zap.Logger, maxDataConns int) *ConnectionGroupManager {
+	if maxDataConns <= 0 {
+		maxDataConns = DefaultMaxDataConns
+	}
+
 	m := &ConnectionGroupManager{
 		groups:          make(map[string]*ConnectionGroup),
 		logger:          logger,
+		maxDataConns:    maxDataConns,
 		cleanupInterval: 60 * time.Second,
 		staleTimeout:    5 * time.Minute,
 		stopCh:          make(chan struct{}),
@@ -38,6 +53,25 @@ func NewConnectionGroupManager(logger *zap.Logger) *ConnectionGroupManager {
 	go m.cleanupLoop()
 
 	return m
+}
+
+func (m *ConnectionGroupManager) MaxDataConns() int {
+	if m == nil || m.maxDataConns <= 0 {
+		return DefaultMaxDataConns
+	}
+	return m.maxDataConns
+}
+
+func (m *ConnectionGroupManager) EffectiveMaxDataConns(clientMaxDataConns int) int {
+	if clientMaxDataConns <= 0 {
+		return 0
+	}
+
+	serverMaxDataConns := m.MaxDataConns()
+	if clientMaxDataConns < serverMaxDataConns {
+		return clientMaxDataConns
+	}
+	return serverMaxDataConns
 }
 
 // GenerateTunnelID generates a unique tunnel ID
@@ -51,12 +85,18 @@ func GenerateTunnelID() string {
 
 // CreateGroup creates a new connection group
 func (m *ConnectionGroupManager) CreateGroup(subdomain, token string, primaryConn *Connection, tunnelType protocol.TunnelType) *ConnectionGroup {
+	return m.CreateGroupWithMaxDataConns(subdomain, token, primaryConn, tunnelType, m.MaxDataConns())
+}
+
+// CreateGroupWithMaxDataConns creates a new connection group with an effective
+// per-tunnel data connection cap.
+func (m *ConnectionGroupManager) CreateGroupWithMaxDataConns(subdomain, token string, primaryConn *Connection, tunnelType protocol.TunnelType, maxDataConns int) *ConnectionGroup {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	tunnelID := GenerateTunnelID()
 
-	group := NewConnectionGroup(tunnelID, subdomain, token, primaryConn, tunnelType, m.logger)
+	group := NewConnectionGroupWithMaxDataConns(tunnelID, subdomain, token, primaryConn, tunnelType, maxDataConns, m.logger)
 
 	m.groups[tunnelID] = group
 
