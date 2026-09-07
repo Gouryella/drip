@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"time"
 )
 
 var limitedConnBufPool = sync.Pool{
@@ -16,15 +17,23 @@ var limitedConnBufPool = sync.Pool{
 
 type LimitedConn struct {
 	net.Conn
-	limiter *Limiter
-	ctx     context.Context
+	limiter       *Limiter
+	ctx           context.Context
+	cancel        context.CancelFunc
+	readDeadline  connDeadline
+	writeDeadline connDeadline
 }
 
 func NewLimitedConn(ctx context.Context, conn net.Conn, limiter *Limiter) *LimitedConn {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithCancel(ctx)
 	return &LimitedConn{
 		Conn:    conn,
 		limiter: limiter,
 		ctx:     ctx,
+		cancel:  cancel,
 	}
 }
 
@@ -40,7 +49,7 @@ func (c *LimitedConn) Read(b []byte) (n int, err error) {
 
 	n, err = c.Conn.Read(b)
 	if n > 0 {
-		if waitErr := c.limiter.RateLimiter().WaitN(c.ctx, n); waitErr != nil {
+		if waitErr := c.waitN(n, &c.readDeadline); waitErr != nil {
 			if err == nil {
 				err = waitErr
 			}
@@ -60,7 +69,7 @@ func (c *LimitedConn) Write(b []byte) (n int, err error) {
 	for len(b) > 0 {
 		chunk := min(len(b), burst)
 
-		if err := c.limiter.RateLimiter().WaitN(c.ctx, chunk); err != nil {
+		if err := c.waitN(chunk, &c.writeDeadline); err != nil {
 			return total, err
 		}
 
@@ -68,6 +77,9 @@ func (c *LimitedConn) Write(b []byte) (n int, err error) {
 		total += nw
 		if err != nil {
 			return total, err
+		}
+		if nw != chunk {
+			return total, io.ErrShortWrite
 		}
 		b = b[chunk:]
 	}
@@ -87,6 +99,9 @@ func (c *LimitedConn) ReadFrom(r io.Reader) (n int64, err error) {
 			if ew != nil {
 				err = ew
 				break
+			}
+			if nw != nr {
+				return n, io.ErrShortWrite
 			}
 		}
 		if er != nil {
@@ -112,6 +127,9 @@ func (c *LimitedConn) WriteTo(w io.Writer) (n int64, err error) {
 				err = ew
 				break
 			}
+			if nw != nr {
+				return n, io.ErrShortWrite
+			}
 		}
 		if er != nil {
 			if er != io.EOF {
@@ -121,4 +139,39 @@ func (c *LimitedConn) WriteTo(w io.Writer) (n int64, err error) {
 		}
 	}
 	return n, err
+}
+
+func (c *LimitedConn) Close() error {
+	c.cancel()
+	return c.Conn.Close()
+}
+
+func (c *LimitedConn) CloseRead() error {
+	if conn, ok := c.Conn.(interface{ CloseRead() error }); ok {
+		return conn.CloseRead()
+	}
+	return nil
+}
+
+func (c *LimitedConn) CloseWrite() error {
+	if conn, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return conn.CloseWrite()
+	}
+	return c.Conn.Close()
+}
+
+func (c *LimitedConn) SetDeadline(t time.Time) error {
+	c.readDeadline.set(t)
+	c.writeDeadline.set(t)
+	return c.Conn.SetDeadline(t)
+}
+
+func (c *LimitedConn) SetReadDeadline(t time.Time) error {
+	c.readDeadline.set(t)
+	return c.Conn.SetReadDeadline(t)
+}
+
+func (c *LimitedConn) SetWriteDeadline(t time.Time) error {
+	c.writeDeadline.set(t)
+	return c.Conn.SetWriteDeadline(t)
 }
