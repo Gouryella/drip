@@ -6,11 +6,14 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"drip/internal/server/metrics"
 	"drip/internal/shared/netutil"
 	"drip/internal/shared/pool"
 	"drip/internal/shared/qos"
+	"drip/internal/shared/utils"
 
 	"go.uber.org/zap"
 )
@@ -22,10 +25,11 @@ type Proxy struct {
 	subdomain string
 	logger    *zap.Logger
 
-	listener net.Listener
-	stopCh   chan struct{}
-	once     sync.Once
-	wg       sync.WaitGroup
+	listener    net.Listener
+	stopCh      chan struct{}
+	once        sync.Once
+	wg          sync.WaitGroup
+	lifecycleMu sync.Mutex
 
 	openStream func() (net.Conn, error)
 	stats      trafficStats
@@ -85,8 +89,17 @@ func (p *Proxy) Start() error {
 }
 
 func (p *Proxy) StartWithListener(ln net.Listener) error {
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
+	if err := p.ctx.Err(); err != nil {
+		if ln != nil {
+			_ = ln.Close()
+		}
+		return err
+	}
+	addr := fmt.Sprintf("0.0.0.0:%d", p.port)
+
 	if ln == nil {
-		addr := fmt.Sprintf("0.0.0.0:%d", p.port)
 		var err error
 		ln, err = net.Listen("tcp", addr)
 		if err != nil {
@@ -107,12 +120,14 @@ func (p *Proxy) StartWithListener(ln net.Listener) error {
 
 func (p *Proxy) Stop() {
 	p.once.Do(func() {
+		p.lifecycleMu.Lock()
 		close(p.stopCh)
 		p.cancel()
 
 		if p.listener != nil {
 			_ = p.listener.Close()
 		}
+		p.lifecycleMu.Unlock()
 
 		done := make(chan struct{})
 		go func() {
@@ -142,6 +157,7 @@ func (p *Proxy) acceptLoop() {
 	defer p.wg.Done()
 
 	tcpLn, _ := p.listener.(*net.TCPListener)
+	retryDelay := 5 * time.Millisecond
 
 	for {
 		select {
@@ -156,6 +172,9 @@ func (p *Proxy) acceptLoop() {
 
 		conn, err := p.listener.Accept()
 		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				continue
 			}
@@ -163,9 +182,18 @@ func (p *Proxy) acceptLoop() {
 			case <-p.stopCh:
 				return
 			default:
-				continue
 			}
+			timer := time.NewTimer(retryDelay)
+			select {
+			case <-p.stopCh:
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			retryDelay = min(retryDelay*2, time.Second)
+			continue
 		}
+		retryDelay = 5 * time.Millisecond
 
 		p.wg.Add(1)
 		go p.handleConn(conn)
@@ -218,21 +246,22 @@ func (p *Proxy) handleConn(conn net.Conn) {
 		stream net.Conn
 		err    error
 	}
-	resultCh := make(chan streamResult, 1)
+	// An unbuffered handoff lets a timed-out caller close late streams.
+	resultCh := make(chan streamResult)
+
+	ctx, cancel := context.WithTimeout(p.ctx, openStreamTimeout)
+	defer cancel()
 
 	go func() {
 		s, err := p.openStream()
-		resultCh <- streamResult{s, err}
-	}()
-
-	drainLateResult := func() {
-		go func() {
-			result := <-resultCh
-			if result.stream != nil {
-				_ = result.stream.Close()
+		select {
+		case resultCh <- streamResult{s, err}:
+		case <-ctx.Done():
+			if s != nil {
+				_ = s.Close()
 			}
-		}()
-	}
+		}
+	}()
 
 	var stream net.Conn
 	select {
@@ -244,19 +273,15 @@ func (p *Proxy) handleConn(conn net.Conn) {
 			return
 		}
 		stream = result.stream
-	case <-time.After(openStreamTimeout):
-		drainLateResult()
+	case <-ctx.Done():
 		p.logger.Debug("Open stream timeout")
 		return
 	case <-p.stopCh:
-		drainLateResult()
-		return
-	case <-p.ctx.Done():
-		drainLateResult()
 		return
 	}
 
 	defer stream.Close()
+	cancel() // The timeout is only for opening the stream.
 
 	var limitedStream net.Conn = stream
 	if p.limiter != nil && p.limiter.IsLimited() {
@@ -265,20 +290,48 @@ func (p *Proxy) handleConn(conn net.Conn) {
 		}
 	}
 
-	_ = netutil.PipeWithCallbacksAndBufferSize(
+	var bytesIn atomic.Int64
+	var bytesOut atomic.Int64
+	err := netutil.PipeWithCallbacksAndBufferSize(
 		p.ctx,
 		conn,
 		limitedStream,
 		pool.SizeLarge,
 		func(n int64) {
+			bytesIn.Add(n)
 			if p.stats != nil {
 				p.stats.AddBytesIn(n)
 			}
 		},
 		func(n int64) {
+			bytesOut.Add(n)
 			if p.stats != nil {
 				p.stats.AddBytesOut(n)
 			}
 		},
 	)
+	p.recordTransferResult(bytesIn.Load()+bytesOut.Load(), err)
+}
+
+func (p *Proxy) recordTransferResult(bytesCopied int64, err error) {
+	result := utils.ClassifyTransferError(p.ctx, err)
+	metrics.ProxyTransferResults.WithLabelValues("tcp_proxy", result).Inc()
+
+	if err == nil || p.logger == nil {
+		return
+	}
+
+	fields := []zap.Field{
+		zap.String("operation", "tcp_proxy"),
+		zap.String("result", result),
+		zap.Int64("bytes_copied", bytesCopied),
+		zap.Int("port", p.port),
+		zap.String("subdomain_hash", utils.HashForLog(p.subdomain)),
+		zap.Error(err),
+	}
+	if utils.IsExpectedTransferResult(result) {
+		p.logger.Debug("TCP proxy transfer ended", fields...)
+		return
+	}
+	p.logger.Warn("TCP proxy transfer failed", fields...)
 }
