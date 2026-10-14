@@ -6,6 +6,7 @@ VERSION?=dev
 COMMIT=$(shell git rev-parse --short=10 HEAD 2>/dev/null || echo "unknown")
 BUILD_TIME=$(shell date -u '+%Y-%m-%d_%H:%M:%S')
 LDFLAGS=-ldflags "-s -w -X main.Version=${VERSION} -X main.GitCommit=${COMMIT} -X main.BuildTime=${BUILD_TIME}"
+STATICCHECK_VERSION?=v0.8.1
 
 # Default target
 all: clean deps test build
@@ -84,8 +85,8 @@ fmt:
 
 # Lint code
 lint:
-	@which golangci-lint > /dev/null || (echo "Installing golangci-lint..." && go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest)
-	golangci-lint run ./...
+	go vet ./...
+	go run honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION} ./...
 
 # Clean build artifacts
 clean:
@@ -96,7 +97,7 @@ clean:
 
 # Docker build
 docker-build:
-	docker build -t drip-server:${VERSION} -f deployments/Dockerfile .
+	docker build --build-arg VERSION=${VERSION} -t drip-server:${VERSION} -f deployments/Dockerfile.server .
 
 # Docker run
 docker-run:

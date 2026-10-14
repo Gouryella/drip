@@ -15,6 +15,7 @@ var (
 	subdomain          string
 	daemonMode         bool
 	daemonMarker       bool
+	daemonSecretFile   string
 	localAddress       string
 	allowIPs           []string
 	denyIPs            []string
@@ -74,6 +75,8 @@ func init() {
 	httpCmd.Flags().BoolVar(&skipLocalTLSVerify, "skip-local-tls-verify", false, "Skip TLS verification for local HTTPS backends")
 	httpCmd.Flags().BoolVar(&daemonMarker, "daemon-child", false, "Internal flag for daemon child process")
 	_ = httpCmd.Flags().MarkHidden("daemon-child")
+	httpCmd.Flags().StringVar(&daemonSecretFile, daemonSecretFileFlagName, "", "Internal daemon secret file")
+	_ = httpCmd.Flags().MarkHidden(daemonSecretFileFlagName)
 	rootCmd.AddCommand(httpCmd)
 }
 
@@ -83,8 +86,20 @@ func runHTTP(_ *cobra.Command, args []string) error {
 		return fmt.Errorf("invalid port number: %s", args[0])
 	}
 
+	if err := validateIPAccessFlags(); err != nil {
+		return err
+	}
+
 	if daemonMode && !daemonMarker {
-		return StartDaemon("http", port, buildDaemonArgs("http", args, subdomain, localAddress))
+		daemonArgs, err := buildDaemonArgs("http", args, subdomain, localAddress)
+		if err != nil {
+			return err
+		}
+		return StartDaemon("http", port, daemonArgs)
+	}
+
+	if err := applyDaemonSecretFile(); err != nil {
+		return err
 	}
 
 	if authPass != "" && authBearer != "" {

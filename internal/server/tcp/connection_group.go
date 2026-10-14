@@ -1,75 +1,34 @@
 package tcp
 
 import (
-	"container/heap"
+	"cmp"
+	"errors"
 	"fmt"
 	"net"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/hashicorp/yamux"
 
 	"drip/internal/shared/constants"
+	"drip/internal/shared/mux"
 	"drip/internal/shared/protocol"
 
 	"go.uber.org/zap"
 )
 
-// sessionEntry represents a session with its current stream count for heap operations
-type sessionEntry struct {
-	id      string
-	session *yamux.Session
-	streams int
-	heapIdx int // index in the heap, managed by heap.Interface
-}
+const primarySessionID = "primary"
 
-// sessionHeap implements heap.Interface for O(log n) session selection
-type sessionHeap []*sessionEntry
-
-func (h sessionHeap) Len() int { return len(h) }
-
-func (h sessionHeap) Less(i, j int) bool {
-	// Min-heap: session with fewer streams has higher priority
-	return h[i].streams < h[j].streams
-}
-
-func (h sessionHeap) Swap(i, j int) {
-	h[i], h[j] = h[j], h[i]
-	h[i].heapIdx = i
-	h[j].heapIdx = j
-}
-
-func (h *sessionHeap) Push(x interface{}) {
-	entry := x.(*sessionEntry)
-	entry.heapIdx = len(*h)
-	*h = append(*h, entry)
-}
-
-func (h *sessionHeap) Pop() interface{} {
-	old := *h
-	n := len(old)
-	entry := old[n-1]
-	old[n-1] = nil // avoid memory leak
-	entry.heapIdx = -1
-	*h = old[0 : n-1]
-	return entry
-}
-
-// sessionHeapPool reuses heap slices to reduce allocations
-var sessionHeapPool = sync.Pool{
-	New: func() interface{} {
-		h := make(sessionHeap, 0, 16)
-		return &h
-	},
-}
-
-func putSessionHeap(h *sessionHeap) {
-	if h == nil {
-		return
-	}
-	*h = (*h)[:0]
-	sessionHeapPool.Put(h)
-}
+var (
+	ErrInvalidDataConnectionID       = errors.New("invalid data connection id")
+	ErrReservedDataConnectionID      = errors.New("reserved data connection id")
+	ErrDuplicateDataConnectionID     = errors.New("duplicate data connection id")
+	ErrDataConnectionLimitExceeded   = errors.New("data connection limit exceeded")
+	ErrDataConnectionReservationLost = errors.New("data connection reservation lost")
+	ErrConnectionGroupClosed         = errors.New("connection group closed")
+)
 
 type ConnectionGroup struct {
 	TunnelID     string
@@ -77,6 +36,7 @@ type ConnectionGroup struct {
 	Token        string
 	PrimaryConn  *Connection
 	Sessions     map[string]*yamux.Session
+	MaxDataConns int
 	TunnelType   protocol.TunnelType
 	RegisteredAt time.Time
 	LastActivity time.Time
@@ -84,21 +44,29 @@ type ConnectionGroup struct {
 	stopCh       chan struct{}
 	logger       *zap.Logger
 
+	pendingDataSessions map[string]struct{}
+
 	heartbeatStarted bool
 }
 
 func NewConnectionGroup(tunnelID, subdomain, token string, primaryConn *Connection, tunnelType protocol.TunnelType, logger *zap.Logger) *ConnectionGroup {
+	return NewConnectionGroupWithMaxDataConns(tunnelID, subdomain, token, primaryConn, tunnelType, DefaultMaxDataConns, logger)
+}
+
+func NewConnectionGroupWithMaxDataConns(tunnelID, subdomain, token string, primaryConn *Connection, tunnelType protocol.TunnelType, maxDataConns int, logger *zap.Logger) *ConnectionGroup {
 	return &ConnectionGroup{
-		TunnelID:     tunnelID,
-		Subdomain:    subdomain,
-		Token:        token,
-		PrimaryConn:  primaryConn,
-		Sessions:     make(map[string]*yamux.Session),
-		TunnelType:   tunnelType,
-		RegisteredAt: time.Now(),
-		LastActivity: time.Now(),
-		stopCh:       make(chan struct{}),
-		logger:       logger.With(zap.String("tunnel_id", tunnelID)),
+		TunnelID:            tunnelID,
+		Subdomain:           subdomain,
+		Token:               token,
+		PrimaryConn:         primaryConn,
+		Sessions:            make(map[string]*yamux.Session),
+		MaxDataConns:        maxDataConns,
+		TunnelType:          tunnelType,
+		RegisteredAt:        time.Now(),
+		LastActivity:        time.Now(),
+		stopCh:              make(chan struct{}),
+		logger:              logger.With(zap.String("tunnel_id", tunnelID)),
+		pendingDataSessions: make(map[string]struct{}),
 	}
 }
 
@@ -256,6 +224,7 @@ func (g *ConnectionGroup) Close() {
 		}
 	}
 	g.Sessions = make(map[string]*yamux.Session)
+	g.pendingDataSessions = make(map[string]struct{})
 
 	g.mu.Unlock()
 
@@ -270,14 +239,140 @@ func (g *ConnectionGroup) IsStale(timeout time.Duration) bool {
 	return time.Since(g.LastActivity) > timeout
 }
 
-func (g *ConnectionGroup) AddSession(connID string, session *yamux.Session) {
-	if connID == "" || session == nil {
-		return
+func validateDataConnectionID(connID string) error {
+	if strings.TrimSpace(connID) == "" {
+		return fmt.Errorf("%w: empty connection id", ErrInvalidDataConnectionID)
+	}
+	if connID == primarySessionID {
+		return fmt.Errorf("%w: %q is reserved", ErrReservedDataConnectionID, primarySessionID)
+	}
+	return nil
+}
+
+func (g *ConnectionGroup) ReserveDataSession(connID string) error {
+	if err := validateDataConnectionID(connID); err != nil {
+		return err
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if g.Sessions == nil {
+		g.Sessions = make(map[string]*yamux.Session)
+	}
+	if g.pendingDataSessions == nil {
+		g.pendingDataSessions = make(map[string]struct{})
+	}
+	select {
+	case <-g.stopCh:
+		return ErrConnectionGroupClosed
+	default:
+	}
+
+	if _, exists := g.Sessions[connID]; exists {
+		return fmt.Errorf("%w: %q", ErrDuplicateDataConnectionID, connID)
+	}
+	if _, exists := g.pendingDataSessions[connID]; exists {
+		return fmt.Errorf("%w: %q", ErrDuplicateDataConnectionID, connID)
+	}
+
+	activeDataConns := g.dataSessionCountLocked()
+	pendingDataConns := len(g.pendingDataSessions)
+	if g.MaxDataConns <= 0 || activeDataConns+pendingDataConns >= g.MaxDataConns {
+		return fmt.Errorf("%w: active=%d pending=%d max=%d",
+			ErrDataConnectionLimitExceeded,
+			activeDataConns,
+			pendingDataConns,
+			g.MaxDataConns,
+		)
+	}
+
+	g.pendingDataSessions[connID] = struct{}{}
+	g.LastActivity = time.Now()
+	return nil
+}
+
+func (g *ConnectionGroup) CommitReservedSession(connID string, session *yamux.Session) error {
+	if err := validateDataConnectionID(connID); err != nil {
+		return err
+	}
+	if session == nil {
+		return fmt.Errorf("%w: nil yamux session", ErrInvalidDataConnectionID)
 	}
 
 	g.mu.Lock()
 	if g.Sessions == nil {
 		g.Sessions = make(map[string]*yamux.Session)
+	}
+	if g.pendingDataSessions == nil {
+		g.pendingDataSessions = make(map[string]struct{})
+	}
+	select {
+	case <-g.stopCh:
+		g.mu.Unlock()
+		return ErrConnectionGroupClosed
+	default:
+	}
+
+	if _, reserved := g.pendingDataSessions[connID]; !reserved {
+		g.mu.Unlock()
+		return fmt.Errorf("%w: %q", ErrDataConnectionReservationLost, connID)
+	}
+	delete(g.pendingDataSessions, connID)
+
+	if existing := g.Sessions[connID]; existing != nil && existing != session {
+		g.mu.Unlock()
+		return fmt.Errorf("%w: %q", ErrDuplicateDataConnectionID, connID)
+	}
+
+	g.Sessions[connID] = session
+	g.LastActivity = time.Now()
+
+	// Start heartbeat on first session
+	shouldStartHeartbeat := !g.heartbeatStarted
+	if shouldStartHeartbeat {
+		g.heartbeatStarted = true
+	}
+	g.mu.Unlock()
+
+	if shouldStartHeartbeat {
+		g.StartHeartbeat(constants.HeartbeatInterval, constants.HeartbeatTimeout)
+	}
+	return nil
+}
+
+func (g *ConnectionGroup) ReleaseDataSessionReservation(connID string) {
+	if connID == "" {
+		return
+	}
+
+	g.mu.Lock()
+	if g.pendingDataSessions != nil {
+		delete(g.pendingDataSessions, connID)
+	}
+	g.mu.Unlock()
+}
+
+func (g *ConnectionGroup) AddSession(connID string, session *yamux.Session) {
+	if connID == "" || session == nil {
+		return
+	}
+
+	var oldSession *yamux.Session
+
+	g.mu.Lock()
+	select {
+	case <-g.stopCh:
+		g.mu.Unlock()
+		_ = session.Close()
+		return
+	default:
+	}
+	if g.Sessions == nil {
+		g.Sessions = make(map[string]*yamux.Session)
+	}
+	if existing := g.Sessions[connID]; existing != nil && existing != session {
+		oldSession = existing
 	}
 	g.Sessions[connID] = session
 	g.LastActivity = time.Now()
@@ -288,6 +383,10 @@ func (g *ConnectionGroup) AddSession(connID string, session *yamux.Session) {
 		g.heartbeatStarted = true
 	}
 	g.mu.Unlock()
+
+	if oldSession != nil {
+		_ = oldSession.Close()
+	}
 
 	if shouldStartHeartbeat {
 		g.StartHeartbeat(constants.HeartbeatInterval, constants.HeartbeatTimeout)
@@ -319,16 +418,37 @@ func (g *ConnectionGroup) SessionCount() int {
 	return len(g.Sessions)
 }
 
-// OpenStream opens a new stream using a min-heap for O(log n) session selection.
+func (g *ConnectionGroup) DataSessionCount() int {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.dataSessionCountLocked()
+}
+
+func (g *ConnectionGroup) PendingDataSessionCount() int {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return len(g.pendingDataSessions)
+}
+
+func (g *ConnectionGroup) dataSessionCountLocked() int {
+	count := 0
+	for id, session := range g.Sessions {
+		if id == primarySessionID || session == nil || session.IsClosed() {
+			continue
+		}
+		count++
+	}
+	return count
+}
+
+const maxStreamsPerSession = 256
+
+// OpenStream selects the least-loaded data session, falling back to the
+// primary when all data sessions are unavailable. Scanning once avoids building
+// and allocating an entire heap for every request.
 func (g *ConnectionGroup) OpenStream() (net.Conn, error) {
-	const (
-		maxStreamsPerSession = 256
-		maxRetries           = 3
-		backoffBase          = 5 * time.Millisecond
-	)
-
+	const maxRetries = 3
 	var lastErr error
-
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		select {
 		case <-g.stopCh:
@@ -336,94 +456,114 @@ func (g *ConnectionGroup) OpenStream() (net.Conn, error) {
 		default:
 		}
 
-		h := g.buildSessionHeap(false)
-		if h.Len() == 0 {
-			putSessionHeap(h)
-			h = g.buildSessionHeap(true)
+		stream, err := g.openStreamAttempt()
+		if err == nil || err == net.ErrClosed {
+			return stream, err
+
 		}
-		if h.Len() == 0 {
-			putSessionHeap(h)
-			return nil, net.ErrClosed
-		}
-
-		anyUnderCap := false
-		for h.Len() > 0 {
-			entry := heap.Pop(h).(*sessionEntry)
-			session := entry.session
-
-			if session == nil || session.IsClosed() {
-				continue
-			}
-
-			currentStreams := session.NumStreams()
-			if currentStreams >= maxStreamsPerSession {
-				continue
-			}
-			anyUnderCap = true
-
-			stream, err := session.Open()
-			if err == nil {
-				putSessionHeap(h)
-				return stream, nil
-			}
-			lastErr = err
-
-			if session.IsClosed() {
-				g.deleteClosedSessions()
-			}
-		}
-
-		putSessionHeap(h)
-
-		if !anyUnderCap {
-			lastErr = fmt.Errorf("all sessions are at stream capacity (%d)", maxStreamsPerSession)
-		}
-
+		lastErr = err
 		if attempt < maxRetries-1 {
+			timer := time.NewTimer(5 * time.Millisecond * time.Duration(attempt+1))
 			select {
 			case <-g.stopCh:
+				timer.Stop()
 				return nil, net.ErrClosed
-			case <-time.After(backoffBase * time.Duration(attempt+1)):
+			case <-timer.C:
 			}
 		}
-	}
-
-	if lastErr == nil {
-		lastErr = fmt.Errorf("failed to open stream")
 	}
 	return nil, lastErr
 }
 
-// buildSessionHeap creates a min-heap of sessions ordered by stream count.
-func (g *ConnectionGroup) buildSessionHeap(includePrimary bool) *sessionHeap {
-	g.mu.RLock()
-	defer g.mu.RUnlock()
-
-	if len(g.Sessions) == 0 {
-		h := sessionHeapPool.Get().(*sessionHeap)
-		return h
+// openStreamAttempt keeps the normal path O(n) with no candidate allocation.
+// After a failed open, sort one snapshot instead of rescanning for each failure.
+// A retry round therefore costs O(n log n) in the worst case, excluding I/O.
+func (g *ConnectionGroup) openStreamAttempt() (net.Conn, error) {
+	session, hasSessions := g.pickSession()
+	if session == nil {
+		if !hasSessions {
+			return nil, net.ErrClosed
+		}
+		return nil, fmt.Errorf("all sessions are at stream capacity (%d)", maxStreamsPerSession)
+	}
+	stream, lastErr := mux.OpenStream(session)
+	if lastErr == nil {
+		return stream, nil
 	}
 
-	h := sessionHeapPool.Get().(*sessionHeap)
-	*h = (*h)[:0]
+	for _, candidate := range g.fallbackSessions(session) {
+		select {
+		case <-g.stopCh:
+			return nil, net.ErrClosed
+		default:
+		}
+		if candidate.session.IsClosed() || candidate.session.NumStreams() >= maxStreamsPerSession {
+			continue
+		}
+		stream, err := mux.OpenStream(candidate.session)
+		if err == nil {
+			return stream, nil
+		}
+		lastErr = err
+	}
+	// One cleanup scan per round, including sessions closed during an open.
+	g.deleteClosedSessions()
+	return nil, lastErr
+}
 
+type streamCandidate struct {
+	session *yamux.Session
+	streams int
+	primary bool
+}
+
+func (g *ConnectionGroup) fallbackSessions(exclude *yamux.Session) []streamCandidate {
+	g.mu.RLock()
+	candidates := make([]streamCandidate, 0, len(g.Sessions))
+	for id, session := range g.Sessions {
+		if session == nil || session == exclude || session.IsClosed() {
+			continue
+		}
+		candidates = append(candidates, streamCandidate{session: session, streams: session.NumStreams(), primary: id == primarySessionID})
+	}
+	g.mu.RUnlock()
+	slices.SortFunc(candidates, func(a, b streamCandidate) int {
+		if a.primary != b.primary {
+			if a.primary {
+				return 1
+			}
+			return -1
+		}
+		return cmp.Compare(a.streams, b.streams)
+	})
+	return candidates
+}
+
+func (g *ConnectionGroup) pickSession() (*yamux.Session, bool) {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	var best, primary *yamux.Session
+	bestStreams := maxStreamsPerSession
+	hasSessions := false
 	for id, session := range g.Sessions {
 		if session == nil || session.IsClosed() {
 			continue
 		}
-		if id == "primary" && !includePrimary {
+		hasSessions = true
+		streams := session.NumStreams()
+		if streams >= maxStreamsPerSession {
 			continue
 		}
-
-		*h = append(*h, &sessionEntry{
-			id:      id,
-			session: session,
-			streams: session.NumStreams(),
-		})
+		if id == primarySessionID {
+			primary = session
+		} else if best == nil || streams < bestStreams {
+			best, bestStreams = session, streams
+		}
 	}
-
-	heap.Init(h)
-	return h
+	if best != nil {
+		return best, hasSessions
+	}
+	return primary, hasSessions
 }
 
 func (g *ConnectionGroup) deleteClosedSessions() {

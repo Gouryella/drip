@@ -7,12 +7,14 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"drip/internal/server/tunnel"
 	"drip/internal/shared/protocol"
+	"drip/pkg/config"
 
 	"go.uber.org/zap"
 )
@@ -25,6 +27,11 @@ func newProxySSETestServer(t *testing.T, streamHandler func(net.Conn)) *httptest
 }
 
 func newProxySSETestServerWithWriteTimeout(t *testing.T, writeTimeout time.Duration, streamHandler func(net.Conn)) *httptest.Server {
+	t.Helper()
+	return newProxySSETestServerWithHandlerConfig(t, writeTimeout, nil, streamHandler)
+}
+
+func newProxySSETestServerWithHandlerConfig(t *testing.T, writeTimeout time.Duration, configure func(*HandlerConfig), streamHandler func(net.Conn)) *httptest.Server {
 	t.Helper()
 
 	logger := zap.NewNop()
@@ -54,12 +61,16 @@ func newProxySSETestServerWithWriteTimeout(t *testing.T, writeTimeout time.Durat
 		return serverSide, nil
 	})
 
-	handler := NewHandler(HandlerConfig{
+	handlerConfig := HandlerConfig{
 		Manager:      manager,
 		Logger:       logger,
 		ServerDomain: "drip.test",
 		TunnelDomain: testTunnelDomain,
-	})
+	}
+	if configure != nil {
+		configure(&handlerConfig)
+	}
+	handler := NewHandler(handlerConfig)
 
 	server := httptest.NewUnstartedServer(handler)
 	server.Config.WriteTimeout = writeTimeout
@@ -177,7 +188,7 @@ func TestHandlerFlushesEventStreamResponse(t *testing.T) {
 	releaseOnce.Do(func() { close(release) })
 }
 
-func TestHandlerClearsWriteDeadlineForSlowEventStream(t *testing.T) {
+func TestHandlerRefreshesWriteDeadlineForSlowEventStream(t *testing.T) {
 	release := make(chan struct{})
 	var releaseOnce sync.Once
 
@@ -207,6 +218,94 @@ func TestHandlerClearsWriteDeadlineForSlowEventStream(t *testing.T) {
 	}
 
 	releaseOnce.Do(func() { close(release) })
+}
+
+func TestHandlerRejectsOversizedTunnelResponseHeader(t *testing.T) {
+	server := newProxySSETestServer(t, func(conn net.Conn) {
+		defer conn.Close()
+		readProxyRequest(t, conn)
+		_, _ = fmt.Fprintf(conn,
+			"HTTP/1.1 200 OK\r\n"+
+				"X-Large: %s\r\n"+
+				"\r\n"+
+				"hello",
+			strings.Repeat("a", int(defaultMaxResponseHeaderBytes)+1024),
+		)
+	})
+	defer server.Close()
+
+	resp := doProxyRequestWithin(t, server, "/large-header?secret=hidden", time.Second)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusBadGateway)
+	}
+}
+
+func TestHandlerTimesOutReadingTunnelResponseHeader(t *testing.T) {
+	server := newProxySSETestServerWithHandlerConfig(t, 0, func(cfg *HandlerConfig) {
+		cfg.ResponseHeaderTimeout = 20 * time.Millisecond
+	}, func(conn net.Conn) {
+		defer conn.Close()
+		readProxyRequest(t, conn)
+		time.Sleep(200 * time.Millisecond)
+	})
+	defer server.Close()
+
+	resp := doProxyRequestWithin(t, server, "/slow-header", time.Second)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusBadGateway)
+	}
+}
+
+func TestHandlerRejectsRequestBodyOverDefaultLimitBeforeOpeningStream(t *testing.T) {
+	logger := zap.NewNop()
+	manager := tunnel.NewManagerWithConfig(logger, tunnel.ManagerConfig{
+		MaxTunnels:      10,
+		MaxTunnelsPerIP: 10,
+		RateLimit:       1000,
+		RateLimitWindow: time.Second,
+	})
+
+	subdomain, err := manager.Register(nil, "demo")
+	if err != nil {
+		t.Fatalf("register tunnel: %v", err)
+	}
+	defer manager.Unregister(subdomain)
+
+	tconn, ok := manager.Get(subdomain)
+	if !ok {
+		t.Fatalf("registered tunnel %q was not found", subdomain)
+	}
+	tconn.SetTunnelType(protocol.TunnelTypeHTTP)
+	streamOpened := false
+	tconn.SetOpenStream(func() (net.Conn, error) {
+		streamOpened = true
+		return nil, fmt.Errorf("stream should not be opened")
+	})
+
+	handler := NewHandler(HandlerConfig{
+		Manager:      manager,
+		Logger:       logger,
+		ServerDomain: "drip.test",
+		TunnelDomain: testTunnelDomain,
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "http://demo."+testTunnelDomain+"/upload?secret=hidden", http.NoBody)
+	req.Host = "demo." + testTunnelDomain
+	req.ContentLength = config.DefaultMaxRequestBodyBytes + 1
+	rr := httptest.NewRecorder()
+
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusRequestEntityTooLarge)
+	}
+	if streamOpened {
+		t.Fatal("stream was opened for an over-limit request body")
+	}
 }
 
 func TestHandlerPreservesContentLengthForOrdinaryResponse(t *testing.T) {

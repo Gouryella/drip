@@ -1,11 +1,42 @@
 services:
   drip-server:
-    image: driptunnel/drip-server:${VERSION:-latest}
+    image: "driptunnel/drip-server:${VERSION:?Set VERSION to a pinned release tag, e.g. v0.7.0}"
     container_name: drip-server
     restart: unless-stopped
     ports:
-      - "443:443"
+      - "443:8443"
       - "20000-20100:20000-20100"
     volumes:
       - ./config.yaml:/app/config.yaml:ro
-      - ./certs:/app/certs:ro
+      - drip-data:/app/data
+    environment:
+      DRIP_TOKEN: ${DRIP_TOKEN:?Set DRIP_TOKEN to a long random server auth token}
+      DRIP_METRICS_TOKEN: ${DRIP_METRICS_TOKEN:?Set DRIP_METRICS_TOKEN to a long random metrics token}
+    secrets:
+      - source: drip_tls_cert
+        target: drip_tls_cert
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+      - source: drip_tls_key
+        target: drip_tls_key
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid,nodev
+    pids_limit: 256
+
+volumes:
+  drip-data:
+
+secrets:
+  drip_tls_cert:
+    file: ./certs/fullchain.pem
+  drip_tls_key:
+    file: ./certs/privkey.pem

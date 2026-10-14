@@ -3,6 +3,7 @@ package wsutil
 import (
 	"io"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -13,14 +14,22 @@ import (
 // It uses binary messages for data transfer, making it compatible
 // with yamux and the existing frame protocol.
 type Conn struct {
-	ws         *websocket.Conn
-	reader     io.Reader
-	readMu     sync.Mutex
-	writeMu    sync.Mutex
-	localAddr  net.Addr
-	remoteAddr net.Addr
-	pingStop   chan struct{}
-	pingOnce   sync.Once
+	ws            *websocket.Conn
+	reader        io.Reader
+	readMu        sync.Mutex
+	writeMu       sync.Mutex
+	localAddr     net.Addr
+	remoteAddr    net.Addr
+	pingStop      chan struct{}
+	pingOnce      sync.Once
+	closeOnce     sync.Once
+	closeErr      error
+	deadlineMu    sync.Mutex
+	writeDeadline time.Time
+	writeTimer    *time.Timer
+	writeActive   bool
+	closed        bool
+	writeTimedOut bool
 }
 
 // NewConn wraps a WebSocket connection as a net.Conn.
@@ -46,6 +55,9 @@ func NewConnWithPing(ws *websocket.Conn, pingInterval time.Duration) *Conn {
 // It handles WebSocket message boundaries transparently, presenting
 // a continuous byte stream to the caller.
 func (c *Conn) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
 	c.readMu.Lock()
 	defer c.readMu.Unlock()
 
@@ -80,9 +92,36 @@ func (c *Conn) Read(p []byte) (int, error) {
 func (c *Conn) Write(p []byte) (int, error) {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	c.deadlineMu.Lock()
+	if c.closed {
+		c.deadlineMu.Unlock()
+		return 0, net.ErrClosed
+	}
+	if !c.writeDeadline.IsZero() && !time.Now().Before(c.writeDeadline) {
+		c.deadlineMu.Unlock()
+		return 0, os.ErrDeadlineExceeded
+	}
+	// Keep gorilla's socket deadline unset. Our timer handles deadline
+	// updates without racing the deadline gorilla applies when flushing.
+	_ = c.ws.SetWriteDeadline(time.Time{})
+	c.writeActive = true
+	c.resetWriteTimerLocked()
+	c.deadlineMu.Unlock()
+	defer func() {
+		c.deadlineMu.Lock()
+		c.writeActive = false
+		c.resetWriteTimerLocked()
+		c.deadlineMu.Unlock()
+	}()
 
 	err := c.ws.WriteMessage(websocket.BinaryMessage, p)
 	if err != nil {
+		c.deadlineMu.Lock()
+		timedOut := c.writeTimedOut
+		c.deadlineMu.Unlock()
+		if timedOut {
+			return 0, os.ErrDeadlineExceeded
+		}
 		return 0, err
 	}
 	return len(p), nil
@@ -90,17 +129,18 @@ func (c *Conn) Write(p []byte) (int, error) {
 
 // Close closes the WebSocket connection.
 func (c *Conn) Close() error {
-	c.pingOnce.Do(func() {
-		close(c.pingStop)
+	c.closeOnce.Do(func() {
+		c.pingOnce.Do(func() { close(c.pingStop) })
+		c.deadlineMu.Lock()
+		c.closed = true
+		c.writeActive = false
+		c.resetWriteTimerLocked()
+		c.deadlineMu.Unlock()
+		// Close must interrupt an in-flight writer. Waiting for writeMu or
+		// sending a close frame here can deadlock behind a stalled peer.
+		c.closeErr = c.ws.Close()
 	})
-
-	// Send close message before closing
-	c.writeMu.Lock()
-	_ = c.ws.WriteMessage(websocket.CloseMessage,
-		websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
-	c.writeMu.Unlock()
-
-	return c.ws.Close()
+	return c.closeErr
 }
 
 // LocalAddr returns the local network address.
@@ -118,7 +158,7 @@ func (c *Conn) SetDeadline(t time.Time) error {
 	if err := c.ws.SetReadDeadline(t); err != nil {
 		return err
 	}
-	return c.ws.SetWriteDeadline(t)
+	return c.SetWriteDeadline(t)
 }
 
 // SetReadDeadline sets the read deadline.
@@ -128,7 +168,40 @@ func (c *Conn) SetReadDeadline(t time.Time) error {
 
 // SetWriteDeadline sets the write deadline.
 func (c *Conn) SetWriteDeadline(t time.Time) error {
-	return c.ws.SetWriteDeadline(t)
+	c.deadlineMu.Lock()
+	defer c.deadlineMu.Unlock()
+	if c.closed {
+		return net.ErrClosed
+	}
+	c.writeDeadline = t
+	c.resetWriteTimerLocked()
+	// Do not wait for writeMu: deadline changes must interrupt an ongoing
+	// Write. Only Write touches gorilla's non-concurrent deadline field.
+	return nil
+}
+
+func (c *Conn) resetWriteTimerLocked() {
+	if c.writeTimer != nil {
+		c.writeTimer.Stop()
+		c.writeTimer = nil
+	}
+	if !c.writeActive || c.writeDeadline.IsZero() {
+		return
+	}
+	deadline := c.writeDeadline
+	c.writeTimer = time.AfterFunc(time.Until(deadline), func() {
+		c.deadlineMu.Lock()
+		expired := c.writeActive && c.writeDeadline.Equal(deadline) && !time.Now().Before(deadline)
+		if expired {
+			c.writeTimedOut = true
+		}
+		c.deadlineMu.Unlock()
+		if expired {
+			// Gorilla cannot reuse a connection after a write timeout. Closing
+			// also covers a write that was about to reset the socket deadline.
+			_ = c.Close()
+		}
+	})
 }
 
 // startPingLoop starts a goroutine that sends periodic ping messages
@@ -147,14 +220,13 @@ func (c *Conn) startPingLoop(interval time.Duration) {
 			case <-c.pingStop:
 				return
 			case <-ticker.C:
-				c.writeMu.Lock()
 				err := c.ws.WriteControl(
 					websocket.PingMessage,
 					[]byte{},
 					time.Now().Add(10*time.Second),
 				)
-				c.writeMu.Unlock()
 				if err != nil {
+					_ = c.Close()
 					return
 				}
 			}

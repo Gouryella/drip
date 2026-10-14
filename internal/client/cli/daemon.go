@@ -211,6 +211,15 @@ func KillProcess(pid int) error {
 
 // StartDaemon starts the current process as a daemon
 func StartDaemon(tunnelType string, port int, args []string) error {
+	cleanArgs := sanitizeDaemonArgs(args)
+	secretPath := parseFlagValue(cleanArgs, daemonSecretFileFlag, "", "")
+	secretTransferred := false
+	defer func() {
+		if secretPath != "" && !secretTransferred {
+			_ = os.Remove(secretPath)
+		}
+	}()
+
 	if err := validateDaemonTarget(tunnelType, port); err != nil {
 		return err
 	}
@@ -221,15 +230,9 @@ func StartDaemon(tunnelType string, port int, args []string) error {
 		return fmt.Errorf("failed to get executable path: %w", err)
 	}
 
-	cleanArgs := sanitizeDaemonArgs(args)
-
 	cmd := exec.Command(executable, cleanArgs...) // #nosec G204 -- exec.Command does not invoke a shell; executable and daemon target are validated separately
 
 	setupDaemonCmd(cmd)
-
-	if token := resolveDaemonToken(cleanArgs); token != "" {
-		cmd.Env = append(os.Environ(), "DRIP_TOKEN="+token)
-	}
 
 	logDir := getDaemonDir()
 	if err := os.MkdirAll(logDir, 0700); err != nil {
@@ -258,6 +261,7 @@ func StartDaemon(tunnelType string, port int, args []string) error {
 		_ = devNull.Close()
 		return fmt.Errorf("failed to start daemon: %w", err)
 	}
+	secretTransferred = true
 
 	_ = logFile.Close()
 	_ = devNull.Close()

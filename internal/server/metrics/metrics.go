@@ -103,4 +103,14 @@ var (
 		Name: "drip_http_requests_in_flight",
 		Help: "Current number of HTTP requests being processed",
 	})
+
+	ProxyAuthEvents = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "drip_proxy_auth_events_total",
+		Help: "Total number of proxy authentication failures and lockouts",
+	}, []string{"auth_type", "outcome", "reason"})
+
+	ProxyTransferResults = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "drip_proxy_transfer_results_total",
+		Help: "Total number of proxy response copy and pipe outcomes",
+	}, []string{"operation", "result"})
 )

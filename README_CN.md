@@ -17,7 +17,7 @@
 
 <div align="center">
 
-[![Go](https://img.shields.io/badge/Go-1.21+-00ADD8?style=flat&logo=go)](https://golang.org/)
+[![Go](https://img.shields.io/badge/Go-1.26.8+-00ADD8?style=flat&logo=go)](https://golang.org/)
 [![License](https://img.shields.io/badge/License-BSD--3--Clause-blue.svg)](LICENSE)
 [![TLS](https://img.shields.io/badge/TLS-1.3-green.svg)](https://tools.ietf.org/html/rfc8446)
 
@@ -60,9 +60,41 @@ burst_multiplier: 2.5
 
 ### 安装
 
+请选择固定 release 标签，并在执行任何脚本前先校验下载内容。安装脚本现在默认拒绝未固定版本的
+release 下载（除非显式传入 `--allow-latest`），并会在解压前校验 release 归档的 SHA256。
+
 ```bash
-bash <(curl -sL https://driptunnel.app/install.sh)
+VERSION=v0.7.0
+SCRIPT=install-client.sh
+SCRIPT_SHA256=<install-client.sh 的 sha256>
+ARCHIVE_SHA256=<GitHub Release checksums 文件中的归档 sha256>
+
+curl -fsSLO "https://raw.githubusercontent.com/Gouryella/drip/${VERSION}/scripts/${SCRIPT}"
+
+# Linux:
+printf '%s  %s\n' "$SCRIPT_SHA256" "$SCRIPT" | sha256sum -c -
+
+# macOS:
+printf '%s  %s\n' "$SCRIPT_SHA256" "$SCRIPT" | shasum -a 256 -c -
+
+bash "$SCRIPT" --version "$VERSION" --checksum "$ARCHIVE_SHA256"
 ```
+
+如果手动安装二进制，请先校验 release checksum 文件：
+
+```bash
+VERSION=v0.7.0
+VERSION_NUMBER="${VERSION#v}"
+ARCHIVE="drip_${VERSION_NUMBER}_linux_amd64.tar.gz"
+
+curl -fsSLO "https://github.com/Gouryella/drip/releases/download/${VERSION}/${ARCHIVE}"
+curl -fsSLO "https://github.com/Gouryella/drip/releases/download/${VERSION}/drip_${VERSION_NUMBER}_checksums.txt"
+grep " ${ARCHIVE}$" "drip_${VERSION_NUMBER}_checksums.txt" | sha256sum -c -
+tar -xzf "$ARCHIVE"
+```
+
+生产环境请避免使用 `curl | bash`。如果只是在一次性测试环境里有意使用管道，也应固定
+`--version`、提供 `--checksum`，并先审阅脚本内容。
 
 ### 基本使用
 

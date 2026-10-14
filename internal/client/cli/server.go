@@ -28,7 +28,9 @@ var (
 	serverDomain              string
 	serverTunnelDomain        string
 	serverAuthToken           string
+	serverAllowAnonymous      bool
 	serverMetricsToken        string
+	serverTrustedProxies      string
 	serverDebug               bool
 	serverTCPPortMin          int
 	serverTCPPortMax          int
@@ -62,7 +64,9 @@ func init() {
 	serverCmd.Flags().StringVarP(&serverDomain, "domain", "d", getEnvString("DRIP_DOMAIN", constants.DefaultDomain), "Server domain for client connections (env: DRIP_DOMAIN)")
 	serverCmd.Flags().StringVar(&serverTunnelDomain, "tunnel-domain", getEnvString("DRIP_TUNNEL_DOMAIN", ""), "Domain for tunnel URLs, defaults to --domain (env: DRIP_TUNNEL_DOMAIN)")
 	serverCmd.Flags().StringVarP(&serverAuthToken, "token", "t", getEnvString("DRIP_TOKEN", ""), "Authentication token (env: DRIP_TOKEN)")
+	serverCmd.Flags().BoolVar(&serverAllowAnonymous, "allow-anonymous", getEnvBool("DRIP_ALLOW_ANONYMOUS", false), "Allow unauthenticated tunnel registration (env: DRIP_ALLOW_ANONYMOUS)")
 	serverCmd.Flags().StringVar(&serverMetricsToken, "metrics-token", getEnvString("DRIP_METRICS_TOKEN", ""), "Metrics and stats token (env: DRIP_METRICS_TOKEN)")
+	serverCmd.Flags().StringVar(&serverTrustedProxies, "trusted-proxies", getEnvString("DRIP_TRUSTED_PROXIES", ""), "Comma-separated trusted reverse proxy IPs/CIDRs for X-Forwarded-For and X-Real-IP (env: DRIP_TRUSTED_PROXIES)")
 	serverCmd.Flags().BoolVar(&serverDebug, "debug", false, "Enable debug logging")
 	serverCmd.Flags().IntVar(&serverTCPPortMin, "tcp-port-min", getEnvInt("DRIP_TCP_PORT_MIN", constants.DefaultTCPPortMin), "Minimum TCP tunnel port (env: DRIP_TCP_PORT_MIN)")
 	serverCmd.Flags().IntVar(&serverTCPPortMax, "tcp-port-max", getEnvInt("DRIP_TCP_PORT_MAX", constants.DefaultTCPPortMax), "Maximum TCP tunnel port (env: DRIP_TCP_PORT_MAX)")
@@ -77,7 +81,7 @@ func init() {
 	// Transport and tunnel type restrictions
 	serverCmd.Flags().StringVar(&serverTransports, "transports", getEnvString("DRIP_TRANSPORTS", "tcp,wss"), "Allowed transports: tcp,wss (env: DRIP_TRANSPORTS)")
 	serverCmd.Flags().StringVar(&serverTunnelTypes, "tunnel-types", getEnvString("DRIP_TUNNEL_TYPES", "http,https,tcp"), "Allowed tunnel types: http,https,tcp (env: DRIP_TUNNEL_TYPES)")
-	serverCmd.Flags().Int64Var(&serverMaxRequestBodyBytes, "max-request-body-bytes", getEnvInt64("DRIP_MAX_REQUEST_BODY_BYTES", 0), "Maximum tunneled HTTP request body size in bytes; 0 disables the limit (env: DRIP_MAX_REQUEST_BODY_BYTES)")
+	serverCmd.Flags().Int64Var(&serverMaxRequestBodyBytes, "max-request-body-bytes", getEnvInt64("DRIP_MAX_REQUEST_BODY_BYTES", config.DefaultMaxRequestBodyBytes), "Maximum tunneled HTTP request body size in bytes; 0 disables the limit and is high-risk (env: DRIP_MAX_REQUEST_BODY_BYTES)")
 }
 
 func runServer(cmd *cobra.Command, _ []string) error {
@@ -97,8 +101,11 @@ func runServer(cmd *cobra.Command, _ []string) error {
 			return fmt.Errorf("failed to load config file: %w", err)
 		}
 	}
+	maxRequestBodyBytesExplicit := cfg != nil && cfg.MaxRequestBodyBytesExplicit()
 	if cfg == nil {
-		cfg = &config.ServerConfig{}
+		cfg = &config.ServerConfig{
+			MaxRequestBodyBytes: config.DefaultMaxRequestBodyBytes,
+		}
 	}
 
 	// Port
@@ -140,11 +147,25 @@ func runServer(cmd *cobra.Command, _ []string) error {
 		cfg.AuthToken = serverAuthToken
 	}
 
+	// AllowAnonymous
+	if cmd.Flags().Changed("allow-anonymous") {
+		cfg.AllowAnonymous = serverAllowAnonymous
+	} else if os.Getenv("DRIP_ALLOW_ANONYMOUS") != "" {
+		cfg.AllowAnonymous = serverAllowAnonymous
+	}
+
 	// MetricsToken
 	if cmd.Flags().Changed("metrics-token") {
 		cfg.MetricsToken = serverMetricsToken
 	} else if os.Getenv("DRIP_METRICS_TOKEN") != "" {
 		cfg.MetricsToken = serverMetricsToken
+	}
+
+	// TrustedProxies
+	if cmd.Flags().Changed("trusted-proxies") {
+		cfg.TrustedProxies = parseCommaSeparated(serverTrustedProxies)
+	} else if os.Getenv("DRIP_TRUSTED_PROXIES") != "" {
+		cfg.TrustedProxies = parseCommaSeparated(serverTrustedProxies)
 	}
 
 	// Debug
@@ -212,8 +233,10 @@ func runServer(cmd *cobra.Command, _ []string) error {
 	// MaxRequestBodyBytes
 	if cmd.Flags().Changed("max-request-body-bytes") {
 		cfg.MaxRequestBodyBytes = serverMaxRequestBodyBytes
+		maxRequestBodyBytesExplicit = true
 	} else if os.Getenv("DRIP_MAX_REQUEST_BODY_BYTES") != "" {
 		cfg.MaxRequestBodyBytes = serverMaxRequestBodyBytes
+		maxRequestBodyBytesExplicit = true
 	}
 
 	// TLSEnabled
@@ -314,28 +337,31 @@ func runServer(cmd *cobra.Command, _ []string) error {
 	listenAddr := fmt.Sprintf("0.0.0.0:%d", cfg.Port)
 
 	httpHandler := proxy.NewHandler(proxy.HandlerConfig{
-		Manager:             tunnelManager,
-		Logger:              logger,
-		ServerDomain:        cfg.Domain,
-		TunnelDomain:        cfg.TunnelDomain,
-		AuthToken:           cfg.AuthToken,
-		MetricsToken:        cfg.MetricsToken,
-		MaxRequestBodyBytes: cfg.MaxRequestBodyBytes,
+		Manager:                    tunnelManager,
+		Logger:                     logger,
+		ServerDomain:               cfg.Domain,
+		TunnelDomain:               cfg.TunnelDomain,
+		AuthToken:                  cfg.AuthToken,
+		MetricsToken:               cfg.MetricsToken,
+		TrustedProxies:             cfg.TrustedProxies,
+		MaxRequestBodyBytes:        cfg.MaxRequestBodyBytes,
+		UnsafeUnlimitedRequestBody: maxRequestBodyBytesExplicit && cfg.MaxRequestBodyBytes == 0,
 	})
 	httpHandler.SetAllowedTransports(cfg.AllowedTransports)
 	httpHandler.SetAllowedTunnelTypes(cfg.AllowedTunnelTypes)
 
 	listener := tcp.NewListener(tcp.ListenerConfig{
-		Address:      listenAddr,
-		TLSConfig:    tlsConfig,
-		AuthToken:    cfg.AuthToken,
-		Manager:      tunnelManager,
-		Logger:       logger,
-		PortAlloc:    portAllocator,
-		Domain:       cfg.Domain,
-		TunnelDomain: cfg.TunnelDomain,
-		PublicPort:   cfg.PublicPort,
-		HTTPHandler:  httpHandler,
+		Address:        listenAddr,
+		TLSConfig:      tlsConfig,
+		AuthToken:      cfg.AuthToken,
+		AllowAnonymous: cfg.AllowAnonymous,
+		Manager:        tunnelManager,
+		Logger:         logger,
+		PortAlloc:      portAllocator,
+		Domain:         cfg.Domain,
+		TunnelDomain:   cfg.TunnelDomain,
+		PublicPort:     cfg.PublicPort,
+		HTTPHandler:    httpHandler,
 	})
 	listener.SetAllowedTransports(cfg.AllowedTransports)
 	listener.SetAllowedTunnelTypes(cfg.AllowedTunnelTypes)
@@ -361,6 +387,8 @@ func runServer(cmd *cobra.Command, _ []string) error {
 		logger.Info("HTTP request body limit configured",
 			zap.Int64("max_request_body_bytes", cfg.MaxRequestBodyBytes),
 		)
+	} else {
+		logger.Warn("HTTP request body limit disabled; this is a high-risk public-server configuration")
 	}
 
 	if err := listener.Start(); err != nil {
@@ -379,6 +407,7 @@ func runServer(cmd *cobra.Command, _ []string) error {
 		zap.String("protocol", protocol),
 		zap.Strings("transports", cfg.AllowedTransports),
 		zap.Strings("tunnel_types", cfg.AllowedTunnelTypes),
+		zap.Strings("trusted_proxies", cfg.TrustedProxies),
 	)
 
 	quit := make(chan os.Signal, 1)
@@ -413,6 +442,17 @@ func getEnvInt64(key string, defaultVal int64) int64 {
 		}
 	}
 	return defaultVal
+}
+
+func getEnvBool(key string, defaultVal bool) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "1", "true", "yes", "y", "on":
+		return true
+	case "0", "false", "no", "n", "off":
+		return false
+	default:
+		return defaultVal
+	}
 }
 
 // getEnvString returns the environment variable value, or defaultVal if not set

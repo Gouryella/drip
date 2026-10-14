@@ -5,10 +5,11 @@ import (
 	"os"
 	"time"
 
+	"drip/internal/shared/netutil"
 	"drip/pkg/config"
 )
 
-func buildDaemonArgs(tunnelType string, args []string, subdomain string, localAddress string) []string {
+func buildDaemonArgs(tunnelType string, args []string, subdomain string, localAddress string) ([]string, error) {
 	daemonArgs := append([]string{tunnelType}, args...)
 	daemonArgs = append(daemonArgs, "--daemon-child")
 
@@ -21,11 +22,16 @@ func buildDaemonArgs(tunnelType string, args []string, subdomain string, localAd
 	if serverURL != "" {
 		daemonArgs = append(daemonArgs, "--server", serverURL)
 	}
-	if authPass != "" {
-		daemonArgs = append(daemonArgs, "--auth", authPass)
-	}
-	if authBearer != "" {
-		daemonArgs = append(daemonArgs, "--auth-bearer", authBearer)
+	if authToken != "" || authPass != "" || authBearer != "" {
+		secretPath, err := writeDaemonSecretFile(daemonSecretPayload{
+			Token:      authToken,
+			AuthPass:   authPass,
+			AuthBearer: authBearer,
+		})
+		if err != nil {
+			return nil, err
+		}
+		daemonArgs = append(daemonArgs, daemonSecretFileFlag, secretPath)
 	}
 	for _, ip := range allowIPs {
 		daemonArgs = append(daemonArgs, "--allow-ip", ip)
@@ -49,7 +55,14 @@ func buildDaemonArgs(tunnelType string, args []string, subdomain string, localAd
 		daemonArgs = append(daemonArgs, "--verbose")
 	}
 
-	return daemonArgs
+	return daemonArgs, nil
+}
+
+func validateIPAccessFlags() error {
+	if err := netutil.ValidateIPAccessRules(allowIPs, denyIPs); err != nil {
+		return fmt.Errorf("invalid IP access flags: %w", err)
+	}
+	return nil
 }
 
 func resolveServerAddrAndToken(tunnelType string, port int) (string, string, error) {
@@ -79,22 +92,6 @@ Please run 'drip config init' first, or use flags:
 	}
 
 	return cfg.Server, token, nil
-}
-
-func resolveDaemonToken(args []string) string {
-	if authToken != "" {
-		return authToken
-	}
-	if token := os.Getenv("DRIP_TOKEN"); token != "" {
-		return token
-	}
-	if token := parseFlagValue(args, "--token", "-t", ""); token != "" {
-		return token
-	}
-	if cfg, err := config.LoadClientConfig(""); err == nil {
-		return cfg.Token
-	}
-	return ""
 }
 
 func newDaemonInfo(tunnelType string, port int, subdomain string, serverAddr string) *DaemonInfo {

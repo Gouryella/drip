@@ -15,10 +15,10 @@ func TestAuthSessionStoreCreateEvictsOldestSessionWhenFull(t *testing.T) {
 
 	base := time.Now().Add(5 * time.Minute)
 	for i := 0; i < maxAuthSessions; i++ {
-		store.sessions[fmt.Sprintf("token-%05d", i)] = &authSession{
+		store.addSessionLocked(fmt.Sprintf("token-%05d", i), &authSession{
 			subdomain: "demo",
-			expiresAt: base.Add(time.Duration(i) * time.Minute),
-		}
+			expiresAt: base.Add(time.Duration(i) * time.Millisecond),
+		})
 	}
 
 	token := store.create("demo")
@@ -44,15 +44,15 @@ func TestAuthSessionStoreCreatePrunesExpiredSessionsBeforeEviction(t *testing.T)
 	}
 
 	now := time.Now()
-	store.sessions["expired"] = &authSession{
+	store.addSessionLocked("expired", &authSession{
 		subdomain: "demo",
 		expiresAt: now.Add(-1 * time.Minute),
-	}
+	})
 	for i := 0; i < maxAuthSessions-1; i++ {
-		store.sessions[fmt.Sprintf("token-%05d", i)] = &authSession{
+		store.addSessionLocked(fmt.Sprintf("token-%05d", i), &authSession{
 			subdomain: "demo",
-			expiresAt: now.Add(10*time.Minute + time.Duration(i)*time.Minute),
-		}
+			expiresAt: now.Add(10*time.Minute + time.Duration(i)*time.Millisecond),
+		})
 	}
 
 	token := store.create("demo")

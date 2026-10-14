@@ -3,7 +3,7 @@ package proxy
 import (
 	"bufio"
 	"context"
-	"crypto/subtle"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -23,6 +23,7 @@ import (
 	"drip/internal/shared/protocol"
 	"drip/internal/shared/qos"
 	"drip/internal/shared/utils"
+	"drip/pkg/config"
 )
 
 // bufio.Reader pool to reduce allocations on hot path
@@ -39,27 +40,45 @@ var bufioWriterPool = sync.Pool{
 	},
 }
 
-const openStreamTimeout = 3 * time.Second
+const (
+	openStreamTimeout               = 3 * time.Second
+	defaultMaxResponseHeaderBytes   = 256 << 10
+	defaultResponseHeaderTimeout    = 15 * time.Second
+	defaultStreamingWriteTimeout    = 30 * time.Second
+	defaultForwardWriteTimeout      = 30 * time.Second
+	defaultForwardFlushWriteTimeout = 10 * time.Second
+)
+
+var errResponseHeadersTooLarge = errors.New("tunnel response headers exceeded limit")
 
 type HandlerConfig struct {
-	Manager             *tunnel.Manager
-	Logger              *zap.Logger
-	ServerDomain        string
-	TunnelDomain        string
-	AuthToken           string
-	MetricsToken        string
-	MaxRequestBodyBytes int64
+	Manager                    *tunnel.Manager
+	Logger                     *zap.Logger
+	ServerDomain               string
+	TunnelDomain               string
+	AuthToken                  string
+	MetricsToken               string
+	TrustedProxies             []string
+	MaxRequestBodyBytes        int64
+	UnsafeUnlimitedRequestBody bool
+	MaxResponseHeaderBytes     int64
+	ResponseHeaderTimeout      time.Duration
+	StreamingWriteTimeout      time.Duration
 }
 
 type Handler struct {
-	manager             *tunnel.Manager
-	logger              *zap.Logger
-	serverDomain        string
-	tunnelDomain        string
-	authToken           string
-	metricsToken        string
-	publicPort          int
-	maxRequestBodyBytes int64
+	manager                *tunnel.Manager
+	logger                 *zap.Logger
+	serverDomain           string
+	tunnelDomain           string
+	authToken              string
+	metricsToken           string
+	trustedProxies         *netutil.TrustedProxySet
+	publicPort             int
+	maxRequestBodyBytes    int64
+	maxResponseHeaderBytes int64
+	responseHeaderTimeout  time.Duration
+	streamingWriteTimeout  time.Duration
 
 	// WebSocket tunnel support
 	wsUpgrader    websocket.Upgrader
@@ -78,14 +97,46 @@ type WSConnectionHandler interface {
 func NewHandler(cfg HandlerConfig) *Handler {
 	serverDomain := cfg.ServerDomain
 	tunnelDomain := cfg.TunnelDomain
+	logger := cfg.Logger
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	trustedProxies, err := netutil.NewTrustedProxySet(cfg.TrustedProxies)
+	if err != nil {
+		logger.Warn("Ignoring invalid trusted proxy configuration", zap.Error(err))
+		trustedProxies = &netutil.TrustedProxySet{}
+	}
+	maxRequestBodyBytes := cfg.MaxRequestBodyBytes
+	if maxRequestBodyBytes == 0 && !cfg.UnsafeUnlimitedRequestBody {
+		maxRequestBodyBytes = config.DefaultMaxRequestBodyBytes
+	}
+	if maxRequestBodyBytes < 0 {
+		maxRequestBodyBytes = config.DefaultMaxRequestBodyBytes
+	}
+	maxResponseHeaderBytes := cfg.MaxResponseHeaderBytes
+	if maxResponseHeaderBytes <= 0 {
+		maxResponseHeaderBytes = defaultMaxResponseHeaderBytes
+	}
+	responseHeaderTimeout := cfg.ResponseHeaderTimeout
+	if responseHeaderTimeout <= 0 {
+		responseHeaderTimeout = defaultResponseHeaderTimeout
+	}
+	streamingWriteTimeout := cfg.StreamingWriteTimeout
+	if streamingWriteTimeout <= 0 {
+		streamingWriteTimeout = defaultStreamingWriteTimeout
+	}
 	return &Handler{
-		manager:             cfg.Manager,
-		logger:              cfg.Logger,
-		serverDomain:        serverDomain,
-		tunnelDomain:        tunnelDomain,
-		authToken:           cfg.AuthToken,
-		metricsToken:        cfg.MetricsToken,
-		maxRequestBodyBytes: cfg.MaxRequestBodyBytes,
+		manager:                cfg.Manager,
+		logger:                 logger,
+		serverDomain:           serverDomain,
+		tunnelDomain:           tunnelDomain,
+		authToken:              cfg.AuthToken,
+		metricsToken:           cfg.MetricsToken,
+		trustedProxies:         trustedProxies,
+		maxRequestBodyBytes:    maxRequestBodyBytes,
+		maxResponseHeaderBytes: maxResponseHeaderBytes,
+		responseHeaderTimeout:  responseHeaderTimeout,
+		streamingWriteTimeout:  streamingWriteTimeout,
 		wsUpgrader: websocket.Upgrader{
 			ReadBufferSize:  256 * 1024,
 			WriteBufferSize: 256 * 1024,
@@ -174,12 +225,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.serveHealth(w, r)
 		return
 	}
-	if r.URL.Path == "/stats" {
-		h.serveStats(w, r)
-		return
-	}
-	if r.URL.Path == "/metrics" {
-		h.serveMetrics(w, r)
+
+	if h.isManagementPath(r.URL.Path) && h.isManagementHost(r.Host) {
+		h.serveManagementPath(w, r)
 		return
 	}
 
@@ -204,7 +252,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if tconn.HasIPAccessControl() {
-		clientIP := netutil.ExtractClientIP(r)
+		clientIP := netutil.ExtractClientIPWithTrustedProxies(r, h.trustedProxies)
 		if !tconn.IsIPAllowed(clientIP) {
 			http.Error(w, "Access denied: your IP is not allowed", http.StatusForbidden)
 			return
@@ -212,27 +260,31 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if auth := tconn.GetProxyAuth(); auth != nil && auth.Enabled {
-		clientIP := netutil.ExtractClientIP(r)
+		clientIP := netutil.ExtractClientIPWithTrustedProxies(r, h.trustedProxies)
+		authType := proxyAuthType(auth)
+		rateLimitKey := authRateLimitKey(clientIP, subdomain)
 
-		if authLimiter.isRateLimited(clientIP) {
+		if authLimiter.isRateLimited(rateLimitKey) {
+			h.recordProxyAuthLockout(r, authType, subdomain, clientIP)
 			w.Header().Set("Retry-After", "60")
 			http.Error(w, "Too many failed authentication attempts. Please try again later.", http.StatusTooManyRequests)
 			return
 		}
 
 		if isBearerProxyAuth(auth) {
-			if !h.isBearerAuthenticated(r, auth) {
-				authLimiter.recordFailure(clientIP)
+			if ok, reason := h.checkBearerAuthenticated(r, auth); !ok {
+				authLimiter.recordFailure(rateLimitKey)
+				h.recordProxyAuthFailure(r, authType, reason, subdomain, clientIP)
 				h.serveBearerAuthRequired(w, "drip")
 				return
 			}
-			authLimiter.resetFailures(clientIP)
+			authLimiter.resetFailures(rateLimitKey)
 		} else {
 			if r.URL.Path == "/_drip/login" {
 				h.handleProxyLoginWithRateLimit(w, r, tconn, subdomain, clientIP)
 				return
 			}
-			if !h.isProxyAuthenticated(r, subdomain) {
+			if !h.isProxyAuthenticated(r, subdomain, tconn) {
 				h.serveLoginPage(w, r, subdomain, "")
 				return
 			}
@@ -249,6 +301,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "CONNECT not supported for HTTP tunnels", http.StatusMethodNotAllowed)
 		return
 	}
+	r = h.forwardedRequest(r)
 
 	if h.isWebSocketUpgrade(r) {
 		h.handleWebSocket(w, r, tconn)
@@ -256,6 +309,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if h.maxRequestBodyBytes > 0 && r.Body != nil {
+		if r.ContentLength > h.maxRequestBodyBytes {
+			h.rejectRequestBodyTooLarge(w, r, subdomain)
+			return
+		}
 		r.Body = http.MaxBytesReader(w, r.Body, h.maxRequestBodyBytes)
 	}
 
@@ -266,6 +323,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer stream.Close()
+	stop := context.AfterFunc(r.Context(), func() {
+		_ = stream.SetDeadline(time.Now())
+		_ = stream.Close()
+	})
+	defer stop()
 
 	tconn.IncActiveConnections()
 	defer tconn.DecActiveConnections()
@@ -285,37 +347,79 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Use pooled bufio.Writer to batch small writes and reduce syscalls
 	bw := bufioWriterPool.Get().(*bufio.Writer)
 	bw.Reset(countingStream)
+	if err := countingStream.SetWriteDeadline(time.Now().Add(defaultForwardWriteTimeout)); err != nil {
+		h.logger.Warn("Failed to set tunnel request write deadline",
+			zap.String("subdomain", subdomain),
+			zap.String("method", r.Method),
+			zap.Error(err),
+		)
+	}
 	if err := r.Write(bw); err != nil {
+		bw.Reset(nil)
 		bufioWriterPool.Put(bw)
 		httputil.SetCloseConnection(w)
 		_ = r.Body.Close()
-		http.Error(w, "Forward failed", http.StatusBadGateway)
+		if isRequestBodyLimitError(err) {
+			h.rejectRequestBodyTooLarge(w, r, subdomain)
+		} else {
+			h.logger.Warn("Failed to forward tunneled request",
+				zap.String("subdomain", subdomain),
+				zap.String("method", r.Method),
+				zap.Error(err),
+			)
+			http.Error(w, "Forward failed", http.StatusBadGateway)
+		}
 		return
 	}
+	if err := countingStream.SetWriteDeadline(time.Now().Add(defaultForwardFlushWriteTimeout)); err != nil {
+		h.logger.Warn("Failed to refresh tunnel request write deadline",
+			zap.String("subdomain", subdomain),
+			zap.String("method", r.Method),
+			zap.Error(err),
+		)
+	}
 	if err := bw.Flush(); err != nil {
+		bw.Reset(nil)
 		bufioWriterPool.Put(bw)
 		httputil.SetCloseConnection(w)
 		_ = r.Body.Close()
+		h.logger.Warn("Failed to flush tunneled request",
+			zap.String("subdomain", subdomain),
+			zap.String("method", r.Method),
+			zap.Error(err),
+		)
 		http.Error(w, "Forward flush failed", http.StatusBadGateway)
 		return
 	}
+	if err := countingStream.SetWriteDeadline(time.Time{}); err != nil {
+		h.logger.Warn("Failed to clear tunnel request write deadline",
+			zap.String("subdomain", subdomain),
+			zap.String("method", r.Method),
+			zap.Error(err),
+		)
+	}
+	bw.Reset(nil)
 	bufioWriterPool.Put(bw)
 
 	reader := bufioReaderPool.Get().(*bufio.Reader)
-	reader.Reset(countingStream)
-	resp, err := http.ReadResponse(reader, r)
+	resp, err := h.readTunnelResponse(reader, countingStream, r)
 	if err != nil {
+		reader.Reset(nil)
 		bufioReaderPool.Put(reader)
 		httputil.SetCloseConnection(w)
-		http.Error(w, "Read response failed", http.StatusBadGateway)
+		h.respondTunnelReadError(w, r, subdomain, err)
 		return
 	}
 	defer func() {
 		_ = resp.Body.Close()
+		reader.Reset(nil)
 		bufioReaderPool.Put(reader)
 	}()
 
 	h.copyResponseHeaders(w.Header(), resp.Header, r.Host)
+	for key := range resp.Trailer {
+		w.Header().Add("Trailer", key)
+	}
 
 	statusCode := resp.StatusCode
 	if statusCode == 0 {
@@ -343,14 +447,28 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(statusCode)
 
-	// Copy with context cancellation support using AfterFunc (avoids per-request goroutine)
-	stop := context.AfterFunc(r.Context(), func() { _ = stream.Close() })
-	defer stop()
-
 	if streamingResponse {
-		clearResponseWriteDeadline(w)
-		flushResponse(w)
-		_, _ = copyResponseBodyFlushing(w, resp.Body)
+		streamWriter := newStreamingResponseWriter(w, h.streamingWriteTimeout)
+		if err := streamWriter.Flush(); err != nil {
+			h.logger.Debug("Failed to flush streaming response headers",
+				zap.String("subdomain", subdomain),
+				zap.String("method", r.Method),
+				zap.Error(err),
+			)
+			return
+		}
+		n, err := copyResponseBodyFlushing(streamWriter, resp.Body)
+		h.recordProxyTransferResult(r.Context(), proxyTransferHTTPStreamingResponse, n, err)
+		if err == nil {
+			httputil.CopyHeaders(w.Header(), resp.Trailer)
+		}
+		if err != nil {
+			h.logger.Debug("Streaming response copy stopped",
+				zap.String("subdomain", subdomain),
+				zap.String("method", r.Method),
+				zap.Error(err),
+			)
+		}
 		return
 	}
 
@@ -358,7 +476,145 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	buf := pool.GetBuffer(pool.SizeLarge)
 	defer pool.PutBuffer(buf)
 
-	_, _ = io.CopyBuffer(w, resp.Body, (*buf)[:])
+	n, err := io.CopyBuffer(w, resp.Body, (*buf)[:])
+	h.recordProxyTransferResult(r.Context(), proxyTransferHTTPResponse, n, err)
+	if err != nil {
+		// A failed close-delimited/chunked response must not look complete.
+		panic(http.ErrAbortHandler)
+	}
+	httputil.CopyHeaders(w.Header(), resp.Trailer)
+}
+
+// forwardedRequest supplies metadata derived from the peer and configured
+// trusted proxies, so a public caller cannot forge the backend's client IP.
+func (h *Handler) forwardedRequest(r *http.Request) *http.Request {
+	out := r.Clone(r.Context())
+	out.Trailer = r.Trailer // Body reads populate this map as trailers arrive.
+	if len(out.Trailer) > 0 {
+		out.ContentLength = -1
+		out.TransferEncoding = []string{"chunked"}
+	}
+	isUpgrade := httputil.IsWebSocketUpgrade(r)
+	httputil.CleanHopByHopHeaders(out.Header)
+	if isUpgrade {
+		out.Header.Set("Connection", "Upgrade")
+		out.Header.Set("Upgrade", "websocket")
+	}
+	out.Header.Del("Forwarded")
+	clientIP := netutil.ExtractClientIPWithTrustedProxies(r, h.trustedProxies)
+	if net.ParseIP(clientIP) != nil {
+		out.Header.Set("X-Forwarded-For", clientIP)
+		out.Header.Set("X-Real-IP", clientIP)
+	} else {
+		out.Header.Del("X-Forwarded-For")
+		out.Header.Del("X-Real-IP")
+	}
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	} else if h.trustedProxies.Contains(netutil.ExtractRemoteIP(r.RemoteAddr)) {
+		if proto := r.Header.Get("X-Forwarded-Proto"); proto == "http" || proto == "https" {
+			scheme = proto
+		}
+	}
+	out.Header.Set("X-Forwarded-Proto", scheme)
+	out.Header.Set("X-Forwarded-Host", r.Host)
+	return out
+}
+
+func (h *Handler) rejectRequestBodyTooLarge(w http.ResponseWriter, r *http.Request, subdomain string) {
+	httputil.SetCloseConnection(w)
+	h.logger.Warn("Rejected over-limit tunneled request body",
+		zap.String("subdomain", subdomain),
+		zap.String("method", r.Method),
+		zap.Int64("content_length", r.ContentLength),
+		zap.Int64("max_request_body_bytes", h.maxRequestBodyBytes),
+	)
+	http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+}
+
+func isRequestBodyLimitError(err error) bool {
+	var maxBytesErr *http.MaxBytesError
+	return errors.As(err, &maxBytesErr) || strings.Contains(err.Error(), "http: request body too large")
+}
+
+func (h *Handler) readTunnelResponse(reader *bufio.Reader, stream net.Conn, req *http.Request) (*http.Response, error) {
+	limitedReader := &responseHeaderLimitReader{
+		reader:    stream,
+		remaining: h.maxResponseHeaderBytes,
+	}
+	reader.Reset(limitedReader)
+
+	if err := stream.SetReadDeadline(time.Now().Add(h.responseHeaderTimeout)); err != nil {
+		h.logger.Warn("Failed to set tunnel response header read deadline",
+			zap.String("method", req.Method),
+			zap.Error(err),
+		)
+	}
+
+	resp, err := http.ReadResponse(reader, req)
+	if clearErr := stream.SetReadDeadline(time.Time{}); clearErr != nil {
+		h.logger.Warn("Failed to clear tunnel response header read deadline",
+			zap.String("method", req.Method),
+			zap.Error(clearErr),
+		)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	limitedReader.allowBody()
+	return resp, nil
+}
+
+func (h *Handler) respondTunnelReadError(w http.ResponseWriter, r *http.Request, subdomain string, err error) {
+	fields := []zap.Field{
+		zap.String("subdomain", subdomain),
+		zap.String("method", r.Method),
+		zap.Int64("max_response_header_bytes", h.maxResponseHeaderBytes),
+		zap.Error(err),
+	}
+
+	if errors.Is(err, errResponseHeadersTooLarge) {
+		h.logger.Warn("Rejected over-limit tunnel response headers", fields...)
+		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		return
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		h.logger.Warn("Timed out reading tunnel response headers", fields...)
+		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		return
+	}
+
+	h.logger.Warn("Failed to read tunnel response", fields...)
+	http.Error(w, "Read response failed", http.StatusBadGateway)
+}
+
+type responseHeaderLimitReader struct {
+	reader    io.Reader
+	remaining int64
+	unlimited bool
+}
+
+func (r *responseHeaderLimitReader) Read(p []byte) (int, error) {
+	if r.unlimited {
+		return r.reader.Read(p)
+	}
+	if r.remaining <= 0 {
+		return 0, errResponseHeadersTooLarge
+	}
+	if int64(len(p)) > r.remaining {
+		p = p[:r.remaining]
+	}
+	n, err := r.reader.Read(p)
+	r.remaining -= int64(n)
+	return n, err
+}
+
+func (r *responseHeaderLimitReader) allowBody() {
+	r.unlimited = true
 }
 
 type streamResult struct {
@@ -395,6 +651,7 @@ func (h *Handler) openStream(tconn *tunnel.Connection, timeout time.Duration) (n
 }
 
 func (h *Handler) copyResponseHeaders(dst http.Header, src http.Header, proxyHost string) {
+	httputil.CleanHopByHopHeaders(src)
 	for key, values := range src {
 		canonicalKey := http.CanonicalHeaderKey(key)
 
@@ -430,18 +687,12 @@ func (h *Handler) rewriteLocationHeader(location, proxyHost string) string {
 		return location
 	}
 
-	if locationURL.Host == "localhost" ||
-		strings.HasPrefix(locationURL.Host, "localhost:") ||
-		locationURL.Host == "127.0.0.1" ||
-		strings.HasPrefix(locationURL.Host, "127.0.0.1:") {
-		rewritten := fmt.Sprintf("https://%s%s", proxyHost, locationURL.Path)
-		if locationURL.RawQuery != "" {
-			rewritten += "?" + locationURL.RawQuery
-		}
-		if locationURL.Fragment != "" {
-			rewritten += "#" + locationURL.Fragment
-		}
-		return rewritten
+	host := locationURL.Hostname()
+	ip := net.ParseIP(host)
+	if strings.EqualFold(host, "localhost") || (ip != nil && ip.IsLoopback()) {
+		locationURL.Scheme = "https"
+		locationURL.Host = proxyHost
+		return locationURL.String()
 	}
 
 	return location
@@ -456,38 +707,95 @@ const (
 )
 
 func (h *Handler) extractSubdomain(host string) (string, subdomainResult) {
-	if idx := strings.Index(host, ":"); idx != -1 {
-		host = host[:idx]
-	}
+	host = normalizeRequestHost(host)
+	serverDomain := normalizeRequestHost(h.serverDomain)
+	tunnelDomain := normalizeRequestHost(h.tunnelDomain)
 
-	if host == h.serverDomain {
+	if host == serverDomain {
 		return "", subdomainHome
 	}
 
-	suffix := "." + h.tunnelDomain
+	suffix := "." + tunnelDomain
 	if strings.HasSuffix(host, suffix) {
 		return strings.TrimSuffix(host, suffix), subdomainFound
 	}
 
-	if host == h.tunnelDomain {
+	if host == tunnelDomain {
 		return "", subdomainNotFound
 	}
 
 	return "", subdomainNotFound
 }
 
+func (h *Handler) isManagementPath(path string) bool {
+	return path == "/stats" ||
+		path == "/metrics" ||
+		path == "/admin" ||
+		strings.HasPrefix(path, "/admin/")
+}
+
+func (h *Handler) isManagementHost(host string) bool {
+	host = normalizeRequestHost(host)
+	serverDomain := normalizeRequestHost(h.serverDomain)
+	if host == "" || serverDomain == "" {
+		return false
+	}
+	return host == serverDomain || host == "admin."+serverDomain
+}
+
+func (h *Handler) serveManagementPath(w http.ResponseWriter, r *http.Request) {
+	switch r.URL.Path {
+	case "/stats":
+		h.serveStats(w, r)
+	case "/metrics":
+		h.serveMetrics(w, r)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func normalizeRequestHost(host string) string {
+	host = strings.TrimSpace(strings.ToLower(host))
+	if host == "" {
+		return ""
+	}
+
+	if parsedHost, _, err := net.SplitHostPort(host); err == nil {
+		host = parsedHost
+	} else if strings.Count(host, ":") == 1 {
+		if idx := strings.LastIndex(host, ":"); idx != -1 {
+			host = host[:idx]
+		}
+	}
+
+	host = strings.TrimPrefix(host, "[")
+	host = strings.TrimSuffix(host, "]")
+	host = strings.TrimSuffix(host, ".")
+	return host
+}
+
 func (h *Handler) validateMetricsAuth(w http.ResponseWriter, r *http.Request, realm string) bool {
-	if h.metricsToken == "" {
-		return true
+	expectedToken := h.metricsAuthToken()
+	if expectedToken == "" {
+		w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer realm="%s"`, realm))
+		http.Error(w, "Unauthorized: configure a metrics token or server auth token", http.StatusUnauthorized)
+		return false
 	}
 
 	token := extractBearerToken(r.Header.Get("Authorization"))
 
-	if subtle.ConstantTimeCompare([]byte(token), []byte(h.metricsToken)) != 1 {
+	if !utils.ConstantTimeEqualString(token, expectedToken) {
 		w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer realm="%s"`, realm))
 		http.Error(w, "Unauthorized: provide metrics token via 'Authorization: Bearer <token>' header", http.StatusUnauthorized)
 		return false
 	}
 
 	return true
+}
+
+func (h *Handler) metricsAuthToken() string {
+	if h.metricsToken != "" {
+		return h.metricsToken
+	}
+	return h.authToken
 }

@@ -1,8 +1,9 @@
 # Drip Server Configuration (Direct TLS mode)
 # Use with: docker-compose.yml
 
-# Server port (required)
-port: 443
+# Server port inside the container. docker-compose.yml maps host 443 to 8443.
+port: 8443
+public_port: 443
 
 # Domain for client connections (required)
 domain: tunnel.example.com
@@ -10,22 +11,25 @@ domain: tunnel.example.com
 # Domain for tunnel URLs (optional, defaults to domain)
 # tunnel_domain: example.com
 
-# Authentication token (optional, but recommended)
-token: your-secret-token
+# Authentication token (required unless allow_anonymous is true)
+# Generate a real secret before enabling; placeholder values are rejected.
+# token: replace-with-a-long-random-token
+# allow_anonymous: false    # Explicitly allow public unauthenticated tunnels
 
 # TLS settings
 # drip-server handles TLS directly, requires certificate files
 tls_enabled: true
-tls_cert: /app/certs/fullchain.pem
-tls_key: /app/certs/privkey.pem
+tls_cert: /run/secrets/drip_tls_cert
+tls_key: /run/secrets/drip_tls_key
 
 # TCP tunnel port range
 tcp_port_min: 20000
 tcp_port_max: 20100
 
 # Optional settings
-# public_port: 443          # Port to display in URLs (for reverse proxy)
-# metrics_token: secret     # Token for /metrics endpoint
+# metrics_token: replace-with-a-long-random-token  # Token for /stats and /metrics endpoints
+# trusted_proxies:          # Reverse proxy IPs/CIDRs allowed to supply X-Forwarded-For
+#   - 127.0.0.1             # Default is empty, which ignores forwarded client IP headers
 # debug: false              # Enable debug logging
 # pprof_port: 6060          # Enable pprof profiling
 # transports:               # Allowed transports (default: tcp,wss)

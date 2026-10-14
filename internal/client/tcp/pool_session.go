@@ -1,6 +1,8 @@
 package tcp
 
 import (
+	"container/heap"
+	"context"
 	"fmt"
 	"net"
 	"sync"
@@ -24,6 +26,7 @@ type sessionHandle struct {
 	active     atomic.Int64
 	lastActive atomic.Int64 // unix nanos
 	closed     atomic.Bool
+	draining   atomic.Bool
 }
 
 func (h *sessionHandle) touch() {
@@ -64,8 +67,6 @@ func (c *PoolClient) warmupSessions() {
 	}
 	wg.Wait()
 
-	// Brief wait for server to register all sessions
-	time.Sleep(100 * time.Millisecond)
 }
 
 // addDataSession creates a new data session.
@@ -84,10 +85,13 @@ func (c *PoolClient) addDataSession() error {
 		return fmt.Errorf("server does not support data connections")
 	}
 
-	conn, err := c.dialer.Dial()
+	conn, err := c.dialer.DialContext(c.ctx)
 	if err != nil {
 		return err
 	}
+	stopHandshake := context.AfterFunc(c.ctx, func() { _ = conn.Close() })
+	defer stopHandshake()
+	_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 
 	if c.closedDuringHandshake(conn) {
 		return net.ErrClosed
@@ -120,6 +124,7 @@ func (c *PoolClient) addDataSession() error {
 	}
 	defer ack.Release()
 	_ = conn.SetReadDeadline(time.Time{})
+	_ = conn.SetWriteDeadline(time.Time{})
 
 	if c.closedDuringHandshake(conn) {
 		return net.ErrClosed
@@ -149,6 +154,11 @@ func (c *PoolClient) addDataSession() error {
 		return fmt.Errorf("data connection rejected: %s", resp.Message)
 	}
 
+	if c.IsClosed() {
+		_ = conn.Close()
+		return net.ErrClosed
+	}
+
 	yamuxCfg := mux.NewClientConfig()
 
 	session, err := yamux.Server(conn, yamuxCfg)
@@ -174,15 +184,13 @@ func (c *PoolClient) addDataSession() error {
 	c.pendingSessions--
 	slotReserved = false
 	c.dataSessions[connID] = h
+	c.wg.Add(3)
 	c.mu.Unlock()
 
-	c.wg.Add(1)
 	go c.acceptLoop(h, false)
 
-	c.wg.Add(1)
 	go c.sessionWatcher(h, false)
 
-	c.wg.Add(1)
 	go c.pingLoop(h)
 
 	return nil
@@ -202,7 +210,7 @@ func (c *PoolClient) reserveSessionSlot() error {
 	default:
 	}
 
-	if c.sessionCountLocked() >= c.maxSessions {
+	if c.maxSessions > 0 && c.sessionCountLocked() >= c.maxSessions {
 		return fmt.Errorf("max sessions reached")
 	}
 
@@ -240,55 +248,88 @@ func (c *PoolClient) sessionCountLocked() int {
 	return count
 }
 
-// removeIdleSessions removes n idle sessions.
-func (c *PoolClient) removeIdleSessions(n int) {
-	if n <= 0 {
-		return
-	}
+type idleSessionCandidate struct {
+	id         string
+	lastActive int64
+}
 
-	type candidate struct {
-		id         string
-		active     int64
-		lastActive time.Time
+type idleSessionHeap []idleSessionCandidate
+
+func (h idleSessionHeap) Len() int           { return len(h) }
+func (h idleSessionHeap) Less(i, j int) bool { return h[i].lastActive < h[j].lastActive }
+func (h idleSessionHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *idleSessionHeap) Push(value any)    { *h = append(*h, value.(idleSessionCandidate)) }
+func (h *idleSessionHeap) Pop() any {
+	i := len(*h) - 1
+	value := (*h)[i]
+	(*h)[i] = idleSessionCandidate{}
+	*h = (*h)[:i]
+	return value
+}
+
+// removeIdleSessions builds one O(n) heap and spends O(log n) per attempted
+// retirement, instead of scanning all sessions again for every candidate.
+func (c *PoolClient) removeIdleSessions(n int) int {
+	if n <= 0 {
+		return 0
 	}
 
 	c.mu.RLock()
-	candidates := make([]candidate, 0, len(c.dataSessions))
+	candidates := make(idleSessionHeap, 0, len(c.dataSessions))
 	for id, h := range c.dataSessions {
-		candidates = append(candidates, candidate{
+		if h == nil || h.active.Load() != 0 || h.draining.Load() {
+			continue
+		}
+		candidates = append(candidates, idleSessionCandidate{
 			id:         id,
-			active:     h.active.Load(),
-			lastActive: h.lastActiveTime(),
+			lastActive: h.lastActive.Load(),
 		})
 	}
 	c.mu.RUnlock()
+	heap.Init(&candidates)
 
 	removed := 0
-	for removed < n {
-		var best candidate
-		found := false
-		for _, cand := range candidates {
-			if cand.active != 0 {
-				continue
-			}
-			if !found || cand.lastActive.Before(best.lastActive) {
-				best = cand
-				found = true
-			}
-		}
-		if !found {
-			return
-		}
-		if c.removeDataSession(best.id) {
+	for removed < n && len(candidates) > 0 {
+		best := heap.Pop(&candidates).(idleSessionCandidate)
+		if c.retireDataSession(best.id) {
 			removed++
 		}
-		for i := range candidates {
-			if candidates[i].id == best.id {
-				candidates[i].active = 1
-				break
+	}
+	return removed
+}
+
+func (c *PoolClient) retireDataSession(id string) bool {
+	c.mu.Lock()
+	h := c.dataSessions[id]
+	if c.closed.Load() || h == nil || h.session == nil || h.active.Load() != 0 || h.session.NumStreams() != 0 || h.draining.Load() {
+		c.mu.Unlock()
+		return false
+	}
+	h.draining.Store(true)
+	c.wg.Add(1)
+	c.mu.Unlock()
+	go func() {
+		defer c.wg.Done()
+		defer c.removeDataSession(id)
+		// Stop the peer from assigning more streams before waiting for any
+		// streams that were already being opened to finish.
+		if err := h.session.GoAway(); err != nil {
+			return
+		}
+		if _, err := h.session.Ping(); err != nil {
+			return
+		}
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+		for h.active.Load() != 0 || h.session.NumStreams() != 0 {
+			select {
+			case <-c.stopCh:
+				return
+			case <-ticker.C:
 			}
 		}
-	}
+	}()
+	return true
 }
 
 // removeDataSession removes a data session by ID.

@@ -17,6 +17,7 @@ type FrameWriter struct {
 	enqueueMu    sync.RWMutex
 	done         chan struct{}
 	closed       bool
+	closeOnce    sync.Once
 
 	maxBatch     int
 	maxBatchWait time.Duration
@@ -169,8 +170,9 @@ func (w *FrameWriter) flushBatchLocked() {
 		return
 	}
 
-	for _, frame := range w.batch {
+	for i, frame := range w.batch {
 		w.flushFrameLocked(frame)
+		w.batch[i] = nil
 	}
 
 	w.batch = w.batch[:0]
@@ -179,6 +181,11 @@ func (w *FrameWriter) flushBatchLocked() {
 // flushFrameLocked writes a single frame immediately. Caller must hold w.mu.
 func (w *FrameWriter) flushFrameLocked(frame *Frame) {
 	if frame == nil {
+		return
+	}
+	if w.writeErr != nil {
+		w.unmarkQueued(frame)
+		frame.Release()
 		return
 	}
 
@@ -193,6 +200,7 @@ func (w *FrameWriter) flushFrameLocked(frame *Frame) {
 				go w.onWriteError(err)
 			}
 			w.closed = true
+			go w.Close()
 		})
 	}
 
@@ -227,7 +235,7 @@ func (w *FrameWriter) WriteFrameWithCancel(frame *Frame, cancel <-chan struct{})
 	size := int64(len(frame.Payload) + FrameHeaderSize)
 	w.queuedFrames.Add(1)
 	w.queuedBytes.Add(size)
-	atomic.StoreInt64(&frame.queuedBytes, size)
+	frame.queuedBytes.Store(size)
 
 	// Try non-blocking first for best performance
 	select {
@@ -236,7 +244,7 @@ func (w *FrameWriter) WriteFrameWithCancel(frame *Frame, cancel <-chan struct{})
 	case <-w.done:
 		w.queuedFrames.Add(-1)
 		w.queuedBytes.Add(-size)
-		atomic.StoreInt64(&frame.queuedBytes, 0)
+		frame.queuedBytes.Store(0)
 		w.mu.Lock()
 		err := w.writeErr
 		w.mu.Unlock()
@@ -255,7 +263,7 @@ func (w *FrameWriter) WriteFrameWithCancel(frame *Frame, cancel <-chan struct{})
 		case <-w.done:
 			w.queuedFrames.Add(-1)
 			w.queuedBytes.Add(-size)
-			atomic.StoreInt64(&frame.queuedBytes, 0)
+			frame.queuedBytes.Store(0)
 			w.mu.Lock()
 			err := w.writeErr
 			w.mu.Unlock()
@@ -266,7 +274,7 @@ func (w *FrameWriter) WriteFrameWithCancel(frame *Frame, cancel <-chan struct{})
 		case <-cancel:
 			w.queuedFrames.Add(-1)
 			w.queuedBytes.Add(-size)
-			atomic.StoreInt64(&frame.queuedBytes, 0)
+			frame.queuedBytes.Store(0)
 			return errors.New("write cancelled")
 		}
 	}
@@ -278,7 +286,7 @@ func (w *FrameWriter) WriteFrameWithCancel(frame *Frame, cancel <-chan struct{})
 	case <-w.done:
 		w.queuedFrames.Add(-1)
 		w.queuedBytes.Add(-size)
-		atomic.StoreInt64(&frame.queuedBytes, 0)
+		frame.queuedBytes.Store(0)
 
 		w.mu.Lock()
 		err := w.writeErr
@@ -290,37 +298,35 @@ func (w *FrameWriter) WriteFrameWithCancel(frame *Frame, cancel <-chan struct{})
 	case <-time.After(30 * time.Second):
 		w.queuedFrames.Add(-1)
 		w.queuedBytes.Add(-size)
-		atomic.StoreInt64(&frame.queuedBytes, 0)
+		frame.queuedBytes.Store(0)
 		return errors.New("write queue full timeout")
 	}
 }
 
 func (w *FrameWriter) Close() error {
-	w.enqueueMu.Lock()
-	defer w.enqueueMu.Unlock()
+	w.closeOnce.Do(func() {
+		// Wake blocked enqueuers before taking their exclusive lock.
+		close(w.done)
+		w.enqueueMu.Lock()
+		defer w.enqueueMu.Unlock()
 
-	w.mu.Lock()
-	if w.closed {
+		w.mu.Lock()
+		w.closed = true
 		w.mu.Unlock()
-		return nil
-	}
-	w.closed = true
-	w.mu.Unlock()
 
-	close(w.queue)
-	close(w.controlQueue)
+		close(w.queue)
+		close(w.controlQueue)
 
-	for frame := range w.queue {
-		w.unmarkQueued(frame)
-		frame.Release()
-	}
-	for frame := range w.controlQueue {
-		w.unmarkQueued(frame)
-		frame.Release()
-	}
+		for frame := range w.queue {
+			w.unmarkQueued(frame)
+			frame.Release()
+		}
+		for frame := range w.controlQueue {
+			w.unmarkQueued(frame)
+			frame.Release()
+		}
 
-	close(w.done)
-
+	})
 	return nil
 }
 
@@ -335,7 +341,7 @@ func (w *FrameWriter) Flush() {
 		select {
 		case frame, ok := <-w.queue:
 			if !ok {
-				break
+				goto done
 			}
 			w.batch = append(w.batch, frame)
 		default:
@@ -412,7 +418,7 @@ func (w *FrameWriter) WriteControl(frame *Frame) error {
 	size := int64(len(frame.Payload) + FrameHeaderSize)
 	w.queuedFrames.Add(1)
 	w.queuedBytes.Add(size)
-	atomic.StoreInt64(&frame.queuedBytes, size)
+	frame.queuedBytes.Store(size)
 
 	// Try non-blocking first
 	select {
@@ -421,7 +427,7 @@ func (w *FrameWriter) WriteControl(frame *Frame) error {
 	case <-w.done:
 		w.queuedFrames.Add(-1)
 		w.queuedBytes.Add(-size)
-		atomic.StoreInt64(&frame.queuedBytes, 0)
+		frame.queuedBytes.Store(0)
 		w.mu.Lock()
 		err := w.writeErr
 		w.mu.Unlock()
@@ -439,7 +445,7 @@ func (w *FrameWriter) WriteControl(frame *Frame) error {
 	case <-w.done:
 		w.queuedFrames.Add(-1)
 		w.queuedBytes.Add(-size)
-		atomic.StoreInt64(&frame.queuedBytes, 0)
+		frame.queuedBytes.Store(0)
 
 		w.mu.Lock()
 		err := w.writeErr
@@ -452,7 +458,7 @@ func (w *FrameWriter) WriteControl(frame *Frame) error {
 		// Control frames should have priority, shorter timeout
 		w.queuedFrames.Add(-1)
 		w.queuedBytes.Add(-size)
-		atomic.StoreInt64(&frame.queuedBytes, 0)
+		frame.queuedBytes.Store(0)
 		return errors.New("control queue full timeout")
 	}
 }
@@ -479,7 +485,7 @@ func (w *FrameWriter) unmarkQueued(frame *Frame) {
 	if frame == nil {
 		return
 	}
-	size := atomic.SwapInt64(&frame.queuedBytes, 0)
+	size := frame.queuedBytes.Swap(0)
 	if size <= 0 {
 		return
 	}

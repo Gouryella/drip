@@ -1,13 +1,16 @@
 package tcp
 
 import (
+	"errors"
 	"fmt"
+	"strings"
 
 	json "github.com/goccy/go-json"
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
 
 	"drip/internal/server/tunnel"
+	"drip/internal/shared/netutil"
 	"drip/internal/shared/protocol"
 	"drip/internal/shared/utils"
 )
@@ -29,6 +32,11 @@ type RegistrationHandler struct {
 	publicPort   int
 	logger       *zap.Logger
 }
+
+const (
+	publicRegistrationFailureCode    = "registration_failed"
+	publicRegistrationFailureMessage = "Unable to register tunnel"
+)
 
 // NewRegistrationHandler creates a new registration handler.
 func NewRegistrationHandler(
@@ -71,7 +79,45 @@ type RegistrationResult struct {
 	TunnelID         string
 	SupportsDataConn bool
 	RecommendedConns int
+	MaxDataConns     int
 	TunnelConn       *tunnel.Connection
+}
+
+func publicRegistrationError(err error) (string, string) {
+	return publicRegistrationFailureCode, publicRegistrationFailureMessage
+}
+
+func registrationFailureReason(err error) string {
+	switch {
+	case err == nil:
+		return "unknown"
+	case errors.Is(err, tunnel.ErrTooManyTunnels):
+		return "max_tunnels"
+	case errors.Is(err, tunnel.ErrTooManyPerIP):
+		return "max_per_ip"
+	case errors.Is(err, tunnel.ErrRateLimitExceeded):
+		return "rate_limited"
+	case errors.Is(err, tunnel.ErrSubdomainGenerationFailed):
+		return "subdomain_generation_failed"
+	case errors.Is(err, tunnel.ErrSubdomainTaken):
+		return "subdomain_taken"
+	case errors.Is(err, tunnel.ErrInvalidSubdomain):
+		return "invalid_subdomain"
+	case errors.Is(err, tunnel.ErrReservedSubdomain):
+		return "reserved_subdomain"
+	}
+
+	errText := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(errText, "port allocator"):
+		return "port_allocator_unavailable"
+	case strings.Contains(errText, "allocate requested port") || strings.Contains(errText, "allocate port"):
+		return "port_allocation"
+	case strings.Contains(errText, "registered tunnel"):
+		return "registered_tunnel_lookup"
+	default:
+		return "unknown"
+	}
 }
 
 // Register handles the tunnel registration process.
@@ -102,6 +148,16 @@ func (rh *RegistrationHandler) Register(req *RegistrationRequest) (*Registration
 		}
 	}
 
+	hasIPAccessRules := req.IPAccess != nil && (len(req.IPAccess.AllowIPs) > 0 || len(req.IPAccess.DenyIPs) > 0)
+	if hasIPAccessRules {
+		if err := netutil.ValidateIPAccessRules(req.IPAccess.AllowIPs, req.IPAccess.DenyIPs); err != nil {
+			if port > 0 && rh.portAlloc != nil {
+				rh.portAlloc.Release(port)
+			}
+			return nil, fmt.Errorf("invalid IP access rules: %w", err)
+		}
+	}
+
 	// Register with tunnel manager
 	subdomain, err := rh.manager.RegisterWithIP(nil, req.CustomSubdomain, req.RemoteIP)
 	if err != nil {
@@ -128,8 +184,14 @@ func (rh *RegistrationHandler) Register(req *RegistrationRequest) (*Registration
 	// Configure tunnel
 	tunnelConn.SetTunnelType(req.TunnelType)
 
-	if req.IPAccess != nil && (len(req.IPAccess.AllowIPs) > 0 || len(req.IPAccess.DenyIPs) > 0) {
-		tunnelConn.SetIPAccessControl(req.IPAccess.AllowIPs, req.IPAccess.DenyIPs)
+	if hasIPAccessRules {
+		if err := tunnelConn.SetIPAccessControl(req.IPAccess.AllowIPs, req.IPAccess.DenyIPs); err != nil {
+			rh.manager.Unregister(subdomain)
+			if port > 0 && rh.portAlloc != nil {
+				rh.portAlloc.Release(port)
+			}
+			return nil, fmt.Errorf("invalid IP access rules: %w", err)
+		}
 		rh.logger.Info("IP access control configured",
 			zap.String("subdomain", subdomain),
 			zap.Strings("allow_ips", req.IPAccess.AllowIPs),
@@ -152,11 +214,15 @@ func (rh *RegistrationHandler) Register(req *RegistrationRequest) (*Registration
 	var tunnelID string
 	var supportsDataConn bool
 	recommendedConns := 0
+	maxDataConns := 0
 
 	if req.PoolCapabilities != nil && req.ConnectionType == "primary" && rh.groupManager != nil {
-		// This will be handled by the caller since it needs the connection instance
-		supportsDataConn = true
-		recommendedConns = 4
+		maxDataConns = rh.groupManager.EffectiveMaxDataConns(req.PoolCapabilities.MaxDataConns)
+		if maxDataConns > 0 {
+			// This will be handled by the caller since it needs the connection instance.
+			supportsDataConn = true
+			recommendedConns = min(4, maxDataConns)
+		}
 	}
 
 	rh.logger.Info("Tunnel registered",
@@ -173,6 +239,7 @@ func (rh *RegistrationHandler) Register(req *RegistrationRequest) (*Registration
 		TunnelID:         tunnelID,
 		SupportsDataConn: supportsDataConn,
 		RecommendedConns: recommendedConns,
+		MaxDataConns:     maxDataConns,
 		TunnelConn:       tunnelConn,
 	}, nil
 }

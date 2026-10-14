@@ -53,8 +53,11 @@ func (p *BufferPool) Get(size int) *[]byte {
 		return p.medium.Get().(*[]byte)
 	case size <= SizeLarge:
 		return p.large.Get().(*[]byte)
-	default:
+	case size <= SizeXLarge:
 		return p.xlarge.Get().(*[]byte)
+	default:
+		buf := make([]byte, size)
+		return &buf
 	}
 }
 

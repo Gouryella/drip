@@ -9,7 +9,7 @@ import (
 	"drip/internal/shared/pool"
 )
 
-const tcpWaitTimeout = 10 * time.Second
+const pipeWriteTimeout = 30 * time.Second
 
 type closeReader interface {
 	CloseRead() error
@@ -21,6 +21,10 @@ type closeWriter interface {
 
 type readDeadliner interface {
 	SetReadDeadline(t time.Time) error
+}
+
+type writeDeadliner interface {
+	SetWriteDeadline(t time.Time) error
 }
 
 // Pipe copies bytes bidirectionally between a and b (gost-like),
@@ -42,6 +46,13 @@ func PipeWithBufferSize(ctx context.Context, a, b io.ReadWriteCloser, bufSize in
 
 // PipeWithCallbacksAndBufferSize is PipeWithCallbacks with a custom buffer size.
 func PipeWithCallbacksAndBufferSize(ctx context.Context, a, b io.ReadWriteCloser, bufSize int, onAToB func(n int64), onBToA func(n int64)) error {
+	return PipeWithCallbacksAndBufferSizeAndWriteTimeout(ctx, a, b, bufSize, onAToB, onBToA, pipeWriteTimeout)
+}
+
+// PipeWithCallbacksAndBufferSizeAndWriteTimeout is PipeWithCallbacksAndBufferSize
+// with an explicit per-write deadline. A non-positive timeout disables deadline
+// updates for callers that need legacy blocking semantics.
+func PipeWithCallbacksAndBufferSizeAndWriteTimeout(ctx context.Context, a, b io.ReadWriteCloser, bufSize int, onAToB func(n int64), onBToA func(n int64), writeTimeout time.Duration) error {
 	if bufSize <= 0 {
 		bufSize = pool.SizeMedium
 	}
@@ -57,6 +68,16 @@ func PipeWithCallbacksAndBufferSize(ctx context.Context, a, b io.ReadWriteCloser
 	closeAll := func() {
 		closeOnce.Do(func() {
 			close(stopCh)
+			// A multiplexed stream may implement Close as a write-side FIN.
+			// Deadlines also interrupt outstanding reads during cancellation.
+			for _, conn := range []io.ReadWriteCloser{a, b} {
+				if rd, ok := conn.(readDeadliner); ok {
+					_ = rd.SetReadDeadline(time.Now())
+				}
+				if wd, ok := conn.(writeDeadliner); ok {
+					_ = wd.SetWriteDeadline(time.Now())
+				}
+			}
 			_ = a.Close()
 			_ = b.Close()
 		})
@@ -66,33 +87,29 @@ func PipeWithCallbacksAndBufferSize(ctx context.Context, a, b io.ReadWriteCloser
 
 	go func() {
 		defer wg.Done()
-		err := pipeBuffer(b, a, bufSize, onAToB, stopCh)
+		err := pipeBuffer(b, a, bufSize, onAToB, stopCh, writeTimeout)
 		if err != nil {
 			errCh <- err
+			closeAll()
 		}
-		closeAll()
 	}()
 
 	go func() {
 		defer wg.Done()
-		err := pipeBuffer(a, b, bufSize, onBToA, stopCh)
+		err := pipeBuffer(a, b, bufSize, onBToA, stopCh, writeTimeout)
 		if err != nil {
 			errCh <- err
+			closeAll()
 		}
-		closeAll()
 	}()
 
 	if ctx != nil {
-		go func() {
-			select {
-			case <-ctx.Done():
-				closeAll()
-			case <-stopCh:
-			}
-		}()
+		stop := context.AfterFunc(ctx, closeAll)
+		defer stop()
 	}
 
 	wg.Wait()
+	closeAll()
 
 	select {
 	case err := <-errCh:
@@ -102,12 +119,12 @@ func PipeWithCallbacksAndBufferSize(ctx context.Context, a, b io.ReadWriteCloser
 	}
 }
 
-func pipeBuffer(dst io.ReadWriteCloser, src io.ReadWriteCloser, bufSize int, onCopied func(n int64), stopCh <-chan struct{}) error {
+func pipeBuffer(dst io.ReadWriteCloser, src io.ReadWriteCloser, bufSize int, onCopied func(n int64), stopCh <-chan struct{}, writeTimeout time.Duration) error {
 	bufPtr := pool.GetBuffer(bufSize)
 	defer pool.PutBuffer(bufPtr)
 
 	buf := (*bufPtr)[:bufSize]
-	_, err := copyBuffer(dst, src, buf, onCopied, stopCh)
+	_, err := copyBuffer(dst, src, buf, onCopied, stopCh, writeTimeout)
 
 	if cr, ok := src.(closeReader); ok {
 		_ = cr.CloseRead()
@@ -117,14 +134,8 @@ func pipeBuffer(dst io.ReadWriteCloser, src io.ReadWriteCloser, bufSize int, onC
 		if e := cw.CloseWrite(); e != nil {
 			_ = dst.Close()
 		}
-		if rd, ok := dst.(readDeadliner); ok {
-			_ = rd.SetReadDeadline(time.Now().Add(tcpWaitTimeout))
-		}
 	} else {
 		_ = dst.Close()
-		if rd, ok := dst.(readDeadliner); ok {
-			_ = rd.SetReadDeadline(time.Now().Add(tcpWaitTimeout))
-		}
 	}
 
 	return err
@@ -132,7 +143,13 @@ func pipeBuffer(dst io.ReadWriteCloser, src io.ReadWriteCloser, bufSize int, onC
 
 const stopCheckInterval = 64
 
-func copyBuffer(dst io.Writer, src io.Reader, buf []byte, onCopied func(n int64), stopCh <-chan struct{}) (written int64, err error) {
+func copyBuffer(dst io.Writer, src io.Reader, buf []byte, onCopied func(n int64), stopCh <-chan struct{}, writeTimeout time.Duration) (written int64, err error) {
+	if wd, ok := dst.(writeDeadliner); ok && writeTimeout > 0 {
+		defer func() {
+			_ = wd.SetWriteDeadline(time.Time{})
+		}()
+	}
+
 	for i := 0; ; i++ {
 		if i%stopCheckInterval == 0 {
 			select {
@@ -144,6 +161,9 @@ func copyBuffer(dst io.Writer, src io.Reader, buf []byte, onCopied func(n int64)
 
 		nr, er := src.Read(buf)
 		if nr > 0 {
+			if wd, ok := dst.(writeDeadliner); ok && writeTimeout > 0 {
+				_ = wd.SetWriteDeadline(time.Now().Add(writeTimeout))
+			}
 			nw, ew := dst.Write(buf[:nr])
 			if nw > 0 {
 				written += int64(nw)
