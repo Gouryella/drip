@@ -2,8 +2,6 @@ package dmux
 
 import (
 	"errors"
-	"fmt"
-	"io"
 	"time"
 )
 
@@ -32,8 +30,6 @@ type Config struct {
 	// KeepAliveTimeout is how long a PING may stay unanswered before the
 	// session is closed.
 	KeepAliveTimeout time.Duration
-	// LogOutput receives protocol diagnostics. Nil disables logging.
-	LogOutput io.Writer
 }
 
 // DefaultConfig returns conservative defaults suitable for tunnel traffic.
@@ -70,13 +66,4 @@ func (c *Config) normalize() {
 	if c.KeepAliveTimeout <= 0 {
 		c.KeepAliveTimeout = 10 * time.Second
 	}
-}
-
-func (c *Config) logf(format string, args ...any) {
-	if c.LogOutput == nil {
-		return
-	}
-	// Diagnostics are rare (protocol errors and lifecycle events), so the
-	// formatter cost is irrelevant here.
-	_, _ = fmt.Fprintf(c.LogOutput, "dmux: "+format+"\n", args...)
 }

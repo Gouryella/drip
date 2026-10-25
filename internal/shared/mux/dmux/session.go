@@ -15,15 +15,13 @@ import (
 type Session struct {
 	conn    net.Conn
 	config  *Config
-	client  bool
 	localID uint32 // parity of locally opened stream IDs: 1 client, 0 server
 
 	nextStreamID atomic.Uint32
 
-	streamsMu          sync.RWMutex
-	streams            map[uint32]*Stream
-	lastRemoteStreamID uint32 // recv goroutine only
-	numStreams         atomic.Int32
+	streamsMu  sync.RWMutex
+	streams    map[uint32]*Stream
+	numStreams atomic.Int32
 
 	acceptCh chan *Stream
 
@@ -65,7 +63,6 @@ func newSession(conn net.Conn, cfg *Config, client bool) (*Session, error) {
 	s := &Session{
 		conn:     conn,
 		config:   cfg,
-		client:   client,
 		streams:  make(map[uint32]*Stream),
 		acceptCh: make(chan *Stream, cfg.AcceptBacklog),
 		outCh:    make(chan []byte, outQueueDepth),
@@ -578,9 +575,6 @@ func (s *Session) acceptRemoteStream(id uint32) (*Stream, error) {
 		s.streamsMu.Unlock()
 		_ = s.sendReset(id)
 		return nil, nil
-	}
-	if id > s.lastRemoteStreamID {
-		s.lastRemoteStreamID = id
 	}
 	st := newStream(s, id, false)
 	s.streams[id] = st

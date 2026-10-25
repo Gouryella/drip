@@ -80,7 +80,6 @@ func unavailableSessionGroup(b testing.TB, count int) *ConnectionGroup {
 		left, right := net.Pipe()
 		cfg := mux.NewOptimizedConfig()
 		cfg.EnableKeepAlive = false
-		cfg.LogOutput = io.Discard
 		local, err := mux.Client(left, cfg)
 		if err != nil {
 			b.Fatal(err)

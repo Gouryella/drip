@@ -18,9 +18,8 @@ type chunk struct {
 // Stream is a bidirectional byte stream multiplexed over a Session. It
 // implements net.Conn plus CloseWrite for half-close.
 type Stream struct {
-	sess  *Session
-	id    uint32
-	local bool
+	sess *Session
+	id   uint32
 
 	synSent      atomic.Bool
 	localClosed  atomic.Bool
@@ -49,7 +48,6 @@ func newStream(s *Session, id uint32, local bool) *Stream {
 	st := &Stream{
 		sess:       s,
 		id:         id,
-		local:      local,
 		rsignal:    make(chan struct{}, 1),
 		wsignal:    make(chan struct{}, 1),
 		sendWindow: int64(s.config.MaxStreamWindowSize),

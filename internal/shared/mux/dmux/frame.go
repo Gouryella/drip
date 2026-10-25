@@ -68,25 +68,6 @@ const (
 	frameReset
 )
 
-func (t frameType) String() string {
-	switch t {
-	case frameData:
-		return "DATA"
-	case frameWindowUpdate:
-		return "WINDOW_UPDATE"
-	case frameGoAway:
-		return "GOAWAY"
-	case framePing:
-		return "PING"
-	case framePong:
-		return "PONG"
-	case frameReset:
-		return "RESET"
-	default:
-		return fmt.Sprintf("UNKNOWN(%d)", byte(t))
-	}
-}
-
 const (
 	// flagSYN marks the first frame of a locally opened stream.
 	flagSYN uint16 = 1 << 0

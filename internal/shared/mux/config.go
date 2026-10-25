@@ -1,7 +1,6 @@
 package mux
 
 import (
-	"io"
 	"net"
 
 	"drip/internal/shared/constants"
@@ -27,7 +26,6 @@ func NewOptimizedConfig() *Config {
 	cfg.ConnectionWriteTimeout = constants.MuxConnectionWriteTimeout
 	cfg.EnableKeepAlive = true
 	cfg.KeepAliveInterval = constants.MuxKeepAliveInterval
-	cfg.LogOutput = io.Discard
 	return cfg
 }
 

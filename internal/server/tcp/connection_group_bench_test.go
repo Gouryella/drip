@@ -1,12 +1,12 @@
 package tcp
 
 import (
-	"drip/internal/shared/mux"
 	"fmt"
-	"go.uber.org/zap"
-	"io"
 	"net"
 	"testing"
+
+	"drip/internal/shared/mux"
+	"go.uber.org/zap"
 )
 
 func BenchmarkConnectionGroupOpenStream(b *testing.B) {
@@ -19,7 +19,6 @@ func BenchmarkConnectionGroupOpenStream(b *testing.B) {
 				left, right := net.Pipe()
 				cfg := mux.NewOptimizedConfig()
 				cfg.EnableKeepAlive = false
-				cfg.LogOutput = io.Discard
 				client, err := mux.Client(left, cfg)
 				if err != nil {
 					b.Fatal(err)
