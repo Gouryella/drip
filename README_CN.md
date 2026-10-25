@@ -35,6 +35,18 @@
 
 ## 最近更新
 
+### 2026-10-25 — v0.8.0
+
+- **吞吐 4×、p99 降低 6×** — 400 并发下 5.5k → 21k req/s，p99 145ms → 24ms。
+- **自研 mux（dmux）** — 替换 yamux：零 RTT 开流、每流流控、批量写入；开/关流快约 4.5×。
+- **HTTP/3（QUIC）** — 公网端口启用，支持 Alt-Svc 与 `--http3` / `DRIP_HTTP3` / `http3:` 配置。
+- **大文件传输修复** — 1GiB 下载/上传 SHA-256 校验通过；慢速大文件不再被服务端超时中断。
+- **默认不限制上传** — `max_request_body_bytes` 默认 0，S3 风格 PUT 与 chunked 上传开箱即用。
+- **内存降低 35–45%** — 负载下 server 366 → 239MB，client 243 → 134MB。
+- **Go 1.27.3** + 全新 CI 工具链（staticcheck 0.8.2、gosec 2.30.0、govulncheck 1.9.0）。
+
+> 协议已变更：客户端与服务端需一起升级。
+
 ### 2025-02-14
 
 - **带宽限速 (QoS)** - 支持按隧道粒度进行带宽控制，使用令牌桶算法，服务端按 `min(client, server)` 作为实际生效限速
@@ -64,7 +76,7 @@ burst_multiplier: 2.5
 release 下载（除非显式传入 `--allow-latest`），并会在解压前校验 release 归档的 SHA256。
 
 ```bash
-VERSION=v0.7.0
+VERSION=v0.8.0
 SCRIPT=install-client.sh
 SCRIPT_SHA256=<install-client.sh 的 sha256>
 ARCHIVE_SHA256=<GitHub Release checksums 文件中的归档 sha256>
@@ -83,7 +95,7 @@ bash "$SCRIPT" --version "$VERSION" --checksum "$ARCHIVE_SHA256"
 如果手动安装二进制，请先校验 release checksum 文件：
 
 ```bash
-VERSION=v0.7.0
+VERSION=v0.8.0
 VERSION_NUMBER="${VERSION#v}"
 ARCHIVE="drip_${VERSION_NUMBER}_linux_amd64.tar.gz"
 

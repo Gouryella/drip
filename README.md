@@ -35,6 +35,18 @@
 
 ## Recent Changes
 
+### 2026-10-25 — v0.8.0
+
+- **4× throughput, 6× lower p99** — 5.5k → 21k req/s at 400 connections; p99 145 ms → 24 ms on the same hardware.
+- **In-house mux (dmux)** — replaces yamux with zero-RTT stream open, per-stream flow control, and batched writes; stream open/close is ~4.5× faster.
+- **HTTP/3 (QUIC)** — enabled on the public port with Alt-Svc and `--http3` / `DRIP_HTTP3` / `http3:` switches.
+- **Large transfers fixed** — 1 GiB downloads/uploads verified by SHA-256; slow transfers are no longer cut by server timeouts.
+- **Unlimited uploads by default** — `max_request_body_bytes` defaults to 0, so S3-style PUT and chunked uploads work out of the box.
+- **35–45% less memory** — server 366 → 239 MB, client 243 → 134 MB under load.
+- **Go 1.27.3** with refreshed CI tooling (staticcheck 0.8.2, gosec 2.30.0, govulncheck 1.9.0).
+
+> The wire protocol changed: upgrade the client and server together.
+
 ### 2025-02-14
 
 - **Bandwidth Limiting (QoS)** - Per-tunnel bandwidth control with token bucket algorithm, server enforces `min(client, server)` as effective limit
@@ -65,7 +77,7 @@ installers now refuse unpinned release downloads unless `--allow-latest` is set,
 and they verify the release archive SHA256 before extraction.
 
 ```bash
-VERSION=v0.7.0
+VERSION=v0.8.0
 SCRIPT=install-client.sh
 SCRIPT_SHA256=<sha256-of-install-client.sh>
 ARCHIVE_SHA256=<sha256-from-the-GitHub-Release-checksums-file>
@@ -84,7 +96,7 @@ bash "$SCRIPT" --version "$VERSION" --checksum "$ARCHIVE_SHA256"
 For a manual binary install, verify the release checksum file first:
 
 ```bash
-VERSION=v0.7.0
+VERSION=v0.8.0
 VERSION_NUMBER="${VERSION#v}"
 ARCHIVE="drip_${VERSION_NUMBER}_linux_amd64.tar.gz"
 
