@@ -22,6 +22,10 @@ HTTP_TEST_PORT=3000
 DRIP_SERVER_PORT=8443
 PPROF_PORT=6060
 
+# Token shared by the benchmark server and client. The server refuses
+# unauthenticated registration unless --allow-anonymous is set explicitly.
+BENCH_TOKEN="${BENCH_TOKEN:-drip-bench-token}"
+
 # PID file
 PIDS_FILE="${LOG_DIR}/pids.txt"
 
@@ -202,6 +206,7 @@ start_drip_server() {
     ./bin/drip server \
         --port "$DRIP_SERVER_PORT" \
         --domain localhost \
+        --token "$BENCH_TOKEN" \
         --tls-cert "$cert_path" \
         --tls-key "$key_path" \
         > "${LOG_DIR}/drip-server.log" 2>&1 &
@@ -223,6 +228,7 @@ start_drip_client() {
 
     ./bin/drip http "$HTTP_TEST_PORT" \
         --server "localhost:${DRIP_SERVER_PORT}" \
+        --token "$BENCH_TOKEN" \
         --insecure \
         > "${LOG_DIR}/drip-client.log" 2>&1 &
     local pid=$!

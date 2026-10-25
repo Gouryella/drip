@@ -18,9 +18,12 @@ import (
 
 const (
 	// DefaultMaxRequestBodyBytes is the public-server default for tunneled
-	// HTTP request bodies. Set max_request_body_bytes to 0 only as an explicit
-	// high-risk opt-in for unlimited uploads.
-	DefaultMaxRequestBodyBytes int64 = 32 << 20
+	// HTTP request bodies. Zero means unlimited: bodies are streamed (never
+	// buffered), and registration requires a token by default, so a cap would
+	// break legitimate large uploads (S3 multipart, speedtests, backups)
+	// without protecting memory. Operators can set max_request_body_bytes to
+	// a positive value to enforce a limit.
+	DefaultMaxRequestBodyBytes int64 = 0
 )
 
 // ServerConfig holds the server configuration
@@ -38,6 +41,10 @@ type ServerConfig struct {
 	TLSEnabled  bool   `yaml:"tls_enabled"`
 	TLSCertFile string `yaml:"tls_cert"`
 	TLSKeyFile  string `yaml:"tls_key"`
+
+	// HTTP/3 (QUIC) on the public port. It is only effective when TLS is
+	// enabled; omitting the field enables it, and false opts out.
+	HTTP3 bool `yaml:"http3"`
 
 	// Security
 	AuthToken      string   `yaml:"token"`
@@ -62,16 +69,14 @@ type ServerConfig struct {
 	BurstMultiplier float64 `yaml:"burst_multiplier,omitempty"`
 
 	// Optional HTTP request body limit for tunneled HTTP/HTTPS traffic.
-	// 0 disables the limit and preserves full reverse-proxy behavior. Omitting
-	// this field uses DefaultMaxRequestBodyBytes.
+	// 0 (the default) means no limit; set a positive value to cap uploads.
 	MaxRequestBodyBytes int64 `yaml:"max_request_body_bytes,omitempty"`
 
 	maxRequestBodyBytesSet bool
 }
 
 // MaxRequestBodyBytesExplicit reports whether max_request_body_bytes was set
-// in the loaded YAML. It is used to preserve explicit 0 = unlimited semantics
-// while still applying a safe default when the field is omitted.
+// in the loaded YAML.
 func (c *ServerConfig) MaxRequestBodyBytesExplicit() bool {
 	return c.maxRequestBodyBytesSet
 }
@@ -86,6 +91,7 @@ func (c *ServerConfig) UnmarshalYAML(value *yaml.Node) error {
 
 	raw := serverConfigYAML{
 		MaxRequestBodyBytes: DefaultMaxRequestBodyBytes,
+		HTTP3:               true,
 	}
 	if err := value.Decode(&raw); err != nil {
 		return err
@@ -106,6 +112,7 @@ var serverConfigYAMLKeys = map[string]struct{}{
 	"tls_enabled":            {},
 	"tls_cert":               {},
 	"tls_key":                {},
+	"http3":                  {},
 	"token":                  {},
 	"allow_anonymous":        {},
 	"metrics_token":          {},

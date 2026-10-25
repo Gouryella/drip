@@ -28,7 +28,7 @@ func (b *bufferedReadWriteCloser) Read(p []byte) (int, error) {
 }
 
 func (h *Handler) handleWebSocket(w http.ResponseWriter, r *http.Request, tconn *tunnel.Connection) {
-	stream, err := h.openStreamWithTimeout(tconn)
+	stream, err := tconn.OpenStream()
 	if err != nil {
 		http.Error(w, "Tunnel unavailable", http.StatusBadGateway)
 		return

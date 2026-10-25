@@ -144,11 +144,21 @@ func pipeBuffer(dst io.ReadWriteCloser, src io.ReadWriteCloser, bufSize int, onC
 const stopCheckInterval = 64
 
 func copyBuffer(dst io.Writer, src io.Reader, buf []byte, onCopied func(n int64), stopCh <-chan struct{}, writeTimeout time.Duration) (written int64, err error) {
-	if wd, ok := dst.(writeDeadliner); ok && writeTimeout > 0 {
+	var wd writeDeadliner
+	if writeTimeout > 0 {
+		wd, _ = dst.(writeDeadliner)
+	}
+	if wd != nil {
 		defer func() {
 			_ = wd.SetWriteDeadline(time.Time{})
 		}()
 	}
+
+	// Re-arming the write deadline on every chunk costs a netpoller timer
+	// update (and an allocation for connections such as qos.LimitedConn).
+	// Arm before the first write, then at most once per half timeout. A
+	// stalled write is still detected within at most 1.5x writeTimeout.
+	var lastDeadlineUpdate time.Time
 
 	for i := 0; ; i++ {
 		if i%stopCheckInterval == 0 {
@@ -161,8 +171,12 @@ func copyBuffer(dst io.Writer, src io.Reader, buf []byte, onCopied func(n int64)
 
 		nr, er := src.Read(buf)
 		if nr > 0 {
-			if wd, ok := dst.(writeDeadliner); ok && writeTimeout > 0 {
-				_ = wd.SetWriteDeadline(time.Now().Add(writeTimeout))
+			if wd != nil {
+				now := time.Now()
+				if lastDeadlineUpdate.IsZero() || now.Sub(lastDeadlineUpdate) >= writeTimeout/2 {
+					_ = wd.SetWriteDeadline(now.Add(writeTimeout))
+					lastDeadlineUpdate = now
+				}
 			}
 			nw, ew := dst.Write(buf[:nr])
 			if nw > 0 {

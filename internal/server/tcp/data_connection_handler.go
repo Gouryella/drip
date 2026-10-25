@@ -7,8 +7,8 @@ import (
 	"net"
 	"time"
 
-	json "github.com/goccy/go-json"
-	"github.com/hashicorp/yamux"
+	"encoding/json"
+
 	"go.uber.org/zap"
 
 	"drip/internal/shared/mux"
@@ -25,7 +25,7 @@ type DataConnectionHandler struct {
 	groupManager     *ConnectionGroupManager
 	stopCh           <-chan struct{}
 	logger           *zap.Logger
-	onSessionCreated func(*yamux.Session)
+	onSessionCreated func(*mux.Session)
 	onTunnelIDSet    func(string)
 }
 
@@ -51,7 +51,7 @@ func NewDataConnectionHandler(
 }
 
 // SetSessionCreatedHandler sets the callback for when a session is created.
-func (h *DataConnectionHandler) SetSessionCreatedHandler(handler func(*yamux.Session)) {
+func (h *DataConnectionHandler) SetSessionCreatedHandler(handler func(*mux.Session)) {
 	h.onSessionCreated = handler
 }
 
@@ -140,7 +140,7 @@ func (h *DataConnectionHandler) Handle(frame *protocol.Frame) error {
 
 	_ = h.conn.SetReadDeadline(time.Time{})
 
-	// Server acts as yamux Client, client connector acts as yamux Server
+	// Server acts as mux client, client connector acts as mux server
 	bc := &bufferedConn{
 		Conn:   h.conn,
 		reader: h.reader,
@@ -149,9 +149,9 @@ func (h *DataConnectionHandler) Handle(frame *protocol.Frame) error {
 	// Use optimized mux config for server
 	cfg := mux.NewServerConfig()
 
-	session, err := yamux.Client(bc, cfg)
+	session, err := mux.Client(bc, cfg)
 	if err != nil {
-		return fmt.Errorf("failed to init yamux session: %w", err)
+		return fmt.Errorf("failed to init mux session: %w", err)
 	}
 
 	if err := group.CommitReservedSession(req.ConnectionID, session); err != nil {

@@ -28,8 +28,15 @@ tcp_port_max: 20100
 
 # Optional settings
 # metrics_token: replace-with-a-long-random-token  # Token for /stats and /metrics endpoints
-# trusted_proxies:          # Reverse proxy IPs/CIDRs allowed to supply X-Forwarded-For
-#   - 127.0.0.1             # Default is empty, which ignores forwarded client IP headers
+# http3: true               # HTTP/3 (QUIC) on the public UDP port; requires tls_enabled.
+#                           # Publish the UDP port too (443:8443/udp) or clients stay on h1/h2.
+# max_request_body_bytes: 0 # Optional upload cap in bytes; 0 (default) means unlimited.
+#                           # Set a positive value only if you need to bound uploads.
+# trusted_proxies:          # Proxy IPs/CIDRs allowed to supply X-Forwarded-For
+#                           # (see https://driptunnel.app/docs/client-ip-trust).
+#   - 127.0.0.1             # Example: a reverse proxy on this host. Leave empty when clients
+#                           # reach drip-server directly - forwarded headers are then ignored
+#                           # and the peer address is used.
 # debug: false              # Enable debug logging
 # pprof_port: 6060          # Enable pprof profiling
 # transports:               # Allowed transports (default: tcp,wss)

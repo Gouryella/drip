@@ -1,6 +1,6 @@
 package protocol
 
-import json "github.com/goccy/go-json"
+import "encoding/json"
 
 type PoolCapabilities struct {
 	MaxDataConns int `json:"max_data_conns"`

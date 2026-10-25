@@ -1,31 +1,30 @@
 package tcp
 
 import (
+	"drip/internal/shared/mux"
 	"fmt"
+	"go.uber.org/zap"
 	"io"
 	"net"
 	"testing"
-
-	"github.com/hashicorp/yamux"
-	"go.uber.org/zap"
 )
 
 func BenchmarkConnectionGroupOpenStream(b *testing.B) {
 	for _, count := range []int{1, 8, 64} {
 		b.Run(fmt.Sprintf("sessions_%d", count), func(b *testing.B) {
-			group := &ConnectionGroup{Sessions: make(map[string]*yamux.Session), stopCh: make(chan struct{}), logger: zap.NewNop()}
+			group := &ConnectionGroup{Sessions: make(map[string]*mux.Session), stopCh: make(chan struct{}), logger: zap.NewNop()}
 			b.Cleanup(group.Close)
 			closed := make(chan struct{}, count)
 			for i := 0; i < count; i++ {
 				left, right := net.Pipe()
-				cfg := yamux.DefaultConfig()
+				cfg := mux.NewOptimizedConfig()
 				cfg.EnableKeepAlive = false
 				cfg.LogOutput = io.Discard
-				client, err := yamux.Client(left, cfg)
+				client, err := mux.Client(left, cfg)
 				if err != nil {
 					b.Fatal(err)
 				}
-				server, err := yamux.Server(right, cfg)
+				server, err := mux.Server(right, cfg)
 				if err != nil {
 					b.Fatal(err)
 				}

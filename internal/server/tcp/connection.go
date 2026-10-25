@@ -13,12 +13,12 @@ import (
 	"sync"
 	"time"
 
-	json "github.com/goccy/go-json"
-	"github.com/hashicorp/yamux"
+	"encoding/json"
 
 	"drip/internal/server/tunnel"
 	"drip/internal/shared/constants"
 	"drip/internal/shared/httputil"
+	"drip/internal/shared/mux"
 	"drip/internal/shared/protocol"
 	"drip/internal/shared/qos"
 	"drip/internal/shared/utils"
@@ -67,7 +67,7 @@ type Connection struct {
 	tunnelType       protocol.TunnelType
 	ctx              context.Context
 	cancel           context.CancelFunc
-	session          *yamux.Session
+	session          *mux.Session
 	proxy            *Proxy
 	tunnelID         string
 	groupManager     *ConnectionGroupManager
@@ -163,7 +163,7 @@ func (c *Connection) Handle() error {
 			c.stopCh,
 			c.logger,
 		)
-		handler.SetSessionCreatedHandler(func(session *yamux.Session) {
+		handler.SetSessionCreatedHandler(func(session *mux.Session) {
 			c.session = session
 			if c.lifecycleManager != nil {
 				c.lifecycleManager.SetSession(session)

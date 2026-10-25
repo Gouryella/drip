@@ -14,7 +14,6 @@ import (
 
 	"drip/internal/server/tunnel"
 	"drip/internal/shared/protocol"
-	"drip/pkg/config"
 
 	"go.uber.org/zap"
 )
@@ -260,7 +259,9 @@ func TestHandlerTimesOutReadingTunnelResponseHeader(t *testing.T) {
 	}
 }
 
-func TestHandlerRejectsRequestBodyOverDefaultLimitBeforeOpeningStream(t *testing.T) {
+const testMaxRequestBodyBytes int64 = 1 << 20
+
+func TestHandlerRejectsRequestBodyOverConfiguredLimitBeforeOpeningStream(t *testing.T) {
 	logger := zap.NewNop()
 	manager := tunnel.NewManagerWithConfig(logger, tunnel.ManagerConfig{
 		MaxTunnels:      10,
@@ -287,15 +288,16 @@ func TestHandlerRejectsRequestBodyOverDefaultLimitBeforeOpeningStream(t *testing
 	})
 
 	handler := NewHandler(HandlerConfig{
-		Manager:      manager,
-		Logger:       logger,
-		ServerDomain: "drip.test",
-		TunnelDomain: testTunnelDomain,
+		Manager:             manager,
+		Logger:              logger,
+		ServerDomain:        "drip.test",
+		TunnelDomain:        testTunnelDomain,
+		MaxRequestBodyBytes: testMaxRequestBodyBytes,
 	})
 
 	req := httptest.NewRequest(http.MethodPost, "http://demo."+testTunnelDomain+"/upload?secret=hidden", http.NoBody)
 	req.Host = "demo." + testTunnelDomain
-	req.ContentLength = config.DefaultMaxRequestBodyBytes + 1
+	req.ContentLength = testMaxRequestBodyBytes + 1
 	rr := httptest.NewRecorder()
 
 	handler.ServeHTTP(rr, req)

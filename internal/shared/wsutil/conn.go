@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -12,7 +13,7 @@ import (
 
 // Conn wraps a gorilla/websocket.Conn to implement net.Conn.
 // It uses binary messages for data transfer, making it compatible
-// with yamux and the existing frame protocol.
+// with the multiplexer and the existing frame protocol.
 type Conn struct {
 	ws            *websocket.Conn
 	reader        io.Reader
@@ -25,11 +26,11 @@ type Conn struct {
 	closeOnce     sync.Once
 	closeErr      error
 	deadlineMu    sync.Mutex
-	writeDeadline time.Time
-	writeTimer    *time.Timer
-	writeActive   bool
-	closed        bool
-	writeTimedOut bool
+	writeDeadline atomic.Pointer[time.Time] // nil means no write deadline
+	writeTimer    *time.Timer               // guarded by deadlineMu
+	writeActive   atomic.Bool
+	closed        atomic.Bool
+	writeTimedOut bool // guarded by deadlineMu
 }
 
 // NewConn wraps a WebSocket connection as a net.Conn.
@@ -92,48 +93,82 @@ func (c *Conn) Read(p []byte) (int, error) {
 func (c *Conn) Write(p []byte) (int, error) {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	c.deadlineMu.Lock()
-	if c.closed {
-		c.deadlineMu.Unlock()
+
+	if c.closed.Load() {
 		return 0, net.ErrClosed
 	}
-	if !c.writeDeadline.IsZero() && !time.Now().Before(c.writeDeadline) {
+
+	// Publish the in-flight write before sampling the deadline. Together with
+	// SetWriteDeadline storing the deadline before checking writeActive, this
+	// guarantees that a deadline configured concurrently with Write is either
+	// observed below or interrupts the write through the timer.
+	c.writeActive.Store(true)
+
+	if c.writeDeadline.Load() == nil {
+		// Fast path: no write deadline is configured. This wrapper never sets
+		// gorilla's write deadline (it starts zero and stays zero), so there
+		// is no per-write deadline bookkeeping to do. A deadline installed
+		// while this write is in flight still arms the interrupt timer.
+		defer func() {
+			c.writeActive.Store(false)
+			if c.writeDeadline.Load() != nil {
+				// A deadline appeared mid-write; stop the timer it armed.
+				c.deadlineMu.Lock()
+				c.resetWriteTimerLocked()
+				c.deadlineMu.Unlock()
+			}
+		}()
+
+		err := c.ws.WriteMessage(websocket.BinaryMessage, p)
+		if err != nil {
+			return 0, c.writeError(err)
+		}
+		return len(p), nil
+	}
+
+	// Deadline path: serialize with SetWriteDeadline so the timer is armed for
+	// exactly the deadline in effect.
+	c.deadlineMu.Lock()
+	if deadline := c.writeDeadline.Load(); deadline != nil && !time.Now().Before(*deadline) {
+		c.writeActive.Store(false)
 		c.deadlineMu.Unlock()
 		return 0, os.ErrDeadlineExceeded
 	}
-	// Keep gorilla's socket deadline unset. Our timer handles deadline
-	// updates without racing the deadline gorilla applies when flushing.
-	_ = c.ws.SetWriteDeadline(time.Time{})
-	c.writeActive = true
 	c.resetWriteTimerLocked()
 	c.deadlineMu.Unlock()
 	defer func() {
 		c.deadlineMu.Lock()
-		c.writeActive = false
+		c.writeActive.Store(false)
 		c.resetWriteTimerLocked()
 		c.deadlineMu.Unlock()
 	}()
 
 	err := c.ws.WriteMessage(websocket.BinaryMessage, p)
 	if err != nil {
-		c.deadlineMu.Lock()
-		timedOut := c.writeTimedOut
-		c.deadlineMu.Unlock()
-		if timedOut {
-			return 0, os.ErrDeadlineExceeded
-		}
-		return 0, err
+		return 0, c.writeError(err)
 	}
 	return len(p), nil
+}
+
+// writeError maps a failed write to os.ErrDeadlineExceeded when the write
+// deadline timer closed the connection.
+func (c *Conn) writeError(err error) error {
+	c.deadlineMu.Lock()
+	timedOut := c.writeTimedOut
+	c.deadlineMu.Unlock()
+	if timedOut {
+		return os.ErrDeadlineExceeded
+	}
+	return err
 }
 
 // Close closes the WebSocket connection.
 func (c *Conn) Close() error {
 	c.closeOnce.Do(func() {
 		c.pingOnce.Do(func() { close(c.pingStop) })
+		c.closed.Store(true)
+		c.writeActive.Store(false)
 		c.deadlineMu.Lock()
-		c.closed = true
-		c.writeActive = false
 		c.resetWriteTimerLocked()
 		c.deadlineMu.Unlock()
 		// Close must interrupt an in-flight writer. Waiting for writeMu or
@@ -168,15 +203,20 @@ func (c *Conn) SetReadDeadline(t time.Time) error {
 
 // SetWriteDeadline sets the write deadline.
 func (c *Conn) SetWriteDeadline(t time.Time) error {
-	c.deadlineMu.Lock()
-	defer c.deadlineMu.Unlock()
-	if c.closed {
+	if c.closed.Load() {
 		return net.ErrClosed
 	}
-	c.writeDeadline = t
-	c.resetWriteTimerLocked()
+	if t.IsZero() {
+		c.writeDeadline.Store(nil)
+	} else {
+		deadline := t
+		c.writeDeadline.Store(&deadline)
+	}
 	// Do not wait for writeMu: deadline changes must interrupt an ongoing
-	// Write. Only Write touches gorilla's non-concurrent deadline field.
+	// Write. Only Write serializes gorilla's write path.
+	c.deadlineMu.Lock()
+	c.resetWriteTimerLocked()
+	c.deadlineMu.Unlock()
 	return nil
 }
 
@@ -185,13 +225,15 @@ func (c *Conn) resetWriteTimerLocked() {
 		c.writeTimer.Stop()
 		c.writeTimer = nil
 	}
-	if !c.writeActive || c.writeDeadline.IsZero() {
+	deadline := c.writeDeadline.Load()
+	if !c.writeActive.Load() || deadline == nil {
 		return
 	}
-	deadline := c.writeDeadline
-	c.writeTimer = time.AfterFunc(time.Until(deadline), func() {
+	d := *deadline
+	c.writeTimer = time.AfterFunc(time.Until(d), func() {
 		c.deadlineMu.Lock()
-		expired := c.writeActive && c.writeDeadline.Equal(deadline) && !time.Now().Before(deadline)
+		current := c.writeDeadline.Load()
+		expired := c.writeActive.Load() && current != nil && current.Equal(d) && !time.Now().Before(d)
 		if expired {
 			c.writeTimedOut = true
 		}

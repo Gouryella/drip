@@ -7,7 +7,7 @@ import (
 	"go.uber.org/zap"
 )
 
-// SessionScaler manages automatic scaling of yamux sessions based on load.
+// SessionScaler manages automatic scaling of mux sessions based on load.
 type SessionScaler struct {
 	client *PoolClient
 	logger *zap.Logger
@@ -89,9 +89,10 @@ func (s *SessionScaler) scalerLoop() {
 		now := time.Now()
 		// Replace lost sessions even when traffic is low. Load-based scaling
 		// alone never restores the pool after a data connection disconnects.
+		// Repair in parallel so a mass drop does not take one tick per session.
 		if current < desired {
 			if now.Sub(lastScale) >= s.scaleUpCooldown {
-				_ = s.client.addDataSession()
+				s.repairSessions(desired - current)
 				s.client.mu.Lock()
 				s.client.lastScale = now
 				s.client.mu.Unlock()
@@ -166,4 +167,33 @@ func (s *SessionScaler) scalerLoop() {
 			}
 		}
 	}
+}
+
+// repairSessions replaces up to maxBurstAdd missing sessions in parallel so a
+// mass drop does not require one scaling tick per session.
+func (s *SessionScaler) repairSessions(missing int) {
+	toAdd := min(missing, s.maxBurstAdd)
+	if remaining := s.client.maxSessions - s.client.sessionCount(); remaining < toAdd {
+		toAdd = max(remaining, 0)
+	}
+	if toAdd <= 0 {
+		return
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < toAdd; i++ {
+		select {
+		case <-s.stopCh:
+			wg.Wait()
+			return
+		default:
+		}
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = s.client.addDataSession()
+		}()
+	}
+	wg.Wait()
 }

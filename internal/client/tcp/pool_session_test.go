@@ -9,7 +9,8 @@ import (
 	"testing"
 	"time"
 
-	json "github.com/goccy/go-json"
+	"encoding/json"
+
 	"go.uber.org/zap"
 
 	"drip/internal/shared/protocol"

@@ -4,18 +4,16 @@ import (
 	"net"
 	"testing"
 	"time"
-
-	"github.com/hashicorp/yamux"
 )
 
 func TestStreamCloseInterruptsReadWithoutClosingPeer(t *testing.T) {
 	left, right := net.Pipe()
-	client, err := yamux.Client(left, NewClientConfig())
+	client, err := Client(left, NewClientConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer client.Close()
-	server, err := yamux.Server(right, NewServerConfig())
+	server, err := Server(right, NewServerConfig())
 	if err != nil {
 		t.Fatal(err)
 	}

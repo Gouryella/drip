@@ -5,6 +5,7 @@ services:
     restart: unless-stopped
     ports:
       - "443:8443"
+      - "443:8443/udp" # HTTP/3 (QUIC); requires http3: true (the default)
       - "20000-20100:20000-20100"
     volumes:
       - ./config.yaml:/app/config.yaml:ro

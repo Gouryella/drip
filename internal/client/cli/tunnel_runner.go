@@ -138,54 +138,56 @@ func runTunnelWithUI(connConfig *tcp.ConnectorConfig, daemonInfo *DaemonInfo) er
 		stopDisplay := make(chan struct{})
 		disconnected := make(chan struct{})
 
-		go func() {
-			renderTicker := time.NewTicker(1 * time.Second)
-			defer renderTicker.Stop()
+		if shouldRenderStatsUI(daemonInfo) {
+			go func() {
+				renderTicker := time.NewTicker(1 * time.Second)
+				defer renderTicker.Stop()
 
-			var lastLatency time.Duration
-			lastRenderedLines := 0
+				var lastLatency time.Duration
+				lastRenderedLines := 0
 
-			for {
-				select {
-				case latency := <-latencyCh:
-					lastLatency = latency
-				case <-renderTicker.C:
-					stats := connector.GetStats()
-					if stats == nil {
-						continue
-					}
-
-					stats.UpdateSpeed()
-					snapshot := stats.GetSnapshot()
-
-					status.Latency = lastLatency
-					status.BytesIn = snapshot.TotalBytesIn
-					status.BytesOut = snapshot.TotalBytesOut
-					status.SpeedIn = float64(snapshot.SpeedIn)
-					status.SpeedOut = float64(snapshot.SpeedOut)
-
-					if status.Type == "tcp" {
-						if snapshot.SpeedIn == 0 && snapshot.SpeedOut == 0 {
-							status.TotalRequest = 0
-						} else {
-							status.TotalRequest = snapshot.ActiveConnections
+				for {
+					select {
+					case latency := <-latencyCh:
+						lastLatency = latency
+					case <-renderTicker.C:
+						stats := connector.GetStats()
+						if stats == nil {
+							continue
 						}
-					} else {
-						status.TotalRequest = snapshot.TotalRequests
-					}
 
-					statsView := ui.RenderTunnelStats(status)
-					if lastRenderedLines > 0 {
-						fmt.Print(clearLines(lastRenderedLines))
-					}
+						stats.UpdateSpeed()
+						snapshot := stats.GetSnapshot()
 
-					fmt.Print(statsView)
-					lastRenderedLines = countRenderedLines(statsView)
-				case <-stopDisplay:
-					return
+						status.Latency = lastLatency
+						status.BytesIn = snapshot.TotalBytesIn
+						status.BytesOut = snapshot.TotalBytesOut
+						status.SpeedIn = float64(snapshot.SpeedIn)
+						status.SpeedOut = float64(snapshot.SpeedOut)
+
+						if status.Type == "tcp" {
+							if snapshot.SpeedIn == 0 && snapshot.SpeedOut == 0 {
+								status.TotalRequest = 0
+							} else {
+								status.TotalRequest = snapshot.ActiveConnections
+							}
+						} else {
+							status.TotalRequest = snapshot.TotalRequests
+						}
+
+						statsView := ui.RenderTunnelStats(status)
+						if lastRenderedLines > 0 {
+							fmt.Print(clearLines(lastRenderedLines))
+						}
+
+						fmt.Print(statsView)
+						lastRenderedLines = countRenderedLines(statsView)
+					case <-stopDisplay:
+						return
+					}
 				}
-			}
-		}()
+			}()
+		}
 
 		go func() {
 			connector.Wait()
@@ -283,6 +285,20 @@ func randomDuration(maxInclusive time.Duration) time.Duration {
 		return maxInclusive / 2
 	}
 	return time.Duration(n.Int64())
+}
+
+// shouldRenderStatsUI reports whether the periodic ANSI stats display can be
+// shown. Daemons redirect stdout to a log file, where cursor-control escape
+// sequences would only bloat the log, so rendering is skipped there.
+func shouldRenderStatsUI(daemonInfo *DaemonInfo) bool {
+	if daemonInfo != nil {
+		return false
+	}
+	fi, err := os.Stdout.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
 }
 
 func clearLines(lines int) string {

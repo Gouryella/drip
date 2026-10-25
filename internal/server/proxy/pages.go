@@ -4,7 +4,8 @@ import (
 	"net/http"
 	"time"
 
-	json "github.com/goccy/go-json"
+	"encoding/json"
+
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"drip/internal/shared/httputil"
@@ -244,7 +245,7 @@ func (h *Handler) serveStats(w http.ResponseWriter, r *http.Request) {
 		tunnelStats = append(tunnelStats, map[string]interface{}{
 			"subdomain":          conn.Subdomain,
 			"tunnel_type":        string(conn.GetTunnelType()),
-			"last_active":        conn.LastActive.Unix(),
+			"last_active":        conn.LastActiveTime().Unix(),
 			"bytes_in":           conn.GetBytesIn(),
 			"bytes_out":          conn.GetBytesOut(),
 			"active_connections": conn.GetActiveConnections(),

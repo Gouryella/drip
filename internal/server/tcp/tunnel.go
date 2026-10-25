@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"net"
 
-	"github.com/hashicorp/yamux"
-
 	"drip/internal/shared/mux"
 )
 
@@ -20,7 +18,7 @@ func (c *bufferedConn) Read(p []byte) (int, error) {
 }
 
 func (c *Connection) handleTCPTunnel(reader *bufio.Reader) error {
-	// Public server acts as yamux Client, client connector acts as yamux Server.
+	// Public server acts as mux client, client connector acts as mux server.
 	bc := &bufferedConn{
 		Conn:   c.conn,
 		reader: reader,
@@ -29,9 +27,9 @@ func (c *Connection) handleTCPTunnel(reader *bufio.Reader) error {
 	// Use optimized mux config for server
 	cfg := mux.NewServerConfig()
 
-	session, err := yamux.Client(bc, cfg)
+	session, err := mux.Client(bc, cfg)
 	if err != nil {
-		return fmt.Errorf("failed to init yamux session: %w", err)
+		return fmt.Errorf("failed to init mux session: %w", err)
 	}
 	c.session = session
 
@@ -75,7 +73,7 @@ func (c *Connection) handleTCPTunnel(reader *bufio.Reader) error {
 }
 
 func (c *Connection) handleHTTPProxyTunnel(reader *bufio.Reader) error {
-	// Public server acts as yamux Client, client connector acts as yamux Server.
+	// Public server acts as mux client, client connector acts as mux server.
 	bc := &bufferedConn{
 		Conn:   c.conn,
 		reader: reader,
@@ -84,9 +82,9 @@ func (c *Connection) handleHTTPProxyTunnel(reader *bufio.Reader) error {
 	// Use optimized mux config for server
 	cfg := mux.NewServerConfig()
 
-	session, err := yamux.Client(bc, cfg)
+	session, err := mux.Client(bc, cfg)
 	if err != nil {
-		return fmt.Errorf("failed to init yamux session: %w", err)
+		return fmt.Errorf("failed to init mux session: %w", err)
 	}
 	c.session = session
 

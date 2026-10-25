@@ -10,12 +10,13 @@ import (
 
 func TestServerConfigBandwidth(t *testing.T) {
 	tests := []struct {
-		name           string
-		yaml           string
-		wantBandwidth  string
-		wantMultiplier float64
-		wantBodyLimit  int64
-		wantTrusted    []string
+		name             string
+		yaml             string
+		wantBandwidth    string
+		wantMultiplier   float64
+		wantBodyLimit    int64
+		wantBodyExplicit bool
+		wantTrusted      []string
 	}{
 		{
 			name: "bandwidth 1M with 2.5x burst",
@@ -31,10 +32,11 @@ trusted_proxies:
   - 127.0.0.1
   - 10.0.0.0/8
 `,
-			wantBandwidth:  "1M",
-			wantMultiplier: 2.5,
-			wantBodyLimit:  10485760,
-			wantTrusted:    []string{"127.0.0.1", "10.0.0.0/8"},
+			wantBandwidth:    "1M",
+			wantMultiplier:   2.5,
+			wantBodyLimit:    10485760,
+			wantBodyExplicit: true,
+			wantTrusted:      []string{"127.0.0.1", "10.0.0.0/8"},
 		},
 		{
 			name: "no bandwidth limit",
@@ -57,10 +59,11 @@ tcp_port_min: 10000
 tcp_port_max: 20000
 max_request_body_bytes: 0
 `,
-			wantBandwidth:  "",
-			wantMultiplier: 0,
-			wantBodyLimit:  0,
-			wantTrusted:    nil,
+			wantBandwidth:    "",
+			wantMultiplier:   0,
+			wantBodyLimit:    0,
+			wantBodyExplicit: true,
+			wantTrusted:      nil,
 		},
 	}
 
@@ -94,8 +97,43 @@ max_request_body_bytes: 0
 					t.Errorf("TrustedProxies[%d] = %q, want %q", i, cfg.TrustedProxies[i], tt.wantTrusted[i])
 				}
 			}
-			if tt.wantBodyLimit == 0 && !cfg.MaxRequestBodyBytesExplicit() {
-				t.Errorf("MaxRequestBodyBytesExplicit() = false, want true")
+			if got := cfg.MaxRequestBodyBytesExplicit(); got != tt.wantBodyExplicit {
+				t.Errorf("MaxRequestBodyBytesExplicit() = %v, want %v", got, tt.wantBodyExplicit)
+			}
+		})
+	}
+}
+
+func TestServerConfigHTTP3DefaultAndOptOut(t *testing.T) {
+	base := `
+port: 8443
+domain: example.com
+tcp_port_min: 10000
+tcp_port_max: 20000
+`
+	tests := []struct {
+		name string
+		yaml string
+		want bool
+	}{
+		{name: "enabled by default", yaml: base, want: true},
+		{name: "explicitly enabled", yaml: base + "http3: true\n", want: true},
+		{name: "explicitly disabled", yaml: base + "http3: false\n", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			configPath := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(configPath, []byte(tt.yaml), 0600); err != nil {
+				t.Fatalf("Failed to write config file: %v", err)
+			}
+
+			cfg, err := LoadServerConfig(configPath)
+			if err != nil {
+				t.Fatalf("LoadServerConfig failed: %v", err)
+			}
+			if cfg.HTTP3 != tt.want {
+				t.Errorf("HTTP3 = %t, want %t", cfg.HTTP3, tt.want)
 			}
 		})
 	}

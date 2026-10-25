@@ -4,11 +4,10 @@ go 1.26.8
 
 require (
 	github.com/charmbracelet/lipgloss v1.1.0
-	github.com/goccy/go-json v0.10.5
 	github.com/gorilla/websocket v1.5.3
-	github.com/hashicorp/yamux v0.1.2
 	github.com/prometheus/client_golang v1.23.2
 	github.com/prometheus/client_model v0.6.2
+	github.com/quic-go/quic-go v0.64.1
 	github.com/spf13/cobra v1.10.2
 	go.uber.org/zap v1.27.1
 	golang.org/x/crypto v0.56.0
@@ -37,6 +36,7 @@ require (
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/prometheus/common v0.67.5 // indirect
 	github.com/prometheus/procfs v0.19.2 // indirect
+	github.com/quic-go/qpack v0.6.0 // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/spf13/pflag v1.0.10 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect

@@ -20,7 +20,7 @@ type Connection struct {
 	Conn          *websocket.Conn
 	SendCh        chan []byte
 	CloseCh       chan struct{}
-	LastActive    time.Time
+	lastActive    atomic.Int64 // unix nanoseconds; updated per copied chunk
 	mu            sync.RWMutex
 	logger        *zap.Logger
 	closed        atomic.Bool
@@ -72,14 +72,15 @@ func (c *Connection) initMetricsLocked() *connectionMetrics {
 }
 
 func NewConnection(subdomain string, conn *websocket.Conn, logger *zap.Logger) *Connection {
-	return &Connection{
-		Subdomain:  subdomain,
-		Conn:       conn,
-		SendCh:     make(chan []byte, 256),
-		CloseCh:    make(chan struct{}),
-		LastActive: time.Now(),
-		logger:     logger,
+	c := &Connection{
+		Subdomain: subdomain,
+		Conn:      conn,
+		SendCh:    make(chan []byte, 256),
+		CloseCh:   make(chan struct{}),
+		logger:    logger,
 	}
+	c.UpdateActivity()
+	return c
 }
 
 func (c *Connection) Send(data []byte) error {
@@ -101,16 +102,20 @@ func (c *Connection) Send(data []byte) error {
 	}
 }
 
+// UpdateActivity records that the tunnel moved data. It runs on every copied
+// chunk, so it must not take the connection mutex shared by all multiplexed
+// public connections.
 func (c *Connection) UpdateActivity() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.LastActive = time.Now()
+	c.lastActive.Store(time.Now().UnixNano())
+}
+
+// LastActiveTime returns the last recorded activity time.
+func (c *Connection) LastActiveTime() time.Time {
+	return time.Unix(0, c.lastActive.Load())
 }
 
 func (c *Connection) IsAlive(timeout time.Duration) bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return time.Since(c.LastActive) < timeout
+	return time.Since(c.LastActiveTime()) < timeout
 }
 
 func (c *Connection) Close() {
@@ -244,6 +249,18 @@ func (c *Connection) IsIPAllowed(ip string) bool {
 		return true
 	}
 	return checker.IsAllowed(ip)
+}
+
+// IsIPAllowedIP is IsIPAllowed for an already-parsed client address.
+func (c *Connection) IsIPAllowedIP(ip net.IP) bool {
+	c.mu.RLock()
+	checker := c.ipAccessChecker
+	c.mu.RUnlock()
+
+	if checker == nil {
+		return true
+	}
+	return checker.IsAllowedIP(ip)
 }
 
 func (c *Connection) HasIPAccessControl() bool {

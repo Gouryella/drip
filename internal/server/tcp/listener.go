@@ -36,6 +36,9 @@ type ListenerConfig struct {
 	PublicPort     int
 	HTTPHandler    http.Handler
 	MaxDataConns   int
+	// HTTP3Enabled serves the same HTTP handler over QUIC (UDP) on the
+	// listener port. It has no effect when TLSConfig is nil.
+	HTTP3Enabled bool
 }
 
 type Listener struct {
@@ -66,6 +69,8 @@ type Listener struct {
 	groupManager   *ConnectionGroupManager
 	httpServer     *http.Server
 	httpListener   *connQueueListener
+	http3Enabled   bool
+	h3Server       *http3Server
 
 	// Server capabilities
 	allowedTransports  []string
@@ -112,6 +117,7 @@ func NewListener(cfg ListenerConfig) *Listener {
 		recoverer:      recoverer,
 		panicMetrics:   panicMetrics,
 		groupManager:   NewConnectionGroupManagerWithMaxDataConns(cfg.Logger, cfg.MaxDataConns),
+		http3Enabled:   cfg.HTTP3Enabled,
 	}
 
 	// Set up WebSocket connection handler if httpHandler supports it
@@ -154,19 +160,45 @@ func (l *Listener) Start() error {
 		httpHandler = http.NotFoundHandler()
 	}
 
+	// The base handler is shared by HTTP/1.1, HTTP/2 and HTTP/3. TLS state is
+	// injected from the connection context for the TCP paths; quic-go already
+	// populates it for HTTP/3 requests.
+	baseHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.TLS == nil {
+			r.TLS, _ = r.Context().Value(httpTLSStateKey{}).(*tls.ConnectionState)
+		}
+		httpHandler.ServeHTTP(w, r)
+	})
+
+	if l.http3Enabled {
+		if l.tlsConfig == nil {
+			l.logger.Info("HTTP/3 requires TLS; QUIC listener disabled")
+		} else if h3, err := newHTTP3Server(l.listener.Addr(), l.publicPort, l.tlsConfig, newHTTP3Handler(baseHandler), l.logger); err != nil {
+			l.logger.Warn("HTTP/3 disabled: failed to bind QUIC listener", zap.Error(err))
+		} else {
+			l.h3Server = h3
+		}
+	}
+
+	servedHandler := http.Handler(baseHandler)
+	if l.h3Server != nil {
+		// Advertise the public UDP port, which may differ from the bound port
+		// when a firewall or NAT forwards traffic.
+		servedHandler = withAltSvc(baseHandler, l.h3Server.advertised)
+	}
+
 	l.httpServer = &http.Server{
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.TLS == nil {
-				r.TLS, _ = r.Context().Value(httpTLSStateKey{}).(*tls.ConnectionState)
-			}
-			httpHandler.ServeHTTP(w, r)
-		}),
+		Handler:           servedHandler,
 		ConnContext:       httpConnectionContext,
-		ReadHeaderTimeout: 10 * time.Second,  // Time to read request headers
-		ReadTimeout:       30 * time.Second,  // Total time to read request (prevents slow-loris)
-		WriteTimeout:      60 * time.Second,  // Time to write response (allows large responses)
-		IdleTimeout:       120 * time.Second, // Keep-alive timeout
-		MaxHeaderBytes:    1 << 18,           // 256KB max header size (reduced from 1MB)
+		ReadHeaderTimeout: 10 * time.Second, // Time to read request headers
+		// A total ReadTimeout/WriteTimeout would abort long-lived tunneled
+		// transfers (large downloads, uploads and speedtests) partway through.
+		// Stalled peers are instead bounded by the per-write deadlines on the
+		// tunnel side and by IdleTimeout between keep-alive requests.
+		ReadTimeout:    0,
+		WriteTimeout:   0,
+		IdleTimeout:    120 * time.Second, // Keep-alive timeout
+		MaxHeaderBytes: 1 << 18,           // 256KB max header size (reduced from 1MB)
 	}
 
 	if err := http2.ConfigureServer(l.httpServer, &http2.Server{
@@ -189,6 +221,10 @@ func (l *Listener) Start() error {
 
 	l.wg.Add(1)
 	go l.acceptLoop()
+
+	if l.h3Server != nil {
+		l.h3Server.Start()
+	}
 
 	return nil
 }
@@ -218,10 +254,7 @@ func (l *Listener) acceptLoop() {
 		default:
 		}
 
-		if tcpListener, ok := l.listener.(*net.TCPListener); ok {
-			_ = tcpListener.SetDeadline(time.Now().Add(1 * time.Second))
-		}
-
+		// Stop closes the listener, which unblocks Accept with net.ErrClosed.
 		conn, err := l.listener.Accept()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
@@ -488,6 +521,13 @@ func (l *Listener) Stop() error {
 			_ = key.(net.Conn).Close()
 			return true
 		})
+
+		if l.h3Server != nil {
+			if err := l.h3Server.Close(); err != nil {
+				l.logger.Warn("HTTP/3 server shutdown error", zap.Error(err))
+			}
+			l.logger.Info("HTTP/3 server shutdown complete")
+		}
 
 		if l.httpServer != nil {
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

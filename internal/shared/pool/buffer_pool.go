@@ -3,17 +3,19 @@ package pool
 import "sync"
 
 const (
-	SizeSmall  = 4 * 1024    // 4KB   - HTTP headers, small messages
-	SizeMedium = 32 * 1024   // 32KB  - HTTP request/response bodies
-	SizeLarge  = 256 * 1024  // 256KB - Data pipe, file transfers
-	SizeXLarge = 1024 * 1024 // 1MB   - Large file transfers, bulk data
+	SizeSmall    = 4 * 1024    // 4KB   - HTTP headers, small messages
+	SizeMedium   = 32 * 1024   // 32KB  - HTTP request/response bodies
+	SizeStandard = 64 * 1024   // 64KB  - Raw TCP tunnels (per direction)
+	SizeLarge    = 256 * 1024  // 256KB - Data pipe, file transfers
+	SizeXLarge   = 1024 * 1024 // 1MB   - Large file transfers, bulk data
 )
 
 type BufferPool struct {
-	small  sync.Pool
-	medium sync.Pool
-	large  sync.Pool
-	xlarge sync.Pool
+	small    sync.Pool
+	medium   sync.Pool
+	standard sync.Pool
+	large    sync.Pool
+	xlarge   sync.Pool
 }
 
 func NewBufferPool() *BufferPool {
@@ -27,6 +29,12 @@ func NewBufferPool() *BufferPool {
 		medium: sync.Pool{
 			New: func() interface{} {
 				b := make([]byte, SizeMedium)
+				return &b
+			},
+		},
+		standard: sync.Pool{
+			New: func() interface{} {
+				b := make([]byte, SizeStandard)
 				return &b
 			},
 		},
@@ -51,6 +59,8 @@ func (p *BufferPool) Get(size int) *[]byte {
 		return p.small.Get().(*[]byte)
 	case size <= SizeMedium:
 		return p.medium.Get().(*[]byte)
+	case size <= SizeStandard:
+		return p.standard.Get().(*[]byte)
 	case size <= SizeLarge:
 		return p.large.Get().(*[]byte)
 	case size <= SizeXLarge:
@@ -74,6 +84,8 @@ func (p *BufferPool) Put(buf *[]byte) {
 		p.small.Put(buf)
 	case SizeMedium:
 		p.medium.Put(buf)
+	case SizeStandard:
+		p.standard.Put(buf)
 	case SizeLarge:
 		p.large.Put(buf)
 	case SizeXLarge:

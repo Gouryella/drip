@@ -1,34 +1,17 @@
 package mux
 
-import (
-	"net"
-	"time"
+import "net"
 
-	"github.com/hashicorp/yamux"
-)
+// WrapStream gives stream-like connections the tunnel's close semantics. The
+// in-house stream already implements CloseWrite and wakes blocked readers on
+// Close, so this is an identity function kept for call-site compatibility.
+func WrapStream(conn net.Conn) net.Conn { return conn }
 
-// Stream gives yamux streams net.Conn close semantics. Yamux's Close only
-// sends FIN; readers otherwise remain blocked until the peer also closes.
-type Stream struct{ *yamux.Stream }
-
-func (s *Stream) Close() error {
-	_ = s.Stream.SetDeadline(time.Now())
-	return s.Stream.Close()
-}
-
-func (s *Stream) CloseWrite() error { return s.Stream.Close() }
-
-func WrapStream(conn net.Conn) net.Conn {
-	if stream, ok := conn.(*yamux.Stream); ok {
-		return &Stream{Stream: stream}
-	}
-	return conn
-}
-
-func OpenStream(session *yamux.Session) (net.Conn, error) {
-	conn, err := session.Open()
+// OpenStream opens a stream and returns it as a net.Conn.
+func OpenStream(session *Session) (net.Conn, error) {
+	st, err := session.Open()
 	if err != nil {
 		return nil, err
 	}
-	return WrapStream(conn), nil
+	return st, nil
 }

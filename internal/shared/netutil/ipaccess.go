@@ -6,28 +6,85 @@ import (
 	"strings"
 )
 
+// ipAccessRule is a CIDR rule whose network address and mask are precomputed
+// at construction time, so matching does not allocate.
+type ipAccessRule struct {
+	network *net.IPNet
+	addr    []byte
+	mask    []byte
+}
+
+func newIPAccessRule(network *net.IPNet) ipAccessRule {
+	return ipAccessRule{
+		network: network,
+		addr:    network.IP,
+		mask:    network.Mask,
+	}
+}
+
+// contains reports whether ip belongs to the rule. The common IPv4/IPv6 cases
+// use a manual masked comparison; mismatched address families fall back to
+// net.IPNet.Contains.
+func (r *ipAccessRule) contains(ip net.IP) bool {
+	if v4 := ip.To4(); v4 != nil {
+		if len(r.addr) == net.IPv4len {
+			return matchMaskedIP(v4, r.addr, r.mask)
+		}
+		return r.network.Contains(ip)
+	}
+	if len(ip) == net.IPv6len && len(r.addr) == net.IPv6len {
+		return matchMaskedIP(ip, r.addr, r.mask)
+	}
+	return r.network.Contains(ip)
+}
+
+func matchMaskedIP(ip, network, mask []byte) bool {
+	switch len(network) {
+	case net.IPv4len:
+		if len(ip) != net.IPv4len || len(mask) != net.IPv4len {
+			return false
+		}
+		return ip[0]&mask[0] == network[0] &&
+			ip[1]&mask[1] == network[1] &&
+			ip[2]&mask[2] == network[2] &&
+			ip[3]&mask[3] == network[3]
+	case net.IPv6len:
+		if len(ip) != net.IPv6len || len(mask) != net.IPv6len {
+			return false
+		}
+		for i := 0; i < net.IPv6len; i++ {
+			if ip[i]&mask[i] != network[i] {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
+
 // IPAccessChecker checks if an IP address is allowed based on whitelist/blacklist rules.
 type IPAccessChecker struct {
-	allowNets []*net.IPNet // Allowed CIDR ranges (whitelist)
-	denyNets  []*net.IPNet // Denied CIDR ranges (blacklist)
-	hasAllow  bool         // Whether whitelist is configured
-	hasDeny   bool         // Whether blacklist is configured
+	allow    []ipAccessRule // Allowed CIDR ranges (whitelist)
+	deny     []ipAccessRule // Denied CIDR ranges (blacklist)
+	hasAllow bool           // Whether whitelist is configured
+	hasDeny  bool           // Whether blacklist is configured
 }
 
 // NewIPAccessChecker creates a new IP access checker from CIDR and IP lists.
 // allowCIDRs: list of CIDR ranges to allow (e.g., "192.168.1.0/24", "10.0.0.0/8")
 // denyIPs: list of CIDR ranges or IP addresses to deny (e.g., "192.168.0.0/16", "1.2.3.4")
 func NewIPAccessChecker(allowCIDRs, denyIPs []string) (*IPAccessChecker, error) {
-	allowNets, denyNets, err := parseIPAccessRules(allowCIDRs, denyIPs)
+	allowRules, denyRules, err := parseIPAccessRules(allowCIDRs, denyIPs)
 	if err != nil {
 		return nil, err
 	}
 
 	return &IPAccessChecker{
-		allowNets: allowNets,
-		denyNets:  denyNets,
-		hasAllow:  len(allowNets) > 0,
-		hasDeny:   len(denyNets) > 0,
+		allow:    allowRules,
+		deny:     denyRules,
+		hasAllow: len(allowRules) > 0,
+		hasDeny:  len(denyRules) > 0,
 	}, nil
 }
 
@@ -37,22 +94,22 @@ func ValidateIPAccessRules(allowCIDRs, denyIPs []string) error {
 	return err
 }
 
-func parseIPAccessRules(allowCIDRs, denyIPs []string) ([]*net.IPNet, []*net.IPNet, error) {
-	allowNets, err := parseIPAccessEntries("allow IP/CIDR", allowCIDRs)
+func parseIPAccessRules(allowCIDRs, denyIPs []string) ([]ipAccessRule, []ipAccessRule, error) {
+	allowRules, err := parseIPAccessEntries("allow IP/CIDR", allowCIDRs)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	denyNets, err := parseIPAccessEntries("deny IP/CIDR", denyIPs)
+	denyRules, err := parseIPAccessEntries("deny IP/CIDR", denyIPs)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	return allowNets, denyNets, nil
+	return allowRules, denyRules, nil
 }
 
-func parseIPAccessEntries(label string, entries []string) ([]*net.IPNet, error) {
-	nets := make([]*net.IPNet, 0, len(entries))
+func parseIPAccessEntries(label string, entries []string) ([]ipAccessRule, error) {
+	rules := make([]ipAccessRule, 0, len(entries))
 
 	for i, entry := range entries {
 		normalized, err := normalizeIPAccessEntry(entry)
@@ -64,10 +121,10 @@ func parseIPAccessEntries(label string, entries []string) ([]*net.IPNet, error) 
 		if err != nil {
 			return nil, fmt.Errorf("%s entry %d (%q): %w", label, i+1, entry, err)
 		}
-		nets = append(nets, ipNet)
+		rules = append(rules, newIPAccessRule(ipNet))
 	}
 
-	return nets, nil
+	return rules, nil
 }
 
 func normalizeIPAccessEntry(entry string) (string, error) {
@@ -100,16 +157,22 @@ func (c *IPAccessChecker) IsAllowed(ipStr string) bool {
 	if c == nil || (!c.hasAllow && !c.hasDeny) {
 		return true // No rules configured, allow all
 	}
+	return c.IsAllowedIP(net.ParseIP(ipStr))
+}
 
-	ip := net.ParseIP(ipStr)
+// IsAllowedIP is IsAllowed for an already-parsed address.
+func (c *IPAccessChecker) IsAllowedIP(ip net.IP) bool {
+	if c == nil || (!c.hasAllow && !c.hasDeny) {
+		return true // No rules configured, allow all
+	}
 	if ip == nil {
 		return false // Invalid IP, reject
 	}
 
 	// Check deny list first (blacklist takes priority)
 	if c.hasDeny {
-		for _, denyNet := range c.denyNets {
-			if denyNet.Contains(ip) {
+		for i := range c.deny {
+			if c.deny[i].contains(ip) {
 				return false
 			}
 		}
@@ -117,8 +180,8 @@ func (c *IPAccessChecker) IsAllowed(ipStr string) bool {
 
 	// Check allow list (whitelist)
 	if c.hasAllow {
-		for _, allowNet := range c.allowNets {
-			if allowNet.Contains(ip) {
+		for i := range c.allow {
+			if c.allow[i].contains(ip) {
 				return true
 			}
 		}

@@ -132,7 +132,9 @@ func ReadFrame(r io.Reader) (*Frame, error) {
 	var poolBuf *[]byte
 
 	if payloadLen > 0 {
-		if payloadLen > pool.SizeLarge {
+		// MaxFrameSize equals pool.SizeXLarge, so every accepted payload can
+		// be served from the pool.
+		if payloadLen > pool.SizeXLarge {
 			payload = make([]byte, payloadLen)
 			if _, err := io.ReadFull(r, payload); err != nil {
 				return nil, fmt.Errorf("failed to read payload: %w", err)

@@ -30,6 +30,42 @@ const (
 	streamingResponseWriteTimeout = 30 * time.Second
 )
 
+// localBackendDialer is shared by all local backend dials. net.Dialer is safe
+// for concurrent use.
+var localBackendDialer = &net.Dialer{Timeout: 10 * time.Second}
+
+// localTargetAddr returns the host:port of the local service. PoolClients built
+// directly (tests) fall back to formatting on demand.
+func (c *PoolClient) localTargetAddr() string {
+	if c.targetAddr != "" {
+		return c.targetAddr
+	}
+	return net.JoinHostPort(c.localHost, fmt.Sprintf("%d", c.localPort))
+}
+
+// localTargetHost returns the Host header value used for local requests.
+func (c *PoolClient) localTargetHost() string {
+	if c.targetHost != "" {
+		return c.targetHost
+	}
+	if c.localPort == 80 || c.localPort == 443 {
+		return c.localHost
+	}
+	return c.localTargetAddr()
+}
+
+// localTargetURL builds the URL for a request forwarded to the local service.
+func (c *PoolClient) localTargetURL(requestURI string) string {
+	if c.baseURL != "" {
+		return c.baseURL + requestURI
+	}
+	scheme := "http"
+	if c.tunnelType == protocol.TunnelTypeHTTPS {
+		scheme = "https"
+	}
+	return scheme + "://" + c.localTargetAddr() + requestURI
+}
+
 func (c *PoolClient) handleStream(h *sessionHandle, stream net.Conn) {
 	defer c.wg.Done()
 	defer func() {
@@ -47,7 +83,7 @@ func (c *PoolClient) handleStream(h *sessionHandle, stream net.Conn) {
 }
 
 func (c *PoolClient) handleTCPStream(stream net.Conn) {
-	localConn, err := (&net.Dialer{Timeout: 10 * time.Second}).DialContext(c.ctx, "tcp", net.JoinHostPort(c.localHost, fmt.Sprintf("%d", c.localPort)))
+	localConn, err := localBackendDialer.DialContext(c.ctx, "tcp", c.localTargetAddr())
 	if err != nil {
 		c.logger.Debug("Dial local failed", zap.Error(err))
 		return
@@ -80,7 +116,16 @@ func (c *PoolClient) handleHTTPStream(stream net.Conn) {
 		func(n int64) { c.stats.AddBytesOut(n) },
 	)
 
-	br := bufio.NewReaderSize(cc, 32*1024)
+	br := pool.GetReader(cc)
+	// An upgraded WebSocket connection keeps using the reader for its whole
+	// lifetime, so it must not be returned to the pool on that path.
+	returnReader := true
+	defer func() {
+		if returnReader {
+			pool.PutReader(br)
+		}
+	}()
+
 	req, err := http.ReadRequest(br)
 	if err != nil {
 		return
@@ -90,6 +135,7 @@ func (c *PoolClient) handleHTTPStream(stream net.Conn) {
 	_ = stream.SetReadDeadline(time.Time{})
 
 	if httputil.IsWebSocketUpgrade(req) {
+		returnReader = false
 		c.handleWebSocketUpgrade(&bufferedConn{Conn: cc, reader: br}, req)
 		return
 	}
@@ -110,13 +156,7 @@ func (c *PoolClient) handleHTTPStream(stream net.Conn) {
 	stopWatchingDisconnect := watchStreamDisconnect(ctx, stream, cancel, nil, bodyDone)
 	defer stopWatchingDisconnect()
 
-	scheme := "http"
-	if c.tunnelType == protocol.TunnelTypeHTTPS {
-		scheme = "https"
-	}
-
-	targetAddr := net.JoinHostPort(c.localHost, fmt.Sprintf("%d", c.localPort))
-	targetURL := fmt.Sprintf("%s://%s%s", scheme, targetAddr, req.URL.RequestURI())
+	targetURL := c.localTargetURL(req.URL.RequestURI())
 	outReq, err := http.NewRequestWithContext(ctx, req.Method, targetURL, req.Body)
 	if err != nil {
 		httputil.WriteProxyError(cc, http.StatusBadGateway, "Bad Gateway")
@@ -129,10 +169,7 @@ func (c *PoolClient) handleHTTPStream(stream net.Conn) {
 	httputil.CopyHeaders(outReq.Header, req.Header)
 	httputil.CleanHopByHopHeaders(outReq.Header)
 
-	targetHost := c.localHost
-	if c.localPort != 80 && c.localPort != 443 {
-		targetHost = targetAddr
-	}
+	targetHost := c.localTargetHost()
 	outReq.Host = targetHost
 	outReq.Header.Set("Host", targetHost)
 	if origHost != "" {
@@ -232,10 +269,9 @@ func (c *PoolClient) handleHTTPStream(stream net.Conn) {
 				if err := chunkedBody.Close(); err != nil {
 					return
 				}
-				if err := resp.Trailer.Write(cc); err != nil {
+				if err := writeResponseTrailer(cc, resp.Trailer); err != nil {
 					return
 				}
-				_, _ = io.WriteString(cc, "\r\n")
 			}
 			break
 		}
@@ -314,8 +350,8 @@ func watchStreamDisconnect(ctx context.Context, stream net.Conn, cancel context.
 }
 
 func (c *PoolClient) handleWebSocketUpgrade(cc net.Conn, req *http.Request) {
-	targetAddr := net.JoinHostPort(c.localHost, fmt.Sprintf("%d", c.localPort))
-	localConn, err := (&net.Dialer{Timeout: 10 * time.Second}).DialContext(c.ctx, "tcp", targetAddr)
+	targetAddr := c.localTargetAddr()
+	localConn, err := localBackendDialer.DialContext(c.ctx, "tcp", targetAddr)
 	if err != nil {
 		httputil.WriteProxyError(cc, http.StatusBadGateway, "WebSocket backend unavailable")
 		return
@@ -445,12 +481,35 @@ func writeResponseHeader(w io.Writer, resp *http.Response) error {
 	statusLine := fmt.Sprintf("HTTP/%d.%d %d %s\r\n",
 		resp.ProtoMajor, resp.ProtoMinor,
 		resp.StatusCode, http.StatusText(resp.StatusCode))
-	if _, err := io.WriteString(w, statusLine); err != nil {
+
+	// Header.Write emits several writes per field; buffer them so each response
+	// reaches the tunnel as one coalesced write instead of one per field.
+	bw := pool.GetWriter(w)
+	defer pool.PutWriter(bw)
+
+	if _, err := bw.WriteString(statusLine); err != nil {
 		return err
 	}
-	if err := resp.Header.Write(w); err != nil {
+	if err := resp.Header.Write(bw); err != nil {
 		return err
 	}
-	_, err := io.WriteString(w, "\r\n")
-	return err
+	if _, err := bw.WriteString("\r\n"); err != nil {
+		return err
+	}
+	return bw.Flush()
+}
+
+// writeResponseTrailer buffers the trailer block the same way as response
+// headers, coalescing one write per trailer field into a single flush.
+func writeResponseTrailer(w io.Writer, trailer http.Header) error {
+	bw := pool.GetWriter(w)
+	defer pool.PutWriter(bw)
+
+	if err := trailer.Write(bw); err != nil {
+		return err
+	}
+	if _, err := bw.WriteString("\r\n"); err != nil {
+		return err
+	}
+	return bw.Flush()
 }

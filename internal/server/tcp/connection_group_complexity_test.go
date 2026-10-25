@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hashicorp/yamux"
+	"drip/internal/shared/mux"
 )
 
 func TestOpenStreamAttemptExhaustsDrainingSessions(t *testing.T) {
@@ -18,7 +18,7 @@ func TestOpenStreamAttemptExhaustsDrainingSessions(t *testing.T) {
 		conn.Close()
 		t.Fatal("opened a draining session")
 	}
-	if !errors.Is(err, yamux.ErrRemoteGoAway) {
+	if !errors.Is(err, mux.ErrGoAway) {
 		t.Fatalf("open error = %v", err)
 	}
 	if group.SessionCount() != 16 {
@@ -28,8 +28,8 @@ func TestOpenStreamAttemptExhaustsDrainingSessions(t *testing.T) {
 
 func TestOpenStreamFallbackPrefersDataBeforePrimary(t *testing.T) {
 	group := unavailableSessionGroup(t, 2)
-	data, dataPeer := newYamuxSessionPair(t)
-	primary, primaryPeer := newYamuxSessionPair(t)
+	data, dataPeer := newMuxSessionPair(t)
+	primary, primaryPeer := newMuxSessionPair(t)
 	t.Cleanup(func() { data.Close(); dataPeer.Close(); primary.Close(); primaryPeer.Close() })
 	group.Sessions["healthy"] = data
 	group.Sessions[primarySessionID] = primary
@@ -45,7 +45,7 @@ func TestOpenStreamFallbackPrefersDataBeforePrimary(t *testing.T) {
 	}
 	defer heldPeer.Close()
 	for _, peer := range []struct {
-		session *yamux.Session
+		session *mux.Session
 		label   string
 	}{{dataPeer, "data"}, {primaryPeer, "main"}} {
 		go func() {
@@ -74,18 +74,18 @@ func TestOpenStreamFallbackPrefersDataBeforePrimary(t *testing.T) {
 
 func unavailableSessionGroup(b testing.TB, count int) *ConnectionGroup {
 	b.Helper()
-	group := &ConnectionGroup{Sessions: make(map[string]*yamux.Session), stopCh: make(chan struct{})}
+	group := &ConnectionGroup{Sessions: make(map[string]*mux.Session), stopCh: make(chan struct{})}
 	b.Cleanup(group.Close)
 	for i := 0; i < count; i++ {
 		left, right := net.Pipe()
-		cfg := yamux.DefaultConfig()
+		cfg := mux.NewOptimizedConfig()
 		cfg.EnableKeepAlive = false
 		cfg.LogOutput = io.Discard
-		local, err := yamux.Client(left, cfg)
+		local, err := mux.Client(left, cfg)
 		if err != nil {
 			b.Fatal(err)
 		}
-		peer, err := yamux.Server(right, cfg)
+		peer, err := mux.Server(right, cfg)
 		if err != nil {
 			b.Fatal(err)
 		}

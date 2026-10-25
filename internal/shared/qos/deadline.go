@@ -20,9 +20,12 @@ func (d *connDeadline) set(t time.Time) {
 	defer d.mu.Unlock()
 	d.time = t
 	if d.changed != nil {
+		// Release waiters blocked on the previous deadline, then let the
+		// next snapshot allocate a fresh channel. Setting the deadline is
+		// rare, so this keeps the per-chunk snapshot path allocation-free.
 		close(d.changed)
+		d.changed = nil
 	}
-	d.changed = make(chan struct{})
 }
 
 func (d *connDeadline) snapshot() (time.Time, <-chan struct{}) {

@@ -23,7 +23,6 @@ import (
 	"drip/internal/shared/protocol"
 	"drip/internal/shared/qos"
 	"drip/internal/shared/utils"
-	"drip/pkg/config"
 )
 
 // bufio.Reader pool to reduce allocations on hot path
@@ -41,7 +40,6 @@ var bufioWriterPool = sync.Pool{
 }
 
 const (
-	openStreamTimeout               = 3 * time.Second
 	defaultMaxResponseHeaderBytes   = 256 << 10
 	defaultResponseHeaderTimeout    = 15 * time.Second
 	defaultStreamingWriteTimeout    = 30 * time.Second
@@ -52,25 +50,25 @@ const (
 var errResponseHeadersTooLarge = errors.New("tunnel response headers exceeded limit")
 
 type HandlerConfig struct {
-	Manager                    *tunnel.Manager
-	Logger                     *zap.Logger
-	ServerDomain               string
-	TunnelDomain               string
-	AuthToken                  string
-	MetricsToken               string
-	TrustedProxies             []string
-	MaxRequestBodyBytes        int64
-	UnsafeUnlimitedRequestBody bool
-	MaxResponseHeaderBytes     int64
-	ResponseHeaderTimeout      time.Duration
-	StreamingWriteTimeout      time.Duration
+	Manager                *tunnel.Manager
+	Logger                 *zap.Logger
+	ServerDomain           string
+	TunnelDomain           string
+	AuthToken              string
+	MetricsToken           string
+	TrustedProxies         []string
+	MaxRequestBodyBytes    int64
+	MaxResponseHeaderBytes int64
+	ResponseHeaderTimeout  time.Duration
+	StreamingWriteTimeout  time.Duration
 }
 
 type Handler struct {
 	manager                *tunnel.Manager
 	logger                 *zap.Logger
-	serverDomain           string
-	tunnelDomain           string
+	normalizedServerDomain string
+	tunnelDomainSuffix     string
+	managementAdminHost    string
 	authToken              string
 	metricsToken           string
 	trustedProxies         *netutil.TrustedProxySet
@@ -107,11 +105,8 @@ func NewHandler(cfg HandlerConfig) *Handler {
 		trustedProxies = &netutil.TrustedProxySet{}
 	}
 	maxRequestBodyBytes := cfg.MaxRequestBodyBytes
-	if maxRequestBodyBytes == 0 && !cfg.UnsafeUnlimitedRequestBody {
-		maxRequestBodyBytes = config.DefaultMaxRequestBodyBytes
-	}
 	if maxRequestBodyBytes < 0 {
-		maxRequestBodyBytes = config.DefaultMaxRequestBodyBytes
+		maxRequestBodyBytes = 0
 	}
 	maxResponseHeaderBytes := cfg.MaxResponseHeaderBytes
 	if maxResponseHeaderBytes <= 0 {
@@ -125,11 +120,20 @@ func NewHandler(cfg HandlerConfig) *Handler {
 	if streamingWriteTimeout <= 0 {
 		streamingWriteTimeout = defaultStreamingWriteTimeout
 	}
+	// The configured domains are fixed for the handler's lifetime; normalize
+	// them once instead of re-parsing them on every request.
+	normalizedServerDomain := normalizeRequestHost(serverDomain)
+	normalizedTunnelDomain := normalizeRequestHost(tunnelDomain)
+	managementAdminHost := ""
+	if normalizedServerDomain != "" {
+		managementAdminHost = "admin." + normalizedServerDomain
+	}
 	return &Handler{
 		manager:                cfg.Manager,
 		logger:                 logger,
-		serverDomain:           serverDomain,
-		tunnelDomain:           tunnelDomain,
+		normalizedServerDomain: normalizedServerDomain,
+		tunnelDomainSuffix:     "." + normalizedTunnelDomain,
+		managementAdminHost:    managementAdminHost,
 		authToken:              cfg.AuthToken,
 		metricsToken:           cfg.MetricsToken,
 		trustedProxies:         trustedProxies,
@@ -251,16 +255,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Resolve the client IP once per request: ACL, proxy auth and the
+	// forwarded headers all derive from the same value.
+	clientIP := netutil.ExtractClientIPWithTrustedProxies(r, h.trustedProxies)
+
 	if tconn.HasIPAccessControl() {
-		clientIP := netutil.ExtractClientIPWithTrustedProxies(r, h.trustedProxies)
-		if !tconn.IsIPAllowed(clientIP) {
+		if !tconn.IsIPAllowedIP(net.ParseIP(clientIP)) {
 			http.Error(w, "Access denied: your IP is not allowed", http.StatusForbidden)
 			return
 		}
 	}
 
 	if auth := tconn.GetProxyAuth(); auth != nil && auth.Enabled {
-		clientIP := netutil.ExtractClientIPWithTrustedProxies(r, h.trustedProxies)
 		authType := proxyAuthType(auth)
 		rateLimitKey := authRateLimitKey(clientIP, subdomain)
 
@@ -301,14 +307,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "CONNECT not supported for HTTP tunnels", http.StatusMethodNotAllowed)
 		return
 	}
-	r = h.forwardedRequest(r)
+	// The upgrade check must run before forwardedRequest cleans the hop-by-hop
+	// headers that carry the Connection/Upgrade tokens.
+	isUpgrade := h.isWebSocketUpgrade(r)
 
-	if h.isWebSocketUpgrade(r) {
-		h.handleWebSocket(w, r, tconn)
-		return
-	}
-
-	if h.maxRequestBodyBytes > 0 && r.Body != nil {
+	// Check the declared length before forwardedRequest mutates the request
+	// for trailer-based (chunked) bodies.
+	if !isUpgrade && h.maxRequestBodyBytes > 0 && r.Body != nil {
 		if r.ContentLength > h.maxRequestBodyBytes {
 			h.rejectRequestBodyTooLarge(w, r, subdomain)
 			return
@@ -316,7 +321,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, h.maxRequestBodyBytes)
 	}
 
-	stream, err := h.openStreamWithTimeout(tconn)
+	r = h.forwardedRequest(r, clientIP, isUpgrade)
+
+	if isUpgrade {
+		h.handleWebSocket(w, r, tconn)
+		return
+	}
+
+	// OpenStream is synchronous; the mux enforces StreamOpenTimeout internally
+	// and fails fast once the session is closed.
+	stream, err := tconn.OpenStream()
 	if err != nil {
 		httputil.SetCloseConnection(w)
 		http.Error(w, "Tunnel unavailable", http.StatusBadGateway)
@@ -472,8 +486,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Use pooled buffer for zero-copy optimization
-	buf := pool.GetBuffer(pool.SizeLarge)
+	// 32KB matches io.Copy's default and avoids pinning 256KB per in-flight response.
+	buf := pool.GetBuffer(pool.SizeMedium)
 	defer pool.PutBuffer(buf)
 
 	n, err := io.CopyBuffer(w, resp.Body, (*buf)[:])
@@ -487,27 +501,25 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // forwardedRequest supplies metadata derived from the peer and configured
 // trusted proxies, so a public caller cannot forge the backend's client IP.
-func (h *Handler) forwardedRequest(r *http.Request) *http.Request {
-	out := r.Clone(r.Context())
-	out.Trailer = r.Trailer // Body reads populate this map as trailers arrive.
-	if len(out.Trailer) > 0 {
-		out.ContentLength = -1
-		out.TransferEncoding = []string{"chunked"}
+// The caller does not use the original request afterwards, so headers are
+// mutated in place instead of cloning the header map for every request.
+func (h *Handler) forwardedRequest(r *http.Request, clientIP string, isUpgrade bool) *http.Request {
+	if len(r.Trailer) > 0 {
+		r.ContentLength = -1
+		r.TransferEncoding = []string{"chunked"}
 	}
-	isUpgrade := httputil.IsWebSocketUpgrade(r)
-	httputil.CleanHopByHopHeaders(out.Header)
+	httputil.CleanHopByHopHeaders(r.Header)
 	if isUpgrade {
-		out.Header.Set("Connection", "Upgrade")
-		out.Header.Set("Upgrade", "websocket")
+		r.Header.Set("Connection", "Upgrade")
+		r.Header.Set("Upgrade", "websocket")
 	}
-	out.Header.Del("Forwarded")
-	clientIP := netutil.ExtractClientIPWithTrustedProxies(r, h.trustedProxies)
+	r.Header.Del("Forwarded")
 	if net.ParseIP(clientIP) != nil {
-		out.Header.Set("X-Forwarded-For", clientIP)
-		out.Header.Set("X-Real-IP", clientIP)
+		r.Header.Set("X-Forwarded-For", clientIP)
+		r.Header.Set("X-Real-IP", clientIP)
 	} else {
-		out.Header.Del("X-Forwarded-For")
-		out.Header.Del("X-Real-IP")
+		r.Header.Del("X-Forwarded-For")
+		r.Header.Del("X-Real-IP")
 	}
 	scheme := "http"
 	if r.TLS != nil {
@@ -517,9 +529,9 @@ func (h *Handler) forwardedRequest(r *http.Request) *http.Request {
 			scheme = proto
 		}
 	}
-	out.Header.Set("X-Forwarded-Proto", scheme)
-	out.Header.Set("X-Forwarded-Host", r.Host)
-	return out
+	r.Header.Set("X-Forwarded-Proto", scheme)
+	r.Header.Set("X-Forwarded-Host", r.Host)
+	return r
 }
 
 func (h *Handler) rejectRequestBodyTooLarge(w http.ResponseWriter, r *http.Request, subdomain string) {
@@ -617,39 +629,6 @@ func (r *responseHeaderLimitReader) allowBody() {
 	r.unlimited = true
 }
 
-type streamResult struct {
-	stream net.Conn
-	err    error
-}
-
-func (h *Handler) openStreamWithTimeout(tconn *tunnel.Connection) (net.Conn, error) {
-	return h.openStream(tconn, openStreamTimeout)
-}
-
-func (h *Handler) openStream(tconn *tunnel.Connection, timeout time.Duration) (net.Conn, error) {
-	// Buffered so OpenStream can always complete without blocking; the timeout
-	// path asynchronously drains and closes any late stream.
-	ch := make(chan streamResult, 1)
-
-	go func() {
-		s, err := tconn.OpenStream()
-		ch <- streamResult{s, err}
-	}()
-
-	select {
-	case r := <-ch:
-		return r.stream, r.err
-	case <-time.After(timeout):
-		go func() {
-			r := <-ch
-			if r.stream != nil {
-				_ = r.stream.Close()
-			}
-		}()
-		return nil, fmt.Errorf("open stream timeout")
-	}
-}
-
 func (h *Handler) copyResponseHeaders(dst http.Header, src http.Header, proxyHost string) {
 	httputil.CleanHopByHopHeaders(src)
 	for key, values := range src {
@@ -708,20 +687,13 @@ const (
 
 func (h *Handler) extractSubdomain(host string) (string, subdomainResult) {
 	host = normalizeRequestHost(host)
-	serverDomain := normalizeRequestHost(h.serverDomain)
-	tunnelDomain := normalizeRequestHost(h.tunnelDomain)
 
-	if host == serverDomain {
+	if host == h.normalizedServerDomain {
 		return "", subdomainHome
 	}
 
-	suffix := "." + tunnelDomain
-	if strings.HasSuffix(host, suffix) {
-		return strings.TrimSuffix(host, suffix), subdomainFound
-	}
-
-	if host == tunnelDomain {
-		return "", subdomainNotFound
+	if strings.HasSuffix(host, h.tunnelDomainSuffix) {
+		return strings.TrimSuffix(host, h.tunnelDomainSuffix), subdomainFound
 	}
 
 	return "", subdomainNotFound
@@ -736,11 +708,10 @@ func (h *Handler) isManagementPath(path string) bool {
 
 func (h *Handler) isManagementHost(host string) bool {
 	host = normalizeRequestHost(host)
-	serverDomain := normalizeRequestHost(h.serverDomain)
-	if host == "" || serverDomain == "" {
+	if host == "" || h.normalizedServerDomain == "" {
 		return false
 	}
-	return host == serverDomain || host == "admin."+serverDomain
+	return host == h.normalizedServerDomain || host == h.managementAdminHost
 }
 
 func (h *Handler) serveManagementPath(w http.ResponseWriter, r *http.Request) {

@@ -71,8 +71,44 @@ func NewFrameWriterWithConfig(conn io.Writer, maxBatch int, maxBatchWait time.Du
 }
 
 func (w *FrameWriter) writeLoop() {
-	batchTicker := time.NewTicker(w.maxBatchWait)
-	defer batchTicker.Stop()
+	// The batch timer is armed on demand, only while a partial batch is
+	// waiting to be flushed. This keeps idle connections free of timer
+	// wakeups (control traffic is only a few frames per minute).
+	var batchTimer *time.Timer
+	var batchCh <-chan time.Time
+
+	stopBatchTimer := func() {
+		if batchCh == nil {
+			return
+		}
+		batchTimer.Stop()
+		// Drain a tick that fired concurrently so a later Reset does not
+		// flush the next batch early.
+		select {
+		case <-batchTimer.C:
+		default:
+		}
+		batchCh = nil
+	}
+
+	armBatchTimer := func() {
+		if batchCh != nil {
+			// A timer is already pending; do not extend the batch window.
+			return
+		}
+		if batchTimer == nil {
+			batchTimer = time.NewTimer(w.maxBatchWait)
+		} else {
+			batchTimer.Reset(w.maxBatchWait)
+		}
+		batchCh = batchTimer.C
+	}
+
+	defer func() {
+		if batchTimer != nil {
+			batchTimer.Stop()
+		}
+	}()
 
 	var heartbeatTicker *time.Ticker
 	var heartbeatCh <-chan time.Time
@@ -124,10 +160,16 @@ func (w *FrameWriter) writeLoop() {
 
 			if shouldFlushNow {
 				w.flushBatchLocked()
+				stopBatchTimer()
+			} else {
+				// A partial batch is pending: bound its wait so it cannot
+				// linger indefinitely when no further frames arrive.
+				armBatchTimer()
 			}
 			w.mu.Unlock()
 
-		case <-batchTicker.C:
+		case <-batchCh:
+			batchCh = nil
 			w.mu.Lock()
 			if len(w.batch) > 0 {
 				w.flushBatchLocked()

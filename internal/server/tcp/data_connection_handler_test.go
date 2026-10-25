@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	json "github.com/goccy/go-json"
-	"github.com/hashicorp/yamux"
+	"encoding/json"
+
 	"go.uber.org/zap"
 
 	"drip/internal/shared/mux"
@@ -46,7 +46,7 @@ func TestDataConnectionHandlerRejectsWhenDataSessionLimitExceeded(t *testing.T) 
 	t.Parallel()
 
 	manager, group := newTestConnectionGroup(t, 1)
-	serverSession, clientSession := newYamuxSessionPair(t)
+	serverSession, clientSession := newMuxSessionPair(t)
 	t.Cleanup(func() {
 		_ = serverSession.Close()
 		_ = clientSession.Close()
@@ -83,7 +83,7 @@ func TestDataConnectionHandlerRejectsDuplicateConnectionID(t *testing.T) {
 	t.Parallel()
 
 	manager, group := newTestConnectionGroup(t, 2)
-	serverSession, clientSession := newYamuxSessionPair(t)
+	serverSession, clientSession := newMuxSessionPair(t)
 	t.Cleanup(func() {
 		_ = serverSession.Close()
 		_ = clientSession.Close()
@@ -172,9 +172,9 @@ func TestDataConnectionHandlerAddsAndRemovesDataSession(t *testing.T) {
 		t.Fatalf("data connection rejected: %+v", resp)
 	}
 
-	clientSession, err := yamux.Server(clientConn, mux.NewClientConfig())
+	clientSession, err := mux.Server(clientConn, mux.NewClientConfig())
 	if err != nil {
-		t.Fatalf("yamux.Server failed: %v", err)
+		t.Fatalf("mux server failed: %v", err)
 	}
 
 	waitFor(t, func() bool {
@@ -200,7 +200,7 @@ func TestConnectionGroupCloseClearsSessionsAndReservations(t *testing.T) {
 	t.Parallel()
 
 	_, group := newTestConnectionGroup(t, 2)
-	serverSession, clientSession := newYamuxSessionPair(t)
+	serverSession, clientSession := newMuxSessionPair(t)
 	t.Cleanup(func() {
 		_ = clientSession.Close()
 	})
@@ -280,17 +280,17 @@ func beginDataConnect(t *testing.T, manager *ConnectionGroupManager, req protoco
 	return clientConn, resp, errCh
 }
 
-func newYamuxSessionPair(t *testing.T) (*yamux.Session, *yamux.Session) {
+func newMuxSessionPair(t *testing.T) (*mux.Session, *mux.Session) {
 	t.Helper()
 
 	serverConn, clientConn := net.Pipe()
-	serverSession, err := yamux.Client(serverConn, mux.NewServerConfig())
+	serverSession, err := mux.Client(serverConn, mux.NewServerConfig())
 	if err != nil {
-		t.Fatalf("yamux.Client failed: %v", err)
+		t.Fatalf("mux client failed: %v", err)
 	}
-	clientSession, err := yamux.Server(clientConn, mux.NewClientConfig())
+	clientSession, err := mux.Server(clientConn, mux.NewClientConfig())
 	if err != nil {
-		t.Fatalf("yamux.Server failed: %v", err)
+		t.Fatalf("mux server failed: %v", err)
 	}
 	return serverSession, clientSession
 }

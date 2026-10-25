@@ -1,13 +1,12 @@
 package tcp
 
 import (
+	"go.uber.org/zap"
 	"sync"
 	"time"
 
-	"github.com/hashicorp/yamux"
-	"go.uber.org/zap"
-
 	"drip/internal/server/tunnel"
+	"drip/internal/shared/mux"
 	"drip/internal/shared/protocol"
 )
 
@@ -27,7 +26,7 @@ type ConnectionLifecycleManager struct {
 	}
 	frameWriter      *protocol.FrameWriter
 	proxy            interface{ Stop() }
-	session          *yamux.Session
+	session          *mux.Session
 	portAlloc        *PortAllocator
 	port             int
 	manager          *tunnel.Manager
@@ -86,8 +85,8 @@ func (clm *ConnectionLifecycleManager) SetProxy(proxy interface{ Stop() }) {
 	clm.proxy = proxy
 }
 
-// SetSession sets the yamux session to close.
-func (clm *ConnectionLifecycleManager) SetSession(session *yamux.Session) {
+// SetSession sets the mux session to close.
+func (clm *ConnectionLifecycleManager) SetSession(session *mux.Session) {
 	clm.mu.Lock()
 	defer clm.mu.Unlock()
 	if clm.closed {

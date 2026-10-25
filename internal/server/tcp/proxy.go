@@ -156,7 +156,6 @@ func (p *Proxy) Stop() {
 func (p *Proxy) acceptLoop() {
 	defer p.wg.Done()
 
-	tcpLn, _ := p.listener.(*net.TCPListener)
 	retryDelay := 5 * time.Millisecond
 
 	for {
@@ -166,10 +165,7 @@ func (p *Proxy) acceptLoop() {
 		default:
 		}
 
-		if tcpLn != nil {
-			_ = tcpLn.SetDeadline(time.Now().Add(1 * time.Second))
-		}
-
+		// Stop closes the listener, which unblocks Accept with net.ErrClosed.
 		conn, err := p.listener.Accept()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
@@ -296,7 +292,7 @@ func (p *Proxy) handleConn(conn net.Conn) {
 		p.ctx,
 		conn,
 		limitedStream,
-		pool.SizeLarge,
+		pool.SizeStandard,
 		func(n int64) {
 			bytesIn.Add(n)
 			if p.stats != nil {

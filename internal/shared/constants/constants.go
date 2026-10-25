@@ -9,31 +9,25 @@ const (
 	// DefaultWSPort is the default WebSocket port
 	DefaultWSPort = 8080
 
-	// ==================== Yamux Configuration ====================
+	// ==================== Multiplexer Configuration ====================
 	// These settings are tuned for high-throughput tunnel scenarios
 
-	// YamuxAcceptBacklog controls how many incoming streams can be queued
+	// MuxAcceptBacklog controls how many incoming streams can be queued
 	// before yamux starts blocking stream opens under load.
 	// Increased from default 256 to handle burst traffic.
-	YamuxAcceptBacklog = 8192
+	MuxAcceptBacklog = 8192
 
-	// YamuxMaxStreamWindowSize is the maximum window size for a stream.
+	// MuxMaxStreamWindowSize is the maximum window size for a stream.
 	// Larger windows allow more data in-flight, improving throughput on high-latency links.
 	// Default is 256KB, increased to 512KB for better throughput.
-	YamuxMaxStreamWindowSize = 512 * 1024
+	MuxMaxStreamWindowSize = 512 * 1024
 
-	// YamuxStreamOpenTimeout is how long to wait for a stream open to complete.
-	YamuxStreamOpenTimeout = 10 * time.Second
-
-	// YamuxStreamCloseTimeout is how long to wait for a stream close to complete.
-	YamuxStreamCloseTimeout = 5 * time.Minute
-
-	// YamuxKeepAliveInterval is how often to send keep-alive pings.
+	// MuxKeepAliveInterval is how often to send keep-alive pings.
 	// Set higher than HeartbeatInterval to avoid redundant pings.
-	YamuxKeepAliveInterval = 15 * time.Second
+	MuxKeepAliveInterval = 15 * time.Second
 
-	// YamuxConnectionWriteTimeout is the timeout for writing to the underlying connection.
-	YamuxConnectionWriteTimeout = 10 * time.Second
+	// MuxConnectionWriteTimeout is the timeout for writing to the underlying connection.
+	MuxConnectionWriteTimeout = 10 * time.Second
 
 	// ==================== Heartbeat Configuration ====================
 

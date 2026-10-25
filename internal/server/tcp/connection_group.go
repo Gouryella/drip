@@ -10,8 +10,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hashicorp/yamux"
-
 	"drip/internal/shared/constants"
 	"drip/internal/shared/mux"
 	"drip/internal/shared/protocol"
@@ -35,7 +33,7 @@ type ConnectionGroup struct {
 	Subdomain    string
 	Token        string
 	PrimaryConn  *Connection
-	Sessions     map[string]*yamux.Session
+	Sessions     map[string]*mux.Session
 	MaxDataConns int
 	TunnelType   protocol.TunnelType
 	RegisteredAt time.Time
@@ -59,7 +57,7 @@ func NewConnectionGroupWithMaxDataConns(tunnelID, subdomain, token string, prima
 		Subdomain:           subdomain,
 		Token:               token,
 		PrimaryConn:         primaryConn,
-		Sessions:            make(map[string]*yamux.Session),
+		Sessions:            make(map[string]*mux.Session),
 		MaxDataConns:        maxDataConns,
 		TunnelType:          tunnelType,
 		RegisteredAt:        time.Now(),
@@ -89,7 +87,7 @@ func (g *ConnectionGroup) heartbeatLoop(interval, timeout time.Duration) {
 
 	type sessionSnapshot struct {
 		id      string
-		session *yamux.Session
+		session *mux.Session
 	}
 	sessions := make([]sessionSnapshot, 0, 16)
 
@@ -174,7 +172,7 @@ func (g *ConnectionGroup) heartbeatLoop(interval, timeout time.Duration) {
 			pingInFlight[snap.id] = true
 
 			done := make(chan error, 1)
-			go func(s *yamux.Session) {
+			go func(s *mux.Session) {
 				_, err := s.Ping()
 				done <- err
 			}(snap.session)
@@ -217,13 +215,13 @@ func (g *ConnectionGroup) Close() {
 		close(g.stopCh)
 	}
 
-	sessions := make([]*yamux.Session, 0, len(g.Sessions))
+	sessions := make([]*mux.Session, 0, len(g.Sessions))
 	for _, session := range g.Sessions {
 		if session != nil {
 			sessions = append(sessions, session)
 		}
 	}
-	g.Sessions = make(map[string]*yamux.Session)
+	g.Sessions = make(map[string]*mux.Session)
 	g.pendingDataSessions = make(map[string]struct{})
 
 	g.mu.Unlock()
@@ -258,7 +256,7 @@ func (g *ConnectionGroup) ReserveDataSession(connID string) error {
 	defer g.mu.Unlock()
 
 	if g.Sessions == nil {
-		g.Sessions = make(map[string]*yamux.Session)
+		g.Sessions = make(map[string]*mux.Session)
 	}
 	if g.pendingDataSessions == nil {
 		g.pendingDataSessions = make(map[string]struct{})
@@ -292,17 +290,17 @@ func (g *ConnectionGroup) ReserveDataSession(connID string) error {
 	return nil
 }
 
-func (g *ConnectionGroup) CommitReservedSession(connID string, session *yamux.Session) error {
+func (g *ConnectionGroup) CommitReservedSession(connID string, session *mux.Session) error {
 	if err := validateDataConnectionID(connID); err != nil {
 		return err
 	}
 	if session == nil {
-		return fmt.Errorf("%w: nil yamux session", ErrInvalidDataConnectionID)
+		return fmt.Errorf("%w: nil mux session", ErrInvalidDataConnectionID)
 	}
 
 	g.mu.Lock()
 	if g.Sessions == nil {
-		g.Sessions = make(map[string]*yamux.Session)
+		g.Sessions = make(map[string]*mux.Session)
 	}
 	if g.pendingDataSessions == nil {
 		g.pendingDataSessions = make(map[string]struct{})
@@ -353,12 +351,12 @@ func (g *ConnectionGroup) ReleaseDataSessionReservation(connID string) {
 	g.mu.Unlock()
 }
 
-func (g *ConnectionGroup) AddSession(connID string, session *yamux.Session) {
+func (g *ConnectionGroup) AddSession(connID string, session *mux.Session) {
 	if connID == "" || session == nil {
 		return
 	}
 
-	var oldSession *yamux.Session
+	var oldSession *mux.Session
 
 	g.mu.Lock()
 	select {
@@ -369,7 +367,7 @@ func (g *ConnectionGroup) AddSession(connID string, session *yamux.Session) {
 	default:
 	}
 	if g.Sessions == nil {
-		g.Sessions = make(map[string]*yamux.Session)
+		g.Sessions = make(map[string]*mux.Session)
 	}
 	if existing := g.Sessions[connID]; existing != nil && existing != session {
 		oldSession = existing
@@ -398,7 +396,7 @@ func (g *ConnectionGroup) RemoveSession(connID string) {
 		return
 	}
 
-	var session *yamux.Session
+	var session *mux.Session
 
 	g.mu.Lock()
 	if g.Sessions != nil {
@@ -512,12 +510,12 @@ func (g *ConnectionGroup) openStreamAttempt() (net.Conn, error) {
 }
 
 type streamCandidate struct {
-	session *yamux.Session
+	session *mux.Session
 	streams int
 	primary bool
 }
 
-func (g *ConnectionGroup) fallbackSessions(exclude *yamux.Session) []streamCandidate {
+func (g *ConnectionGroup) fallbackSessions(exclude *mux.Session) []streamCandidate {
 	g.mu.RLock()
 	candidates := make([]streamCandidate, 0, len(g.Sessions))
 	for id, session := range g.Sessions {
@@ -539,10 +537,10 @@ func (g *ConnectionGroup) fallbackSessions(exclude *yamux.Session) []streamCandi
 	return candidates
 }
 
-func (g *ConnectionGroup) pickSession() (*yamux.Session, bool) {
+func (g *ConnectionGroup) pickSession() (*mux.Session, bool) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
-	var best, primary *yamux.Session
+	var best, primary *mux.Session
 	bestStreams := maxStreamsPerSession
 	hasSessions := false
 	for id, session := range g.Sessions {

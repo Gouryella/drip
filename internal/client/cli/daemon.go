@@ -10,7 +10,7 @@ import (
 
 	"drip/internal/shared/ui"
 	"drip/pkg/config"
-	json "github.com/goccy/go-json"
+	"encoding/json"
 )
 
 func isSupportedTunnelType(tunnelType string) bool {

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"drip/internal/server/tunnel"
+	"drip/internal/shared/netutil"
 	"drip/internal/shared/protocol"
 	"go.uber.org/zap"
 )
@@ -29,15 +30,15 @@ func TestForwardedRequestUsesTrustedPeerMetadata(t *testing.T) {
 		req.Header.Set("Forwarded", "for=127.0.0.1")
 		req.Header.Add("Connection", "X-Internal")
 		req.Header.Set("X-Internal", "private")
-		out := h.forwardedRequest(req)
+		out := h.forwardedRequest(req, netutil.ExtractClientIPWithTrustedProxies(req, h.trustedProxies), false)
 		if out.Header.Get("X-Forwarded-For") != tc.wantIP || out.Header.Get("X-Real-IP") != tc.wantIP || out.Header.Get("X-Forwarded-Proto") != tc.wantProto {
 			t.Errorf("peer %s: forwarded headers = %v", tc.peer, out.Header)
 		}
 		if out.Header.Get("Forwarded") != "" || out.Header.Get("X-Internal") != "" {
 			t.Error("untrusted/hop headers were forwarded")
 		}
-		if req.Header.Get("X-Internal") != "private" {
-			t.Error("original request was mutated")
+		if out != req {
+			t.Error("forwardedRequest returned a copy instead of mutating in place")
 		}
 	}
 }

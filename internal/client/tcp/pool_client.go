@@ -12,8 +12,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	json "github.com/goccy/go-json"
-	"github.com/hashicorp/yamux"
+	"encoding/json"
+
 	"go.uber.org/zap"
 
 	"drip/internal/shared/constants"
@@ -23,7 +23,7 @@ import (
 	"drip/pkg/config"
 )
 
-// PoolClient manages a pool of yamux sessions for tunnel connections.
+// PoolClient manages a pool of mux sessions for tunnel connections.
 type PoolClient struct {
 	serverAddr string
 	tlsConfig  *tls.Config
@@ -32,6 +32,12 @@ type PoolClient struct {
 	localHost  string
 	localPort  int
 	subdomain  string
+
+	// Local backend endpoints derived from localHost/localPort/tunnelType,
+	// which are immutable after construction.
+	targetAddr string
+	targetHost string
+	baseURL    string
 
 	assignedURL string
 	tunnelID    string
@@ -120,6 +126,16 @@ func NewPoolClient(cfg *ConnectorConfig, logger *zap.Logger) *PoolClient {
 		tunnelType = protocol.TunnelTypeTCP
 	}
 
+	targetAddr := net.JoinHostPort(localHost, fmt.Sprintf("%d", cfg.LocalPort))
+	targetHost := localHost
+	if cfg.LocalPort != 80 && cfg.LocalPort != 443 {
+		targetHost = targetAddr
+	}
+	baseURL := "http://" + targetAddr
+	if tunnelType == protocol.TunnelTypeHTTPS {
+		baseURL = "https://" + targetAddr
+	}
+
 	numCPU := runtime.GOMAXPROCS(0)
 
 	minSessions := cfg.PoolMin
@@ -159,6 +175,9 @@ func NewPoolClient(cfg *ConnectorConfig, logger *zap.Logger) *PoolClient {
 		tunnelType:         tunnelType,
 		localHost:          localHost,
 		localPort:          cfg.LocalPort,
+		targetAddr:         targetAddr,
+		targetHost:         targetHost,
+		baseURL:            baseURL,
 		subdomain:          cfg.Subdomain,
 		minSessions:        minSessions,
 		maxSessions:        maxSessions,
@@ -321,12 +340,12 @@ func (c *PoolClient) Connect() (err error) {
 	}
 	c.mu.Unlock()
 
-	yamuxCfg := mux.NewClientConfig()
+	muxCfg := mux.NewClientConfig()
 
-	session, err := yamux.Server(primaryConn, yamuxCfg)
+	session, err := mux.Server(primaryConn, muxCfg)
 	if err != nil {
 		_ = primaryConn.Close()
-		return fmt.Errorf("failed to init yamux session: %w", err)
+		return fmt.Errorf("failed to init mux session: %w", err)
 	}
 
 	primary := &sessionHandle{
@@ -437,12 +456,23 @@ func (c *PoolClient) sessionWatcher(h *sessionHandle, isPrimary bool) {
 	}
 }
 
+// dataSessionPingInterval is the liveness-check cadence for data sessions.
+// The primary session pings more often because it also measures latency.
+const dataSessionPingInterval = 15 * time.Second
+
 func (c *PoolClient) pingLoop(h *sessionHandle) {
 	defer c.wg.Done()
 
 	const maxConsecutiveFailures = 3
 
-	ticker := time.NewTicker(constants.HeartbeatInterval)
+	// The primary session measures user-visible latency and keeps the original
+	// 2s cadence; data sessions are only health-checked, which the server-side
+	// mux keepalive (15s) also covers.
+	interval := dataSessionPingInterval
+	if h.id == "primary" {
+		interval = constants.HeartbeatInterval
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	consecutiveFailures := 0
@@ -484,6 +514,12 @@ func (c *PoolClient) pingLoop(h *sessionHandle) {
 
 		consecutiveFailures = 0
 		h.touch()
+
+		// Only the primary session measures user-visible latency; data sessions
+		// are health-checked and must not skew the displayed value.
+		if h.id != "primary" {
+			continue
+		}
 
 		c.latencyNanos.Store(int64(latency))
 		if cb, ok := c.latencyCallback.Load().(LatencyCallback); ok && cb != nil {

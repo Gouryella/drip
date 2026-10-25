@@ -6,18 +6,17 @@ import (
 	"time"
 
 	"drip/internal/shared/mux"
-	"github.com/hashicorp/yamux"
 	"go.uber.org/zap"
 )
 
-func retirementClient(t *testing.T) (*PoolClient, *yamux.Session, *yamux.Session) {
+func retirementClient(t *testing.T) (*PoolClient, *mux.Session, *mux.Session) {
 	t.Helper()
 	left, right := net.Pipe()
-	local, err := yamux.Server(left, mux.NewClientConfig())
+	local, err := mux.Server(left, mux.NewClientConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
-	peer, err := yamux.Client(right, mux.NewServerConfig())
+	peer, err := mux.Client(right, mux.NewServerConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,14 +71,14 @@ func TestIdleSessionBatchSkipsBusyOldestCandidate(t *testing.T) {
 	}
 	defer busyLocal.Close()
 	c.dataSessions["idle"].lastActive.Store(1)
-	var idleSessions []*yamux.Session
+	var idleSessions []*mux.Session
 	for _, id := range []string{"older", "newer"} {
 		left, right := net.Pipe()
-		session, err := yamux.Server(left, mux.NewClientConfig())
+		session, err := mux.Server(left, mux.NewClientConfig())
 		if err != nil {
 			t.Fatal(err)
 		}
-		remote, err := yamux.Client(right, mux.NewServerConfig())
+		remote, err := mux.Client(right, mux.NewServerConfig())
 		if err != nil {
 			t.Fatal(err)
 		}

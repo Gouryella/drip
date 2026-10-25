@@ -40,6 +40,7 @@ var (
 	serverTransports          string
 	serverTunnelTypes         string
 	serverMaxRequestBodyBytes int64
+	serverHTTP3               bool
 	serverConfigFile          string
 )
 
@@ -81,7 +82,10 @@ func init() {
 	// Transport and tunnel type restrictions
 	serverCmd.Flags().StringVar(&serverTransports, "transports", getEnvString("DRIP_TRANSPORTS", "tcp,wss"), "Allowed transports: tcp,wss (env: DRIP_TRANSPORTS)")
 	serverCmd.Flags().StringVar(&serverTunnelTypes, "tunnel-types", getEnvString("DRIP_TUNNEL_TYPES", "http,https,tcp"), "Allowed tunnel types: http,https,tcp (env: DRIP_TUNNEL_TYPES)")
-	serverCmd.Flags().Int64Var(&serverMaxRequestBodyBytes, "max-request-body-bytes", getEnvInt64("DRIP_MAX_REQUEST_BODY_BYTES", config.DefaultMaxRequestBodyBytes), "Maximum tunneled HTTP request body size in bytes; 0 disables the limit and is high-risk (env: DRIP_MAX_REQUEST_BODY_BYTES)")
+	serverCmd.Flags().Int64Var(&serverMaxRequestBodyBytes, "max-request-body-bytes", getEnvInt64("DRIP_MAX_REQUEST_BODY_BYTES", config.DefaultMaxRequestBodyBytes), "Maximum tunneled HTTP request body size in bytes; 0 (default) means unlimited (env: DRIP_MAX_REQUEST_BODY_BYTES)")
+
+	// HTTP/3 on the public UDP port (only when TLS is enabled)
+	serverCmd.Flags().BoolVar(&serverHTTP3, "http3", getEnvBool("DRIP_HTTP3", true), "Enable HTTP/3 (QUIC) on the public port; requires TLS (env: DRIP_HTTP3)")
 }
 
 func runServer(cmd *cobra.Command, _ []string) error {
@@ -101,10 +105,10 @@ func runServer(cmd *cobra.Command, _ []string) error {
 			return fmt.Errorf("failed to load config file: %w", err)
 		}
 	}
-	maxRequestBodyBytesExplicit := cfg != nil && cfg.MaxRequestBodyBytesExplicit()
 	if cfg == nil {
 		cfg = &config.ServerConfig{
 			MaxRequestBodyBytes: config.DefaultMaxRequestBodyBytes,
+			HTTP3:               serverHTTP3,
 		}
 	}
 
@@ -233,10 +237,15 @@ func runServer(cmd *cobra.Command, _ []string) error {
 	// MaxRequestBodyBytes
 	if cmd.Flags().Changed("max-request-body-bytes") {
 		cfg.MaxRequestBodyBytes = serverMaxRequestBodyBytes
-		maxRequestBodyBytesExplicit = true
 	} else if os.Getenv("DRIP_MAX_REQUEST_BODY_BYTES") != "" {
 		cfg.MaxRequestBodyBytes = serverMaxRequestBodyBytes
-		maxRequestBodyBytesExplicit = true
+	}
+
+	// HTTP3 (only effective when TLS is enabled)
+	if cmd.Flags().Changed("http3") {
+		cfg.HTTP3 = serverHTTP3
+	} else if os.Getenv("DRIP_HTTP3") != "" {
+		cfg.HTTP3 = serverHTTP3
 	}
 
 	// TLSEnabled
@@ -325,6 +334,9 @@ func runServer(cmd *cobra.Command, _ []string) error {
 		)
 	} else {
 		logger.Info("TLS disabled - running in plain TCP mode (for reverse proxy)")
+		if cfg.HTTP3 {
+			logger.Info("HTTP/3 ignored because TLS is disabled")
+		}
 	}
 
 	tunnelManager := tunnel.NewManager(logger)
@@ -337,15 +349,14 @@ func runServer(cmd *cobra.Command, _ []string) error {
 	listenAddr := fmt.Sprintf("0.0.0.0:%d", cfg.Port)
 
 	httpHandler := proxy.NewHandler(proxy.HandlerConfig{
-		Manager:                    tunnelManager,
-		Logger:                     logger,
-		ServerDomain:               cfg.Domain,
-		TunnelDomain:               cfg.TunnelDomain,
-		AuthToken:                  cfg.AuthToken,
-		MetricsToken:               cfg.MetricsToken,
-		TrustedProxies:             cfg.TrustedProxies,
-		MaxRequestBodyBytes:        cfg.MaxRequestBodyBytes,
-		UnsafeUnlimitedRequestBody: maxRequestBodyBytesExplicit && cfg.MaxRequestBodyBytes == 0,
+		Manager:             tunnelManager,
+		Logger:              logger,
+		ServerDomain:        cfg.Domain,
+		TunnelDomain:        cfg.TunnelDomain,
+		AuthToken:           cfg.AuthToken,
+		MetricsToken:        cfg.MetricsToken,
+		TrustedProxies:      cfg.TrustedProxies,
+		MaxRequestBodyBytes: cfg.MaxRequestBodyBytes,
 	})
 	httpHandler.SetAllowedTransports(cfg.AllowedTransports)
 	httpHandler.SetAllowedTunnelTypes(cfg.AllowedTunnelTypes)
@@ -362,6 +373,7 @@ func runServer(cmd *cobra.Command, _ []string) error {
 		TunnelDomain:   cfg.TunnelDomain,
 		PublicPort:     cfg.PublicPort,
 		HTTPHandler:    httpHandler,
+		HTTP3Enabled:   cfg.HTTP3,
 	})
 	listener.SetAllowedTransports(cfg.AllowedTransports)
 	listener.SetAllowedTunnelTypes(cfg.AllowedTunnelTypes)
@@ -388,7 +400,7 @@ func runServer(cmd *cobra.Command, _ []string) error {
 			zap.Int64("max_request_body_bytes", cfg.MaxRequestBodyBytes),
 		)
 	} else {
-		logger.Warn("HTTP request body limit disabled; this is a high-risk public-server configuration")
+		logger.Info("HTTP request body limit: unlimited (default)")
 	}
 
 	if err := listener.Start(); err != nil {

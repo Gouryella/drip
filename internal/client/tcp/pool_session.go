@@ -9,8 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	json "github.com/goccy/go-json"
-	"github.com/hashicorp/yamux"
+	"encoding/json"
 
 	"drip/internal/shared/mux"
 	"drip/internal/shared/protocol"
@@ -18,11 +17,11 @@ import (
 
 var dataConnCounter atomic.Uint64
 
-// sessionHandle wraps a yamux session with metadata.
+// sessionHandle wraps a mux session with metadata.
 type sessionHandle struct {
 	id         string
 	conn       net.Conn
-	session    *yamux.Session
+	session    *mux.Session
 	active     atomic.Int64
 	lastActive atomic.Int64 // unix nanos
 	closed     atomic.Bool
@@ -159,12 +158,12 @@ func (c *PoolClient) addDataSession() error {
 		return net.ErrClosed
 	}
 
-	yamuxCfg := mux.NewClientConfig()
+	muxCfg := mux.NewClientConfig()
 
-	session, err := yamux.Server(conn, yamuxCfg)
+	session, err := mux.Server(conn, muxCfg)
 	if err != nil {
 		_ = conn.Close()
-		return fmt.Errorf("failed to init yamux session: %w", err)
+		return fmt.Errorf("failed to init mux session: %w", err)
 	}
 
 	h := &sessionHandle{

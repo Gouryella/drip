@@ -3,8 +3,6 @@ package mux
 import (
 	"bufio"
 	"net"
-
-	"github.com/hashicorp/yamux"
 )
 
 // BufferedConn wraps a connection with a buffered reader.
@@ -15,10 +13,7 @@ type BufferedConn struct {
 
 // NewBufferedConn creates a new buffered connection.
 func NewBufferedConn(conn net.Conn, reader *bufio.Reader) *BufferedConn {
-	return &BufferedConn{
-		Conn:   conn,
-		reader: reader,
-	}
+	return &BufferedConn{Conn: conn, reader: reader}
 }
 
 // Read reads from the buffered reader if available, otherwise from the connection.
@@ -29,19 +24,17 @@ func (bc *BufferedConn) Read(p []byte) (int, error) {
 	return bc.Conn.Read(p)
 }
 
-// SessionBuilder helps build yamux sessions with consistent configuration.
+// SessionBuilder helps build multiplexer sessions with consistent configuration.
 type SessionBuilder struct {
 	conn     net.Conn
 	reader   *bufio.Reader
-	config   *yamux.Config
+	config   *Config
 	isServer bool
 }
 
 // NewSessionBuilder creates a new session builder.
 func NewSessionBuilder(conn net.Conn) *SessionBuilder {
-	return &SessionBuilder{
-		conn: conn,
-	}
+	return &SessionBuilder{conn: conn}
 }
 
 // WithReader sets the buffered reader for the session.
@@ -50,8 +43,8 @@ func (sb *SessionBuilder) WithReader(reader *bufio.Reader) *SessionBuilder {
 	return sb
 }
 
-// WithConfig sets the yamux configuration.
-func (sb *SessionBuilder) WithConfig(config *yamux.Config) *SessionBuilder {
+// WithConfig sets the multiplexer configuration.
+func (sb *SessionBuilder) WithConfig(config *Config) *SessionBuilder {
 	sb.config = config
 	return sb
 }
@@ -74,16 +67,12 @@ func (sb *SessionBuilder) AsClient() *SessionBuilder {
 	return sb
 }
 
-// Build creates the yamux session.
-func (sb *SessionBuilder) Build() (*yamux.Session, error) {
+// Build creates the session.
+func (sb *SessionBuilder) Build() (*Session, error) {
 	conn := sb.conn
-
-	// Wrap with buffered reader if provided
 	if sb.reader != nil {
 		conn = NewBufferedConn(sb.conn, sb.reader)
 	}
-
-	// Use default config if not set
 	if sb.config == nil {
 		if sb.isServer {
 			sb.config = NewServerConfig()
@@ -91,26 +80,18 @@ func (sb *SessionBuilder) Build() (*yamux.Session, error) {
 			sb.config = NewClientConfig()
 		}
 	}
-
-	// Create session based on role
 	if sb.isServer {
-		return yamux.Server(conn, sb.config)
+		return Server(conn, sb.config)
 	}
-	return yamux.Client(conn, sb.config)
+	return Client(conn, sb.config)
 }
 
-// BuildClientSession creates a yamux client session with the given connection and reader.
-func BuildClientSession(conn net.Conn, reader *bufio.Reader) (*yamux.Session, error) {
-	return NewSessionBuilder(conn).
-		WithReader(reader).
-		AsClient().
-		Build()
+// BuildClientSession creates a client session with the given connection and reader.
+func BuildClientSession(conn net.Conn, reader *bufio.Reader) (*Session, error) {
+	return NewSessionBuilder(conn).WithReader(reader).AsClient().Build()
 }
 
-// BuildServerSession creates a yamux server session with the given connection and reader.
-func BuildServerSession(conn net.Conn, reader *bufio.Reader) (*yamux.Session, error) {
-	return NewSessionBuilder(conn).
-		WithReader(reader).
-		AsServer().
-		Build()
+// BuildServerSession creates a server session with the given connection and reader.
+func BuildServerSession(conn net.Conn, reader *bufio.Reader) (*Session, error) {
+	return NewSessionBuilder(conn).WithReader(reader).AsServer().Build()
 }
