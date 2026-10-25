@@ -119,6 +119,7 @@ For complete documentation, visit **[Docs](https://driptunnel.app/docs)**
 - [Installation Guide](https://driptunnel.app/docs/installation)
 - [Basic Usage](https://driptunnel.app/docs/basic-tunnels)
 - [Server Deployment](https://driptunnel.app/docs/direct-mode)
+- [Reverse Proxy & Client IP Trust](https://driptunnel.app/docs/client-ip-trust)
 - [Command Reference](https://driptunnel.app/docs/commands)
 
 ## License

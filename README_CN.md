@@ -117,6 +117,7 @@ drip http 3000 -n myapp
 - [安装指南](https://driptunnel.app/docs/installation)
 - [基础使用](https://driptunnel.app/docs/basic-tunnels)
 - [服务端部署](https://driptunnel.app/docs/direct-mode)
+- [反向代理与客户端 IP 信任](https://driptunnel.app/docs/client-ip-trust)
 - [命令参考](https://driptunnel.app/docs/commands)
 
 ## 协议

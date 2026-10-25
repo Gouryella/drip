@@ -35,6 +35,8 @@ services:
     pids_limit: 256
     mem_limit: 256m
     mem_reservation: 64m
+    networks:
+      - drip-net
 
   drip-server:
     image: "driptunnel/drip-server:${VERSION:?Set VERSION to a pinned release tag, e.g. v0.7.0}"
@@ -50,6 +52,14 @@ services:
     environment:
       DRIP_TOKEN: ${DRIP_TOKEN:?Set DRIP_TOKEN to a long random server auth token}
       DRIP_METRICS_TOKEN: ${DRIP_METRICS_TOKEN:?Set DRIP_METRICS_TOKEN to a long random metrics token}
+      # Caddy is the only peer that reaches this service's HTTP listener on
+      # 8443, so trust exactly the drip-net subnet: forwarded client IP
+      # headers are honored from it and ignored from everywhere else. TCP
+      # tunnel ports are published past Caddy and never read those headers.
+      # Never widen this to 0.0.0.0/0 - that would let any caller choose the
+      # IP used by tunnel allow/deny rules. If you change the subnet below,
+      # change this value with it.
+      DRIP_TRUSTED_PROXIES: ${DRIP_TRUSTED_PROXIES:-172.28.0.0/16}
       GOMEMLIMIT: 256MiB
     read_only: true
     cap_drop:
@@ -61,6 +71,16 @@ services:
     pids_limit: 256
     mem_limit: 512m
     mem_reservation: 128m
+    networks:
+      - drip-net
+
+networks:
+  # Fixed subnet so DRIP_TRUSTED_PROXIES above can name it exactly. If it
+  # collides with an existing network, pick another range and update both.
+  drip-net:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
 
 volumes:
   caddy-data:

@@ -7,24 +7,6 @@ import (
 	"strings"
 )
 
-var privateNetworks []*net.IPNet
-
-func init() {
-	privateCIDRs := []string{
-		"127.0.0.0/8",
-		"10.0.0.0/8",
-		"172.16.0.0/12",
-		"192.168.0.0/16",
-		"::1/128",
-		"fc00::/7",
-		"fe80::/10",
-	}
-	for _, cidr := range privateCIDRs {
-		_, ipNet, _ := net.ParseCIDR(cidr)
-		privateNetworks = append(privateNetworks, ipNet)
-	}
-}
-
 // TrustedProxySet contains the proxy IP ranges allowed to supply forwarding headers.
 type TrustedProxySet struct {
 	networks []*net.IPNet
@@ -92,22 +74,6 @@ func ExtractRemoteIP(remoteAddr string) string {
 		return remoteAddr
 	}
 	return host
-}
-
-// IsPrivateIP checks if the given IP is a private/loopback address.
-func IsPrivateIP(ip string) bool {
-	parsedIP := net.ParseIP(ip)
-	if parsedIP == nil {
-		return false
-	}
-
-	for _, network := range privateNetworks {
-		if network.Contains(parsedIP) {
-			return true
-		}
-	}
-
-	return false
 }
 
 // ExtractClientIP extracts the direct client IP from the request.
