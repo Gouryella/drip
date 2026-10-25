@@ -3,7 +3,6 @@ package utils
 import (
 	"crypto/rand"
 	"fmt"
-	"math/big"
 	"regexp"
 )
 
@@ -22,17 +21,33 @@ func GenerateSubdomain(length int) string {
 		length = DefaultSubdomainLength
 	}
 
-	result := make([]byte, length)
-	charsLen := big.NewInt(int64(len(SubdomainChars)))
+	// Draw entropy in a single batch and map bytes onto the charset with
+	// rejection sampling: mask each byte to 6 bits (0-63) and discard values
+	// outside the charset. This keeps the distribution uniform while avoiding
+	// one getrandom syscall and big.Int allocation per character.
+	const mask = 0x3f
+	var randomBytes [64]byte
+	randomPos := len(randomBytes)
+	charsLen := byte(len(SubdomainChars))
 
-	for i := 0; i < length; i++ {
-		num, err := rand.Int(rand.Reader, charsLen)
-		if err != nil {
-			// crypto/rand should never fail in practice. If it does,
-			// we cannot generate a secure random subdomain.
-			panic(fmt.Sprintf("failed to generate random subdomain: %v", err))
+	result := make([]byte, length)
+	for i := 0; i < length; {
+		if randomPos == len(randomBytes) {
+			if _, err := rand.Read(randomBytes[:]); err != nil {
+				// crypto/rand should never fail in practice. If it does,
+				// we cannot generate a secure random subdomain.
+				panic(fmt.Sprintf("failed to generate random subdomain: %v", err))
+			}
+			randomPos = 0
 		}
-		result[i] = SubdomainChars[num.Int64()]
+
+		b := randomBytes[randomPos] & mask
+		randomPos++
+		if b >= charsLen {
+			continue
+		}
+		result[i] = SubdomainChars[b]
+		i++
 	}
 
 	return string(result)

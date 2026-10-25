@@ -29,6 +29,7 @@ func GetReader(r io.Reader) *bufio.Reader {
 
 // PutReader returns a bufio.Reader to the pool.
 func PutReader(reader *bufio.Reader) {
+	reader.Reset(nil)
 	BufioReaderPool.Put(reader)
 }
 
@@ -41,5 +42,6 @@ func GetWriter(w io.Writer) *bufio.Writer {
 
 // PutWriter returns a bufio.Writer to the pool.
 func PutWriter(writer *bufio.Writer) {
+	writer.Reset(nil)
 	BufioWriterPool.Put(writer)
 }

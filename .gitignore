@@ -54,5 +54,4 @@ certs/
 .drip-server.env
 benchmark-results/
 drip-linux-amd64
-./drip
-drip
+/drip

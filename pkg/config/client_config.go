@@ -3,10 +3,13 @@ package config
 import (
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
+	"drip/internal/shared/netutil"
 	"gopkg.in/yaml.v3"
 )
 
@@ -28,6 +31,9 @@ type TunnelConfig struct {
 
 // Validate checks if the tunnel configuration is valid
 func (t *TunnelConfig) Validate() error {
+	if t == nil {
+		return fmt.Errorf("tunnel configuration must not be null")
+	}
 	if t.Name == "" {
 		return fmt.Errorf("tunnel name is required")
 	}
@@ -50,6 +56,9 @@ func (t *TunnelConfig) Validate() error {
 	if t.Auth != "" && t.AuthBearer != "" {
 		return fmt.Errorf("only one of auth or auth_bearer can be set for '%s'", t.Name)
 	}
+	if err := netutil.ValidateIPAccessRules(t.AllowIPs, t.DenyIPs); err != nil {
+		return fmt.Errorf("invalid IP access rules for '%s': %w", t.Name, err)
+	}
 	return nil
 }
 
@@ -67,7 +76,19 @@ func (c *ClientConfig) Validate() error {
 		return fmt.Errorf("server address is required")
 	}
 
-	host, port, err := net.SplitHostPort(c.Server)
+	address := c.Server
+	if strings.HasPrefix(address, "wss://") {
+		u, err := url.Parse(address)
+		if err != nil || u.Hostname() == "" {
+			return fmt.Errorf("invalid WebSocket server address")
+		}
+		port := u.Port()
+		if port == "" {
+			port = "443"
+		}
+		address = net.JoinHostPort(u.Hostname(), port)
+	}
+	host, port, err := net.SplitHostPort(address)
 	if err != nil {
 		if strings.Contains(err.Error(), "missing port") {
 			return fmt.Errorf("server address must include port (e.g., example.com:443), got: %s", c.Server)
@@ -81,6 +102,10 @@ func (c *ClientConfig) Validate() error {
 
 	if port == "" {
 		return fmt.Errorf("server port is required")
+	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return fmt.Errorf("invalid server port: must be between 1 and 65535")
 	}
 
 	// Validate tunnels and check for duplicate names
@@ -134,6 +159,14 @@ func LoadClientConfig(path string) (*ClientConfig, error) {
 
 	cleanPath := filepath.Clean(path)
 
+	info, err := os.Stat(cleanPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("config file not found at %s, please run 'drip config init' first", path)
+		}
+		return nil, fmt.Errorf("failed to stat config file: %w", err)
+	}
+
 	data, err := os.ReadFile(cleanPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -143,8 +176,14 @@ func LoadClientConfig(path string) (*ClientConfig, error) {
 	}
 
 	var config ClientConfig
-	if err := yaml.Unmarshal(data, &config); err != nil {
+	if err := decodeYAMLStrict(data, &config); err != nil {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
+	}
+
+	if clientConfigContainsSecrets(&config) {
+		if err := checkSensitiveFilePermissions(cleanPath, info, "config file containing token or proxy auth fields"); err != nil {
+			return nil, err
+		}
 	}
 
 	if err := config.Validate(); err != nil {
@@ -174,7 +213,7 @@ func SaveClientConfig(config *ClientConfig, path string) error {
 	}
 
 	// Write to file with secure permissions
-	if err := os.WriteFile(cleanPath, data, 0600); err != nil {
+	if err := writeConfigFile(cleanPath, data); err != nil {
 		return fmt.Errorf("failed to write config file: %w", err)
 	}
 
@@ -188,4 +227,16 @@ func ConfigExists(path string) bool {
 	}
 	_, err := os.Stat(path)
 	return err == nil
+}
+
+func clientConfigContainsSecrets(config *ClientConfig) bool {
+	if config.Token != "" {
+		return true
+	}
+	for _, tunnel := range config.Tunnels {
+		if tunnel != nil && (tunnel.Auth != "" || tunnel.AuthBearer != "") {
+			return true
+		}
+	}
+	return false
 }

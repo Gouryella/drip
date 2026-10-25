@@ -22,7 +22,7 @@ func CleanHopByHopHeaders(headers http.Header) {
 		return
 	}
 
-	if connectionHeaders := headers.Get("Connection"); connectionHeaders != "" {
+	for _, connectionHeaders := range headers.Values("Connection") {
 		for _, token := range strings.Split(connectionHeaders, ",") {
 			if t := strings.TrimSpace(token); t != "" {
 				headers.Del(t)
@@ -32,6 +32,7 @@ func CleanHopByHopHeaders(headers http.Header) {
 
 	for _, key := range []string{
 		"Connection",
+		"Upgrade",
 		"Keep-Alive",
 		"Proxy-Authenticate",
 		"Proxy-Authorization",

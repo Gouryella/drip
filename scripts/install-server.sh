@@ -10,7 +10,44 @@ SERVICE_USER="${SERVICE_USER:-drip}"
 CONFIG_DIR="/etc/drip"
 WORK_DIR="/var/lib/drip"
 VERSION="${VERSION:-}"
+CHECKSUM="${CHECKSUM:-${DRIP_SHA256:-}}"
+CHECKSUM_URL="${CHECKSUM_URL:-${DRIP_CHECKSUM_URL:-}}"
+ALLOW_LATEST="${ALLOW_LATEST:-false}"
 COMMAND_MADE_AVAILABLE=false
+IS_UPDATE=false
+DOWNLOAD_TMP_DIR=""
+DOWNLOADED_BINARY=""
+EXPECTED_CHECKSUM=""
+
+print_server_usage() {
+    cat << EOF
+Usage: install-server.sh --version vX.Y.Z [options]
+
+Options:
+  --version vX.Y.Z       Release tag to install. Required unless --allow-latest is set.
+  --checksum SHA256      Expected SHA256 for the Linux release archive.
+  --checksum-url URL     URL for a SHA256/checksums file.
+  --allow-latest         Resolve GitHub's latest release explicitly.
+  -h, --help             Show this help.
+
+If --checksum is omitted, the installer tries release checksum assets and fails
+closed when no checksum for the archive is available.
+EOF
+}
+
+for arg in "$@"; do
+    case "$arg" in
+        --help|-h)
+            print_server_usage
+            exit 0
+            ;;
+    esac
+done
+
+if [[ ${BASH_VERSINFO[0]} -lt 4 ]]; then
+    echo "install-server.sh requires Bash 4.0 or newer. Use a Linux server shell with Bash 4+." >&2
+    exit 1
+fi
 
 # Default values
 DEFAULT_PORT=8443
@@ -318,6 +355,64 @@ EOF
     echo ""
 }
 
+usage() {
+    print_server_usage
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --version)
+                if [[ $# -lt 2 ]]; then
+                    print_error "--version requires a value"
+                    exit 1
+                fi
+                VERSION="$2"
+                shift 2
+                ;;
+            --version=*)
+                VERSION="${1#*=}"
+                shift
+                ;;
+            --checksum|--sha256)
+                if [[ $# -lt 2 ]]; then
+                    print_error "--checksum requires a value"
+                    exit 1
+                fi
+                CHECKSUM="$2"
+                shift 2
+                ;;
+            --checksum=*|--sha256=*)
+                CHECKSUM="${1#*=}"
+                shift
+                ;;
+            --checksum-url)
+                if [[ $# -lt 2 ]]; then
+                    print_error "--checksum-url requires a value"
+                    exit 1
+                fi
+                CHECKSUM_URL="$2"
+                shift 2
+                ;;
+            --checksum-url=*)
+                CHECKSUM_URL="${1#*=}"
+                shift
+                ;;
+            --allow-latest)
+                ALLOW_LATEST=true
+                shift
+                ;;
+            --help|-h)
+                usage
+                exit 0
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+}
+
 # Extract version from a drip binary, preferring the plain output when available
 get_version_from_binary() {
     local binary="$1"
@@ -437,6 +532,13 @@ check_dependencies() {
     print_success "$(msg deps_ok)"
 }
 
+is_truthy() {
+    case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+        1|true|yes|y) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 get_latest_version() {
     # Get latest version from GitHub API
     local api_url="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
@@ -456,27 +558,201 @@ get_latest_version() {
     echo "$version"
 }
 
+ensure_version_pinned() {
+    if [[ -n "$VERSION" ]]; then
+        return
+    fi
+
+    if is_truthy "$ALLOW_LATEST"; then
+        VERSION=$(get_latest_version)
+        print_warning "Resolved latest release to $VERSION because --allow-latest was set"
+        return
+    fi
+
+    print_error "Refusing to download an unpinned release. Set VERSION=vX.Y.Z or pass --version vX.Y.Z."
+    exit 1
+}
+
+cleanup_download_tmp() {
+    if [[ -n "$DOWNLOAD_TMP_DIR" && -d "$DOWNLOAD_TMP_DIR" ]]; then
+        rm -rf "$DOWNLOAD_TMP_DIR"
+    fi
+}
+
+trap cleanup_download_tmp EXIT HUP INT TERM
+
+create_download_tmp_dir() {
+    local tmp_root="${TMPDIR:-/tmp}"
+    DOWNLOAD_TMP_DIR=$(mktemp -d "${tmp_root%/}/drip-server.XXXXXX")
+    chmod 700 "$DOWNLOAD_TMP_DIR"
+}
+
+download_to_file() {
+    local url="$1"
+    local output="$2"
+    local show_progress="${3:-false}"
+
+    if command -v curl &> /dev/null; then
+        if [[ "$show_progress" == true ]]; then
+            curl -f#L "$url" -o "$output"
+        else
+            curl -fsSL "$url" -o "$output"
+        fi
+    else
+        if [[ "$show_progress" == true ]]; then
+            wget --show-progress "$url" -O "$output"
+        else
+            wget -qO "$output" "$url"
+        fi
+    fi
+}
+
+sha256_file() {
+    local file="$1"
+    if command -v sha256sum &> /dev/null; then
+        sha256sum "$file" | awk '{print $1}'
+    elif command -v shasum &> /dev/null; then
+        shasum -a 256 "$file" | awk '{print $1}'
+    elif command -v openssl &> /dev/null; then
+        openssl dgst -sha256 "$file" | awk '{print $NF}'
+    else
+        print_error "sha256sum, shasum, or openssl is required for checksum verification"
+        exit 1
+    fi
+}
+
+extract_checksum_for_asset() {
+    local checksum_file="$1"
+    local asset_name="$2"
+
+    awk -v asset="$asset_name" '
+        index($0, asset) > 0 {
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^[A-Fa-f0-9]{64}$/) {
+                    print $i
+                    exit
+                }
+            }
+        }
+    ' "$checksum_file"
+}
+
+extract_first_checksum() {
+    local checksum_file="$1"
+
+    awk '{
+        for (i = 1; i <= NF; i++) {
+            if ($i ~ /^[A-Fa-f0-9]{64}$/) {
+                print $i
+                exit
+            }
+        }
+    }' "$checksum_file"
+}
+
+resolve_expected_checksum() {
+    local archive_name="$1"
+    local version_number="${VERSION#v}"
+    local checksum_file="${DOWNLOAD_TMP_DIR}/checksums.txt"
+    local checksum=""
+    local checksum_urls=(
+        "https://github.com/${GITHUB_REPO}/releases/download/${VERSION}/drip_${version_number}_checksums.txt"
+        "https://github.com/${GITHUB_REPO}/releases/download/${VERSION}/checksums.txt"
+        "https://github.com/${GITHUB_REPO}/releases/download/${VERSION}/${archive_name}.sha256"
+    )
+    local url
+
+    if [[ -n "$CHECKSUM" ]]; then
+        EXPECTED_CHECKSUM="$CHECKSUM"
+        return
+    fi
+
+    if [[ -n "$CHECKSUM_URL" ]]; then
+        if ! download_to_file "$CHECKSUM_URL" "$checksum_file" false; then
+            print_error "Failed to download checksum file: $CHECKSUM_URL"
+            exit 1
+        fi
+        checksum=$(extract_checksum_for_asset "$checksum_file" "$archive_name")
+        if [[ -z "$checksum" ]]; then
+            checksum=$(extract_first_checksum "$checksum_file")
+        fi
+        if [[ -n "$checksum" ]]; then
+            EXPECTED_CHECKSUM="$checksum"
+            return
+        fi
+        print_error "Checksum file does not contain a SHA256 for $archive_name"
+        exit 1
+    fi
+
+    for url in "${checksum_urls[@]}"; do
+        if download_to_file "$url" "$checksum_file" false 2>/dev/null; then
+            checksum=$(extract_checksum_for_asset "$checksum_file" "$archive_name")
+            if [[ -z "$checksum" ]]; then
+                checksum=$(extract_first_checksum "$checksum_file")
+            fi
+            if [[ -n "$checksum" ]]; then
+                EXPECTED_CHECKSUM="$checksum"
+                return
+            fi
+        fi
+    done
+
+    print_error "Checksum verification is required. Pass --checksum SHA256 or --checksum-url URL."
+    exit 1
+}
+
+verify_sha256() {
+    local file="$1"
+    local expected="$2"
+    local actual
+
+    expected=$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+    if [[ ! "$expected" =~ ^[0-9a-f]{64}$ ]]; then
+        print_error "Invalid SHA256 value"
+        exit 1
+    fi
+
+    actual=$(sha256_file "$file")
+    actual=$(printf '%s' "$actual" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+    if [[ "$actual" != "$expected" ]]; then
+        print_error "Checksum verification failed"
+        echo "Expected: $expected"
+        echo "Actual:   $actual"
+        exit 1
+    fi
+}
+
 
 check_existing_install() {
     local server_path="$INSTALL_DIR/drip"
 
     if [[ -f "$server_path" ]]; then
-        local current_version=$(get_version_from_binary "$server_path")
+        local current_version
+        local target_version
+
+        current_version=$(get_version_from_binary "$server_path")
 
         print_warning "$(msg already_installed): $server_path"
         print_info "$(msg current_version): $current_version"
 
-        # Check remote version
-        print_step "Checking for updates..."
-        local latest_version=$(get_latest_version)
+        target_version="$VERSION"
+        if [[ -z "$target_version" ]]; then
+            if is_truthy "$ALLOW_LATEST"; then
+                print_step "Checking for updates..."
+                target_version=$(get_latest_version)
+            else
+                print_info "Set --version vX.Y.Z and --checksum SHA256 to install a pinned update."
+                exit 0
+            fi
+        fi
 
-        if [[ "$current_version" == "$latest_version" ]]; then
+        if [[ "$current_version" == "$target_version" ]]; then
             print_success "Already up to date ($current_version)"
             exit 0
         else
-            print_info "Latest version: $latest_version"
+            print_info "Target version: $target_version"
             echo ""
-            read -p "$(msg update_now) [Y/n]: " update_choice < /dev/tty
+            read -p "Install this version? [Y/n]: " update_choice < /dev/tty
         fi
 
         if [[ "$update_choice" =~ ^[Nn]$ ]]; then
@@ -484,6 +760,7 @@ check_existing_install() {
             exit 0
         fi
 
+        VERSION="$target_version"
         IS_UPDATE=true
 
         # Stop service if running
@@ -498,10 +775,7 @@ check_existing_install() {
 # Download and install
 # ============================================================================
 download_binary() {
-    # Get latest version if not set
-    if [[ -z "$VERSION" ]]; then
-        VERSION=$(get_latest_version)
-    fi
+    ensure_version_pinned
 
     if [[ "$IS_UPDATE" == true ]]; then
         print_step "$(msg updating)"
@@ -514,26 +788,19 @@ download_binary() {
     local archive_name="drip_${version_number}_linux_${ARCH}.tar.gz"
     local download_url="https://github.com/${GITHUB_REPO}/releases/download/${VERSION}/${archive_name}"
 
-    local tmp_archive="/tmp/drip-archive.tar.gz"
-    local tmp_dir="/tmp/drip-extract"
-
-    # Clean up any previous extraction
-    rm -rf "$tmp_dir"
+    create_download_tmp_dir
+    local tmp_archive="${DOWNLOAD_TMP_DIR}/${archive_name}"
+    local tmp_dir="${DOWNLOAD_TMP_DIR}/extract"
     mkdir -p "$tmp_dir"
 
-    if command -v curl &> /dev/null; then
-        # Use -# for progress bar instead of -s (silent)
-        if ! curl -f#L "$download_url" -o "$tmp_archive"; then
-            print_error "$(msg download_failed): $download_url"
-            exit 1
-        fi
-    else
-        # Use --show-progress to display download progress
-        if ! wget --show-progress "$download_url" -O "$tmp_archive" 2>&1 | grep -v "^$"; then
-            print_error "$(msg download_failed): $download_url"
-            exit 1
-        fi
+    resolve_expected_checksum "$archive_name"
+
+    if ! download_to_file "$download_url" "$tmp_archive" true; then
+        print_error "$(msg download_failed): $download_url"
+        exit 1
     fi
+
+    verify_sha256 "$tmp_archive" "$EXPECTED_CHECKSUM"
 
     # Extract the archive
     if ! tar -xzf "$tmp_archive" -C "$tmp_dir"; then
@@ -551,11 +818,9 @@ download_binary() {
     fi
 
     # Move to standard location
-    mv "$extracted_binary" /tmp/drip
-    chmod +x /tmp/drip
-
-    # Clean up
-    rm -rf "$tmp_archive" "$tmp_dir"
+    DOWNLOADED_BINARY="${DOWNLOAD_TMP_DIR}/drip"
+    mv "$extracted_binary" "$DOWNLOADED_BINARY"
+    chmod +x "$DOWNLOADED_BINARY"
 
     print_success "$(msg download_ok)"
 }
@@ -564,7 +829,12 @@ install_binary() {
     print_step "$(msg installing)"
 
     mkdir -p "$INSTALL_DIR"
-    mv /tmp/drip "$INSTALL_DIR/drip"
+    if [[ -z "$DOWNLOADED_BINARY" || ! -f "$DOWNLOADED_BINARY" ]]; then
+        print_error "Downloaded binary not found"
+        exit 1
+    fi
+
+    mv "$DOWNLOADED_BINARY" "$INSTALL_DIR/drip"
     chmod +x "$INSTALL_DIR/drip"
 
     if [[ "$IS_UPDATE" == true ]]; then
@@ -877,9 +1147,10 @@ generate_self_signed_cert() {
         -addext "subjectAltName=DNS:${DOMAIN},DNS:*.${DOMAIN}" \
         2>/dev/null
 
-    # Set proper permissions
-    chmod 600 "$KEY_PATH"
+    # Set proper permissions (readable by the drip service group)
+    chmod 640 "$KEY_PATH"
     chmod 644 "$CERT_PATH"
+    chown root:"$SERVICE_USER" "$KEY_PATH"
 
     print_success "$(msg cert_generated)"
     print_info "Certificate: $CERT_PATH"
@@ -1050,6 +1321,8 @@ show_completion() {
 # Main
 # ============================================================================
 main() {
+    parse_args "$@"
+
     clear
     print_banner
     if [[ "$SKIP_LANG_PROMPT" == "true" ]]; then

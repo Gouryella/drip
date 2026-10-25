@@ -6,15 +6,14 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"net/url"
 	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	json "github.com/goccy/go-json"
-	"github.com/hashicorp/yamux"
+	"encoding/json"
+
 	"go.uber.org/zap"
 
 	"drip/internal/shared/constants"
@@ -24,7 +23,7 @@ import (
 	"drip/pkg/config"
 )
 
-// PoolClient manages a pool of yamux sessions for tunnel connections.
+// PoolClient manages a pool of mux sessions for tunnel connections.
 type PoolClient struct {
 	serverAddr string
 	tlsConfig  *tls.Config
@@ -33,6 +32,12 @@ type PoolClient struct {
 	localHost  string
 	localPort  int
 	subdomain  string
+
+	// Local backend endpoints derived from localHost/localPort/tunnelType,
+	// which are immutable after construction.
+	targetAddr string
+	targetHost string
+	baseURL    string
 
 	assignedURL string
 	tunnelID    string
@@ -51,19 +56,21 @@ type PoolClient struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	stopCh chan struct{}
-	doneCh chan struct{}
-	once   sync.Once
-	wg     sync.WaitGroup
-	closed atomic.Bool
+	stopCh   chan struct{}
+	doneCh   chan struct{}
+	once     sync.Once
+	doneOnce sync.Once
+	wg       sync.WaitGroup
+	closed   atomic.Bool
 
 	primary *sessionHandle
 
-	mu           sync.RWMutex
-	dataSessions map[string]*sessionHandle
-	desiredTotal int
-	lastScale    time.Time
+	mu              sync.RWMutex
+	dataSessions    map[string]*sessionHandle
+	desiredTotal    int
+	lastScale       time.Time
 	pendingSessions int
+	connectStarted  bool
 
 	logger *zap.Logger
 
@@ -78,7 +85,7 @@ type PoolClient struct {
 	insecure  bool
 
 	// Connection dialer
-	dialer *ConnectionDialer
+	dialer connectionDialer
 
 	// Session scaler
 	scaler *SessionScaler
@@ -93,20 +100,8 @@ type PoolClient struct {
 // NewPoolClient creates a new pool client.
 func NewPoolClient(cfg *ConnectorConfig, logger *zap.Logger) *PoolClient {
 	// Parse server address to get host for TLS config
-	serverAddr := cfg.ServerAddr
+	serverAddr := normalizeServerAddress(cfg.ServerAddr)
 	host := serverAddr
-
-	// Handle wss:// prefix
-	if strings.HasPrefix(serverAddr, "wss://") {
-		if u, err := url.Parse(serverAddr); err == nil {
-			host = u.Host
-			// Normalize server address for internal use
-			if u.Port() == "" {
-				host = u.Host + ":443"
-			}
-			serverAddr = host
-		}
-	}
 
 	// Extract hostname without port for TLS
 	hostOnly, _, _ := net.SplitHostPort(host)
@@ -131,7 +126,17 @@ func NewPoolClient(cfg *ConnectorConfig, logger *zap.Logger) *PoolClient {
 		tunnelType = protocol.TunnelTypeTCP
 	}
 
-	numCPU := runtime.NumCPU()
+	targetAddr := net.JoinHostPort(localHost, fmt.Sprintf("%d", cfg.LocalPort))
+	targetHost := localHost
+	if cfg.LocalPort != 80 && cfg.LocalPort != 443 {
+		targetHost = targetAddr
+	}
+	baseURL := "http://" + targetAddr
+	if tunnelType == protocol.TunnelTypeHTTPS {
+		baseURL = "https://" + targetAddr
+	}
+
+	numCPU := runtime.GOMAXPROCS(0)
 
 	minSessions := cfg.PoolMin
 	if minSessions <= 0 {
@@ -157,6 +162,9 @@ func NewPoolClient(cfg *ConnectorConfig, logger *zap.Logger) *PoolClient {
 	if transport == "" {
 		transport = TransportAuto
 	}
+	if transport == TransportAuto && strings.HasPrefix(cfg.ServerAddr, "wss://") {
+		transport = TransportWebSocket
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -167,6 +175,9 @@ func NewPoolClient(cfg *ConnectorConfig, logger *zap.Logger) *PoolClient {
 		tunnelType:         tunnelType,
 		localHost:          localHost,
 		localPort:          cfg.LocalPort,
+		targetAddr:         targetAddr,
+		targetHost:         targetHost,
+		baseURL:            baseURL,
 		subdomain:          cfg.Subdomain,
 		minSessions:        minSessions,
 		maxSessions:        maxSessions,
@@ -209,11 +220,34 @@ func isLoopbackHost(host string) bool {
 }
 
 // Connect establishes the primary connection and starts background workers.
-func (c *PoolClient) Connect() error {
-	primaryConn, err := c.dialer.Dial()
+func (c *PoolClient) Connect() (err error) {
+	c.mu.Lock()
+	if c.closed.Load() {
+		c.mu.Unlock()
+		return net.ErrClosed
+	}
+	if c.connectStarted {
+		c.mu.Unlock()
+		return fmt.Errorf("client connection already started")
+	}
+	c.connectStarted = true
+	// Keep Wait's counter nonzero until setup and warmup have finished.
+	c.wg.Add(1)
+	c.mu.Unlock()
+	defer c.wg.Done()
+	defer c.startWaiter()
+	defer func() {
+		if err != nil {
+			_ = c.Close()
+		}
+	}()
+	primaryConn, err := c.dialer.DialContext(c.ctx)
 	if err != nil {
 		return err
 	}
+	stopHandshake := context.AfterFunc(c.ctx, func() { _ = primaryConn.Close() })
+	defer stopHandshake()
+	_ = primaryConn.SetWriteDeadline(time.Now().Add(constants.RequestTimeout))
 
 	maxData := max(c.maxSessions-1, 0)
 	req := protocol.RegisterRequest{
@@ -272,6 +306,7 @@ func (c *PoolClient) Connect() error {
 	}
 	defer ack.Release()
 	_ = primaryConn.SetReadDeadline(time.Time{})
+	_ = primaryConn.SetWriteDeadline(time.Time{})
 
 	if ack.Type == protocol.FrameTypeError {
 		var errMsg protocol.ErrorMessage
@@ -293,6 +328,7 @@ func (c *PoolClient) Connect() error {
 		return fmt.Errorf("failed to parse register response: %w", err)
 	}
 
+	c.mu.Lock()
 	c.assignedURL = resp.URL
 	c.subdomain = resp.Subdomain
 	if resp.SupportsDataConn && resp.TunnelID != "" {
@@ -302,13 +338,14 @@ func (c *PoolClient) Connect() error {
 	if resp.Bandwidth > 0 {
 		c.bandwidth = resp.Bandwidth
 	}
+	c.mu.Unlock()
 
-	yamuxCfg := mux.NewClientConfig()
+	muxCfg := mux.NewClientConfig()
 
-	session, err := yamux.Server(primaryConn, yamuxCfg)
+	session, err := mux.Server(primaryConn, muxCfg)
 	if err != nil {
 		_ = primaryConn.Close()
-		return fmt.Errorf("failed to init yamux session: %w", err)
+		return fmt.Errorf("failed to init mux session: %w", err)
 	}
 
 	primary := &sessionHandle{
@@ -318,6 +355,13 @@ func (c *PoolClient) Connect() error {
 	}
 	primary.touch()
 	c.mu.Lock()
+	if c.closed.Load() {
+		c.mu.Unlock()
+		_ = session.Close()
+		_ = primaryConn.Close()
+		return net.ErrClosed
+	}
+
 	c.primary = primary
 	c.mu.Unlock()
 
@@ -348,12 +392,16 @@ func (c *PoolClient) Connect() error {
 		c.scaler.Start()
 	}
 
-	go func() {
-		c.wg.Wait()
-		close(c.doneCh)
-	}()
-
 	return nil
+}
+
+func (c *PoolClient) startWaiter() {
+	c.doneOnce.Do(func() {
+		go func() {
+			c.wg.Wait()
+			close(c.doneCh)
+		}()
+	})
 }
 
 func (c *PoolClient) acceptLoop(h *sessionHandle, isPrimary bool) {
@@ -389,7 +437,7 @@ func (c *PoolClient) acceptLoop(h *sessionHandle, isPrimary bool) {
 		c.stats.IncActiveConnections()
 
 		c.wg.Add(1)
-		go c.handleStream(h, stream)
+		go c.handleStream(h, mux.WrapStream(stream))
 	}
 }
 
@@ -408,12 +456,23 @@ func (c *PoolClient) sessionWatcher(h *sessionHandle, isPrimary bool) {
 	}
 }
 
+// dataSessionPingInterval is the liveness-check cadence for data sessions.
+// The primary session pings more often because it also measures latency.
+const dataSessionPingInterval = 15 * time.Second
+
 func (c *PoolClient) pingLoop(h *sessionHandle) {
 	defer c.wg.Done()
 
 	const maxConsecutiveFailures = 3
 
-	ticker := time.NewTicker(constants.HeartbeatInterval)
+	// The primary session measures user-visible latency and keeps the original
+	// 2s cadence; data sessions are only health-checked, which the server-side
+	// mux keepalive (15s) also covers.
+	interval := dataSessionPingInterval
+	if h.id == "primary" {
+		interval = constants.HeartbeatInterval
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	consecutiveFailures := 0
@@ -456,6 +515,12 @@ func (c *PoolClient) pingLoop(h *sessionHandle) {
 		consecutiveFailures = 0
 		h.touch()
 
+		// Only the primary session measures user-visible latency; data sessions
+		// are health-checked and must not skew the displayed value.
+		if h.id != "primary" {
+			continue
+		}
+
 		c.latencyNanos.Store(int64(latency))
 		if cb, ok := c.latencyCallback.Load().(LatencyCallback); ok && cb != nil {
 			cb(latency)
@@ -473,6 +538,9 @@ func (c *PoolClient) Close() error {
 
 		if c.cancel != nil {
 			c.cancel()
+		}
+		if c.httpClient != nil {
+			c.httpClient.CloseIdleConnections()
 		}
 
 		var data []*sessionHandle
@@ -507,14 +575,23 @@ func (c *PoolClient) Close() error {
 				_ = primary.conn.Close()
 			}
 		}
+		c.startWaiter()
 	})
 
 	return closeErr
 }
 
-func (c *PoolClient) Wait()                         { <-c.doneCh }
-func (c *PoolClient) GetURL() string                { return c.assignedURL }
-func (c *PoolClient) GetSubdomain() string          { return c.subdomain }
+func (c *PoolClient) Wait() { <-c.doneCh }
+func (c *PoolClient) GetURL() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.assignedURL
+}
+func (c *PoolClient) GetSubdomain() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.subdomain
+}
 func (c *PoolClient) GetLatency() time.Duration     { return time.Duration(c.latencyNanos.Load()) }
 func (c *PoolClient) GetStats() *stats.TrafficStats { return c.stats }
 func (c *PoolClient) IsClosed() bool                { return c.closed.Load() }

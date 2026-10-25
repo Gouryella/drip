@@ -7,11 +7,18 @@ import (
 )
 
 type TrafficStats struct {
+	// Counters below are updated concurrently from many connections. Each hot
+	// counter is padded to its own cache line to avoid false sharing between
+	// cores.
 	totalBytesIn  int64
+	_             [56]byte
 	totalBytesOut int64
+	_             [56]byte
 
 	totalRequests     int64
+	_                 [56]byte
 	activeConnections int64
+	_                 [56]byte
 
 	lastBytesIn  int64
 	lastBytesOut int64

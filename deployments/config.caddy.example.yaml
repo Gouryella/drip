@@ -14,8 +14,10 @@ domain: tunnel.example.com
 # Domain for tunnel URLs (optional, defaults to domain)
 # tunnel_domain: example.com
 
-# Authentication token (optional, but recommended)
-token: your-secret-token
+# Authentication token (required unless allow_anonymous is true)
+# Generate a real secret before enabling; placeholder values are rejected.
+# token: replace-with-a-long-random-token
+# allow_anonymous: false    # Explicitly allow public unauthenticated tunnels
 
 # TLS disabled - Caddy handles TLS termination
 tls_enabled: false
@@ -28,7 +30,15 @@ tcp_port_min: 20000
 tcp_port_max: 20100
 
 # Optional settings
-# metrics_token: secret     # Token for /metrics endpoint
+# metrics_token: replace-with-a-long-random-token  # Token for /stats and /metrics endpoints
+# http3: false              # Caddy terminates QUIC at the edge and proxies h1/h2 to drip-server,
+#                           # so drip-server's own HTTP/3 listener is unreachable here.
+# max_request_body_bytes: 0 # Optional upload cap in bytes; 0 (default) means unlimited.
+#                           # Set a positive value only if you need to bound uploads.
+# trusted_proxies:          # Proxy IPs/CIDRs allowed to supply X-Forwarded-For
+#                           # (see https://driptunnel.app/docs/client-ip-trust)
+#   - 172.28.0.0/16         # Caddy only; matches the drip-net subnet in docker-compose.caddy.yml.
+#                           # docker-compose.caddy.yml sets this via DRIP_TRUSTED_PROXIES.
 # debug: false              # Enable debug logging
 # pprof_port: 6060          # Enable pprof profiling
 # transports:               # Allowed transports (default: tcp,wss)

@@ -1,8 +1,10 @@
 services:
   caddy:
-    image: slothcroissant/caddy-cloudflaredns:latest
+    image: "slothcroissant/caddy-cloudflaredns:${CADDY_CLOUDFLARE_IMAGE_TAG:?Set CADDY_CLOUDFLARE_IMAGE_TAG to a pinned image tag}"
     container_name: drip-caddy
     restart: unless-stopped
+    depends_on:
+      - drip-server
     ports:
       - "80:80"
       - "443:443"
@@ -10,26 +12,81 @@ services:
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
+      - caddy-config:/config
     environment:
-      DOMAIN: ${DOMAIN}
+      DOMAIN: ${DOMAIN:?Set DOMAIN, e.g. tunnel.example.com}
       ACME_EMAIL: ${ACME_EMAIL:-}
-      CF_API_TOKEN: ${CF_API_TOKEN}
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    secrets:
+      - cf_api_token
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        export CF_API_TOKEN="$$(cat /run/secrets/cf_api_token)"
+        exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid,nodev
+    pids_limit: 256
     mem_limit: 256m
     mem_reservation: 64m
+    networks:
+      - drip-net
 
   drip-server:
-    image: driptunnel/drip-server:${VERSION:-latest}
+    image: "driptunnel/drip-server:${VERSION:?Set VERSION to a pinned release tag, e.g. v0.7.0}"
     container_name: drip-server
     restart: unless-stopped
-    network_mode: host
+    expose:
+      - "8443"
+    ports:
+      - "20000-20100:20000-20100"
     volumes:
       - ./config.yaml:/app/config.yaml:ro
+      - drip-data:/app/data
     environment:
+      DRIP_TOKEN: ${DRIP_TOKEN:?Set DRIP_TOKEN to a long random server auth token}
+      DRIP_METRICS_TOKEN: ${DRIP_METRICS_TOKEN:?Set DRIP_METRICS_TOKEN to a long random metrics token}
+      # Caddy is the only peer that reaches this service's HTTP listener on
+      # 8443, so trust exactly the drip-net subnet: forwarded client IP
+      # headers are honored from it and ignored from everywhere else. TCP
+      # tunnel ports are published past Caddy and never read those headers.
+      # Never widen this to 0.0.0.0/0 - that would let any caller choose the
+      # IP used by tunnel allow/deny rules. If you change the subnet below,
+      # change this value with it.
+      DRIP_TRUSTED_PROXIES: ${DRIP_TRUSTED_PROXIES:-172.28.0.0/16}
       GOMEMLIMIT: 256MiB
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid,nodev
+    pids_limit: 256
     mem_limit: 512m
     mem_reservation: 128m
+    networks:
+      - drip-net
+
+networks:
+  # Fixed subnet so DRIP_TRUSTED_PROXIES above can name it exactly. If it
+  # collides with an existing network, pick another range and update both.
+  drip-net:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
 
 volumes:
   caddy-data:
+  caddy-config:
+  drip-data:
+
+secrets:
+  cf_api_token:
+    file: ./secrets/cloudflare_api_token

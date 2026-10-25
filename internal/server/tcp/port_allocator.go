@@ -9,7 +9,7 @@ import (
 )
 
 // PortAllocator manages dynamic TCP port allocation within a configured range.
-// It keeps an in-memory reservation map; ports are held until Release is called.
+// It holds bound sockets until proxy handoff and reservations until Release.
 type PortAllocator struct {
 	min       int
 	max       int
@@ -38,8 +38,11 @@ func (p *PortAllocator) Allocate() (int, error) {
 	defer p.mu.Unlock()
 
 	total := p.max - p.min + 1
+	start := p.randomPort() - p.min
 	for attempts := 0; attempts < total; attempts++ {
-		port := p.randomPort()
+		// Probe each port once. Sampling with replacement can report exhaustion
+		// even while free ports remain, especially near the range's capacity.
+		port := p.min + (start+attempts)%total
 		if p.used[port] {
 			continue
 		}
@@ -49,7 +52,6 @@ func (p *PortAllocator) Allocate() (int, error) {
 		if err != nil {
 			continue
 		}
-
 		p.used[port] = true
 		p.listeners[port] = ln
 		return port, nil
@@ -74,35 +76,30 @@ func (p *PortAllocator) AllocateSpecific(port int) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("requested port %d unavailable: %w", port, err)
 	}
-
 	p.used[port] = true
 	p.listeners[port] = ln
 	return port, nil
-}
-
-// TakeListener returns the held listener for a port and removes it from the allocator.
-func (p *PortAllocator) TakeListener(port int) (net.Listener, bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	ln, ok := p.listeners[port]
-	if !ok {
-		return nil, false
-	}
-	delete(p.listeners, port)
-	return ln, true
 }
 
 // Release frees a previously allocated port.
 func (p *PortAllocator) Release(port int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-
-	if ln, ok := p.listeners[port]; ok {
+	if ln := p.listeners[port]; ln != nil {
 		_ = ln.Close()
 		delete(p.listeners, port)
 	}
 	delete(p.used, port)
+}
+
+// TakeListener transfers the bound socket to a proxy while keeping its port
+// reserved until Release. No other process can claim the port between steps.
+func (p *PortAllocator) TakeListener(port int) net.Listener {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	ln := p.listeners[port]
+	delete(p.listeners, port)
+	return ln
 }
 
 func (p *PortAllocator) randomPort() int {

@@ -157,17 +157,26 @@ func startMultipleTunnels(cfg *config.ClientConfig, tunnels []*config.TunnelConf
 	var wg sync.WaitGroup
 	errChan := make(chan error, len(tunnels))
 	stopChan := make(chan struct{})
-	var clientsMu sync.Mutex
-	var clients []tcp.TunnelClient
+	var stopOnce sync.Once
+	stopAll := func() {
+		stopOnce.Do(func() {
+			close(stopChan)
+		})
+	}
+	defer stopAll()
 
 	// Handle interrupt signal
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigChan)
 
 	go func() {
-		<-sigChan
-		fmt.Println("\nShutting down tunnels...")
-		close(stopChan)
+		select {
+		case <-sigChan:
+			fmt.Println("\nShutting down tunnels...")
+			stopAll()
+		case <-stopChan:
+		}
 	}()
 
 	for _, t := range tunnels {
@@ -175,48 +184,68 @@ func startMultipleTunnels(cfg *config.ClientConfig, tunnels []*config.TunnelConf
 		go func(tunnel *config.TunnelConfig) {
 			defer wg.Done()
 
+			select {
+			case <-stopChan:
+				return
+			default:
+			}
+
 			connConfig, err := buildConnectorConfig(cfg, tunnel)
 			if err != nil {
 				errChan <- err
+				stopAll()
 				return
 			}
 			fmt.Printf("  Starting %s (%s %s:%d)...\n", tunnel.Name, tunnel.Type, getAddress(tunnel), tunnel.Port)
 
-			client := tcp.NewTunnelClient(connConfig, logger)
-
-			if err := client.Connect(); err != nil {
-				errChan <- fmt.Errorf("%s: %w", tunnel.Name, err)
+			select {
+			case <-stopChan:
 				return
+			default:
 			}
 
+			client := newTunnelClient(connConfig, logger)
+			connectFinished := make(chan struct{})
+			go func() {
+				select {
+				case <-stopChan:
+					_ = client.Close()
+				case <-connectFinished:
+				}
+			}()
+			defer close(connectFinished)
+			defer client.Close()
+
+			// Connect
+			if err := client.Connect(); err != nil {
+				errChan <- fmt.Errorf("%s: %w", tunnel.Name, err)
+				stopAll()
+				return
+			}
 			fmt.Printf("  ✓ %s: %s\n", tunnel.Name, client.GetURL())
 
-			clientsMu.Lock()
-			clients = append(clients, client)
-			clientsMu.Unlock()
+			// Run until stopped
+			<-stopChan
 		}(t)
 	}
 
-	wg.Wait()
-	close(errChan)
+	// Wait for interrupt or error
+	go func() {
+		wg.Wait()
+		close(errChan)
+	}()
 
+	// Collect errors
 	var errors []error
 	for err := range errChan {
 		errors = append(errors, err)
 		fmt.Printf("  ✗ %v\n", err)
 	}
 
+	wg.Wait()
+
 	if len(errors) > 0 {
-		for _, client := range clients {
-			_ = client.Close()
-		}
 		return fmt.Errorf("%d tunnel(s) failed to start", len(errors))
-	}
-
-	<-stopChan
-
-	for _, client := range clients {
-		_ = client.Close()
 	}
 
 	return nil

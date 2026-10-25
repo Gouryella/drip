@@ -11,6 +11,8 @@ import (
 	"sync"
 	"time"
 
+	"drip/internal/shared/utils"
+
 	"go.uber.org/zap"
 )
 
@@ -157,7 +159,8 @@ func (h *HTTPRequestHandler) handleLegacy() error {
 
 		h.logger.Info("Processing HTTP request on TCP port",
 			zap.String("method", req.Method),
-			zap.String("url", req.URL.String()),
+			zap.String("path", utils.URLPathForLog(req.URL)),
+			zap.Strings("query_keys", utils.QueryKeysForLog(req.URL)),
 			zap.String("host", req.Host),
 		)
 
@@ -183,7 +186,8 @@ func (h *HTTPRequestHandler) handleLegacy() error {
 
 		h.logger.Debug("HTTP request processing completed",
 			zap.String("method", req.Method),
-			zap.String("url", req.URL.String()),
+			zap.String("path", utils.URLPathForLog(req.URL)),
+			zap.Strings("query_keys", utils.QueryKeysForLog(req.URL)),
 		)
 
 		shouldClose := false

@@ -30,6 +30,7 @@ var (
 	ErrTooManyPerIP              = errors.New("maximum tunnels per IP reached")
 	ErrRateLimitExceeded         = errors.New("rate limit exceeded, try again later")
 	ErrSubdomainGenerationFailed = errors.New("failed to generate unique subdomain")
+	ErrManagerClosed             = errors.New("tunnel manager is closed")
 )
 
 // shard holds a subset of tunnels with its own lock
@@ -61,6 +62,7 @@ type Manager struct {
 	// Lifecycle
 	stopCh       chan struct{}
 	shutdownOnce sync.Once
+	lifecycleMu  sync.RWMutex
 }
 
 // ManagerConfig holds configuration for the Manager
@@ -141,6 +143,13 @@ func (m *Manager) Register(conn *websocket.Conn, customSubdomain string) (string
 
 // RegisterWithIP registers a new tunnel with IP tracking
 func (m *Manager) RegisterWithIP(conn *websocket.Conn, customSubdomain string, remoteIP string) (string, error) {
+	m.lifecycleMu.RLock()
+	defer m.lifecycleMu.RUnlock()
+	select {
+	case <-m.stopCh:
+		return "", ErrManagerClosed
+	default:
+	}
 	// Reserve a global slot atomically using CAS loop
 	for {
 		current := m.tunnelCount.Load()
@@ -318,26 +327,43 @@ func (m *Manager) RegisterWithIP(conn *websocket.Conn, customSubdomain string, r
 
 // Unregister removes a tunnel connection
 func (m *Manager) Unregister(subdomain string) {
+	m.unregister(subdomain, nil)
+}
+
+// UnregisterIf removes only the registration owned by expected. A delayed
+// cleanup from an old connection must not remove a reused subdomain.
+func (m *Manager) UnregisterIf(subdomain string, expected *Connection) {
+	m.unregister(subdomain, expected)
+}
+
+func (m *Manager) unregister(subdomain string, expected *Connection) {
+	m.lifecycleMu.RLock()
+	defer m.lifecycleMu.RUnlock()
+	select {
+	case <-m.stopCh:
+		return
+	default:
+	}
 	s := m.getShard(subdomain)
 	s.mu.Lock()
 
 	tc, ok := s.tunnels[subdomain]
-	if !ok {
+	if !ok || (expected != nil && tc != expected) {
 		s.mu.Unlock()
 		return
 	}
 
 	remoteIP := tc.remoteIP
 	tunnelType := tc.GetTunnelType().String()
-	tc.Close()
 	delete(s.tunnels, subdomain)
 	delete(s.used, subdomain)
-	s.mu.Unlock()
 
-	// Clean up per-tunnel Prometheus labels to prevent cardinality explosion
+	// Remove labels before this name can be reused by another registration.
 	metrics.TunnelBytesReceived.DeleteLabelValues(subdomain, subdomain, tunnelType)
 	metrics.TunnelBytesSent.DeleteLabelValues(subdomain, subdomain, tunnelType)
 	metrics.TunnelActiveConnections.DeleteLabelValues(subdomain, subdomain, tunnelType)
+	s.mu.Unlock()
+	tc.Close()
 
 	// Update counters
 	m.tunnelCount.Add(-1)
@@ -405,17 +431,17 @@ func (m *Manager) CleanupStale(timeout time.Duration) int {
 		s := &m.shards[i]
 		s.mu.RLock()
 
-		var staleSubdomains []string
+		staleSubdomains := make(map[string]*Connection)
 		for subdomain, tc := range s.tunnels {
 			if !tc.IsAlive(timeout) {
-				staleSubdomains = append(staleSubdomains, subdomain)
+				staleSubdomains[subdomain] = tc
 			}
 		}
 		s.mu.RUnlock()
 
 		// Unregister outside shard lock — Unregister handles its own locking safely
-		for _, subdomain := range staleSubdomains {
-			m.Unregister(subdomain)
+		for subdomain, tc := range staleSubdomains {
+			m.UnregisterIf(subdomain, tc)
 		}
 		totalCleaned += len(staleSubdomains)
 	}
@@ -451,6 +477,8 @@ func (m *Manager) StartCleanupTask(interval, timeout time.Duration) {
 // Shutdown gracefully shuts down all tunnels
 func (m *Manager) Shutdown() {
 	m.shutdownOnce.Do(func() {
+		m.lifecycleMu.Lock()
+		defer m.lifecycleMu.Unlock()
 		// Signal cleanup goroutine to stop
 		close(m.stopCh)
 
@@ -471,5 +499,12 @@ func (m *Manager) Shutdown() {
 		}
 
 		m.tunnelCount.Store(0)
+		m.ipMu.Lock()
+		for ip := range m.tunnelsByIP {
+			metrics.TunnelsByIP.DeleteLabelValues(ip)
+		}
+		clear(m.tunnelsByIP)
+		m.ipMu.Unlock()
+		metrics.TunnelCount.Set(0)
 	})
 }

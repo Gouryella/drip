@@ -28,10 +28,14 @@ var (
 	}
 )
 
+// errorResponseSanitizer strips CR/LF from status text and messages so they
+// cannot inject additional response lines. It is safe for concurrent use.
+var errorResponseSanitizer = strings.NewReplacer("\r", "", "\n", "")
+
 // WriteErrorResponse writes an HTTP error response to the connection.
 func WriteErrorResponse(conn net.Conn, resp *HTTPErrorResponse) error {
-	statusText := strings.NewReplacer("\r", "", "\n", "").Replace(resp.StatusText)
-	message := strings.NewReplacer("\r", "", "\n", "").Replace(resp.Message)
+	statusText := errorResponseSanitizer.Replace(resp.StatusText)
+	message := errorResponseSanitizer.Replace(resp.Message)
 
 	response := fmt.Sprintf(
 		"HTTP/1.1 %d %s\r\n"+
