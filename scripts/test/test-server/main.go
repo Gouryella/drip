@@ -18,7 +18,7 @@ import (
 // storing the whole stream.
 func fillChunk(chunk []byte, offset int64) []byte {
 	for j := range chunk {
-		chunk[j] = byte((offset + int64(j)) % 256)
+		chunk[j] = byte((offset + int64(j)) % 256) // #nosec G115
 	}
 	return chunk
 }

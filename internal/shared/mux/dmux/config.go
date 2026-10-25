@@ -18,8 +18,7 @@ var (
 type Config struct {
 	// AcceptBacklog bounds streams waiting in Accept.
 	AcceptBacklog int
-	// MaxStreamWindowSize is the per-stream receive window. Both peers must
-	// use the same value; it is not negotiated on the wire yet.
+	// MaxStreamWindowSize is the per-stream receive window. Both peers must match.
 	MaxStreamWindowSize uint32
 	// ConnectionWriteTimeout bounds a single write to the transport.
 	ConnectionWriteTimeout time.Duration

@@ -56,7 +56,6 @@ func newStream(s *Session, id uint32, local bool) *Stream {
 	return st
 }
 
-// ID returns the wire stream identifier.
 func (st *Stream) ID() uint32 { return st.id }
 
 func (st *Stream) signalRead() {
@@ -110,7 +109,6 @@ func (st *Stream) addWindow(inc int64) {
 	st.signalWrite()
 }
 
-// Read implements io.Reader.
 func (st *Stream) Read(p []byte) (int, error) {
 	for {
 		st.rmu.Lock()
@@ -209,12 +207,11 @@ func (st *Stream) waitRead() error {
 // keeps the reader from ever blocking on the write path.
 func (st *Stream) sendWindowUpdate(inc int64) {
 	var payload [4]byte
-	binary.BigEndian.PutUint32(payload[:], uint32(inc))
+	binary.BigEndian.PutUint32(payload[:], uint32(inc)) // #nosec G115
 	_ = st.sess.enqueue(frameHeader{typ: frameWindowUpdate, streamID: st.id}, payload[:])
 }
 
-// Write implements io.Writer. The payload is copied into the session batch
-// buffer, so Write returns without waiting for a syscall.
+// Write copies into the session batch and returns without waiting for a syscall.
 func (st *Stream) Write(p []byte) (int, error) {
 	st.wmu.Lock()
 	defer st.wmu.Unlock()
@@ -373,29 +370,24 @@ func (st *Stream) sessionClosed(err error) {
 	st.signalWrite()
 }
 
-// SetDeadline implements net.Conn.
 func (st *Stream) SetDeadline(t time.Time) error {
 	st.rdeadline.set(t)
 	st.wdeadline.set(t)
 	return nil
 }
 
-// SetReadDeadline implements net.Conn.
 func (st *Stream) SetReadDeadline(t time.Time) error {
 	st.rdeadline.set(t)
 	return nil
 }
 
-// SetWriteDeadline implements net.Conn.
 func (st *Stream) SetWriteDeadline(t time.Time) error {
 	st.wdeadline.set(t)
 	return nil
 }
 
-// LocalAddr implements net.Conn.
 func (st *Stream) LocalAddr() net.Addr { return st.sess.conn.LocalAddr() }
 
-// RemoteAddr implements net.Conn.
 func (st *Stream) RemoteAddr() net.Addr { return st.sess.conn.RemoteAddr() }
 
 type deadline struct {

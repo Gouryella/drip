@@ -150,7 +150,6 @@ func (s *Session) Open() (*Stream, error) {
 	return st, nil
 }
 
-// OpenStream is an alias for Open.
 func (s *Session) OpenStream() (*Stream, error) { return s.Open() }
 
 // Accept returns the next stream opened by the peer.
@@ -171,7 +170,6 @@ func (s *Session) Accept() (*Stream, error) {
 	}
 }
 
-// AcceptStream is an alias for Accept.
 func (s *Session) AcceptStream() (*Stream, error) { return s.Accept() }
 
 // Ping measures a round trip to the peer.
@@ -245,10 +243,8 @@ func (s *Session) IsClosed() bool { return s.isClosed() }
 // CloseChan is closed when the session terminates.
 func (s *Session) CloseChan() <-chan struct{} { return s.closeCh }
 
-// LocalAddr returns the local transport address.
 func (s *Session) LocalAddr() net.Addr { return s.conn.LocalAddr() }
 
-// RemoteAddr returns the peer transport address.
 func (s *Session) RemoteAddr() net.Addr { return s.conn.RemoteAddr() }
 
 // Close terminates the session and all streams.
@@ -326,7 +322,7 @@ func (s *Session) enqueue(h frameHeader, payload []byte) error {
 	if headerSize+len(payload) > batchSize {
 		return fmt.Errorf("%w: frame of %d bytes exceeds batch", ErrProtocol, headerSize+len(payload))
 	}
-	h.length = uint32(len(payload))
+	h.length = uint32(len(payload)) // #nosec G115
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
 	if len(s.sendBuf)+headerSize+len(payload) > cap(s.sendBuf) {

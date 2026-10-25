@@ -1,7 +1,7 @@
 # =========================
 # Builder stage
 # =========================
-FROM golang:1.26.8-alpine3.24 AS builder
+FROM golang:1.27.3-alpine3.24 AS builder
 
 RUN apk add --no-cache ca-certificates tzdata
 
@@ -29,7 +29,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
 # =========================
 # Runtime stage
 # =========================
-FROM alpine:3.24
+FROM alpine:3.24.3
 
 RUN apk add --no-cache ca-certificates tzdata && \
     update-ca-certificates

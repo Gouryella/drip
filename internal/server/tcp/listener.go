@@ -20,7 +20,6 @@ import (
 	"drip/internal/shared/utils"
 
 	"go.uber.org/zap"
-	"golang.org/x/net/http2"
 )
 
 type ListenerConfig struct {
@@ -201,13 +200,10 @@ func (l *Listener) Start() error {
 		MaxHeaderBytes: 1 << 18,           // 256KB max header size (reduced from 1MB)
 	}
 
-	if err := http2.ConfigureServer(l.httpServer, &http2.Server{
-		MaxConcurrentStreams:         1000,
-		IdleTimeout:                  120 * time.Second,
-		MaxUploadBufferPerConnection: 1 << 20, // 1MB (default 64KB)
-		MaxUploadBufferPerStream:     1 << 20, // 1MB (default 64KB)
-	}); err != nil {
-		l.logger.Warn("Failed to configure HTTP/2", zap.Error(err))
+	l.httpServer.HTTP2 = &http.HTTP2Config{
+		MaxConcurrentStreams:          1000,
+		MaxReceiveBufferPerConnection: 1 << 20,
+		MaxReceiveBufferPerStream:     1 << 20,
 	}
 
 	l.wg.Add(1)

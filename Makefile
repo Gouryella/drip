@@ -6,7 +6,7 @@ VERSION?=dev
 COMMIT=$(shell git rev-parse --short=10 HEAD 2>/dev/null || echo "unknown")
 BUILD_TIME=$(shell date -u '+%Y-%m-%d_%H:%M:%S')
 LDFLAGS=-ldflags "-s -w -X main.Version=${VERSION} -X main.GitCommit=${COMMIT} -X main.BuildTime=${BUILD_TIME}"
-STATICCHECK_VERSION?=v0.8.1
+STATICCHECK_VERSION?=v0.8.2
 
 # Default target
 all: clean deps test build
