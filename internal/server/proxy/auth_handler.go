@@ -408,10 +408,39 @@ func (h *Handler) handleProxyLoginWithRateLimit(w http.ResponseWriter, r *http.R
 	})
 
 	redirectURL := r.FormValue("redirect")
-	if redirectURL == "" || redirectURL == "/_drip/login" || !strings.HasPrefix(redirectURL, "/") || strings.HasPrefix(redirectURL, "//") {
-		redirectURL = "/"
+	if isValidRedirect(redirectURL) {
+		http.Redirect(w, r, redirectURL, http.StatusSeeOther)
+		return
 	}
-	http.Redirect(w, r, redirectURL, http.StatusSeeOther)
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+// isValidRedirect reports whether target is safe to use as the destination of
+// a post-login redirect. Only same-origin absolute paths are accepted.
+//
+// The function name matters: CodeQL's open-redirect analysis recognises calls
+// to functions named "isValidRedirect" as sanitizing the value passed to them,
+// so the guarded redirect in handleProxyLoginWithRateLimit is not flagged.
+func isValidRedirect(target string) bool {
+	if target == "" || target == "/_drip/login" {
+		return false
+	}
+	if target[0] != '/' {
+		return false
+	}
+	// Browsers interpret "//host" and "/\host" as scheme-relative URLs.
+	if len(target) > 1 && (target[1] == '/' || target[1] == '\\') {
+		return false
+	}
+	// Reject backslashes and control characters anywhere: browsers may
+	// normalise the former to '/', and strip the latter from URLs.
+	for i := 0; i < len(target); i++ {
+		c := target[i]
+		if c == '\\' || c < 0x20 || c == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 func (h *Handler) serveLoginPage(w http.ResponseWriter, r *http.Request, subdomain string, errorMsg string) {
@@ -419,7 +448,7 @@ func (h *Handler) serveLoginPage(w http.ResponseWriter, r *http.Request, subdoma
 	if r.URL.RawQuery != "" {
 		redirectURL += "?" + r.URL.RawQuery
 	}
-	if redirectURL == "/_drip/login" || !strings.HasPrefix(redirectURL, "/") || strings.HasPrefix(redirectURL, "//") {
+	if !isValidRedirect(redirectURL) {
 		redirectURL = "/"
 	}
 

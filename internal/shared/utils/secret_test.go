@@ -33,6 +33,18 @@ func TestConstantTimeEqualString(t *testing.T) {
 			b:    "",
 			want: true,
 		},
+		{
+			name: "embedded NUL bytes compare by content",
+			a:    "sec\x00ret",
+			b:    "sec\x00ret",
+			want: true,
+		},
+		{
+			name: "trailing NUL changes the length",
+			a:    "secret",
+			b:    "secret\x00",
+			want: false,
+		},
 	}
 
 	for _, tt := range tests {
